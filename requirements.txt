@@ -1,0 +1,28 @@
+# ─── Core Dependencies ───
+faster-whisper
+edge-tts
+pyyaml
+
+# ─── LLM Backends ───
+google-genai            # NEW: replaces deprecated google-generativeai
+groq
+ollama
+
+# ─── Memory ───
+chromadb
+sentence-transformers
+
+# ─── Audio Pipeline ───
+sounddevice
+soundfile
+numpy
+torch
+torchaudio
+
+# ─── PC Control & Input ───
+pyautogui
+pillow
+
+# ─── Volume Control (optional but recommended) ───
+pycaw
+comtypes

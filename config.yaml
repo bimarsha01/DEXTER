@@ -1,0 +1,42 @@
+bot_name: "Dexter"
+wake_words: 
+  - "hey dexter"
+  - "dexter"
+
+api_keys:
+  gemini: "GEMINI_API_KEY"
+  groq: "GROQ_API_KEY"    # Fallback — Groq Cloud (free)
+
+models:
+  primary_llm: "gemini-2.0-flash"              # Gemini — fast primary brain
+  fallback_llm: "llama-3.3-70b-versatile"      # Groq — lightning fast fallback
+  local_llm: "qwen2.5"                         # Ollama — offline local fallback
+  whisper_model: "small.en"                    # Speech-to-text (runs on RTX GPU)
+  tts_voice: "en-GB-RyanNeural"                # Professional British Male Voice (Edge-TTS, free)
+
+defaults:
+  city: ""
+
+security:
+  require_confirm_power_actions: true
+  allowed_apps: []
+
+rag:
+  intent_catalog_path: "intent_catalog.md"
+  intent_top_k: 3
+  intent_min_score: 0.72
+
+clap_wake:
+  enabled: true
+  sensitivity: "medium"
+  min_gap_ms: 150
+  max_gap_ms: 800
+  cooldown_ms: 1500
+  awake_seconds: 30
+
+audio_settings:
+  sample_rate: 16000
+  chunk_size: 512
+
+speed:
+  whisper_beam_size: 1     # 1 = fastest (greedy), 5 = most accurate. Recommended: 1 for real-time.

@@ -1,0 +1,23 @@
+# Secrets
+.env
+
+# Python specific
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+
+# IDEs
+.vscode/
+.idea/
+
+# Dexter Specific
+*.log
+memory_db/
+ChromaDB_data/
+temp_*.wav
+temp_*.mp3
+test_output.txt
+test_results.txt
