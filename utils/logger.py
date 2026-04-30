@@ -1,7 +1,20 @@
 import logging
 import sys
+import io
 
 def setup_logger():
+    # Force UTF-8 on Windows console to support Unicode characters (✓, →, ═, etc.)
+    if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
+        try:
+            sys.stdout = io.TextIOWrapper(
+                sys.stdout.buffer, encoding="utf-8", errors="replace", line_buffering=True
+            )
+            sys.stderr = io.TextIOWrapper(
+                sys.stderr.buffer, encoding="utf-8", errors="replace", line_buffering=True
+            )
+        except Exception:
+            pass
+
     # Create logger
     logger = logging.getLogger("Dexter")
     logger.setLevel(logging.DEBUG)

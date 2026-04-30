@@ -14,13 +14,16 @@ class DexterMemory:
 
     def remember(self, text: str, role: str = "user"):
         """Stores an interaction into the vector database for future recall."""
-        doc_id = f"msg_{int(time.time() * 1000)}"
-        self.collection.add(
-            documents=[text],
-            metadatas=[{"role": role, "timestamp": time.time()}],
-            ids=[doc_id]
-        )
-        logger.debug(f"Saved memory: {text[:60]}...")
+        try:
+            doc_id = f"msg_{int(time.time() * 1000)}"
+            self.collection.add(
+                documents=[text],
+                metadatas=[{"role": role, "timestamp": time.time()}],
+                ids=[doc_id]
+            )
+            logger.debug(f"Saved memory: {text[:60]}...")
+        except Exception as e:
+            logger.error(f"Memory save error (non-fatal): {e}")
 
     def recall_context(self, query: str, n_results: int = 3) -> str:
         """

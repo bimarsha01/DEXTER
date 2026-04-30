@@ -10,7 +10,7 @@ api_keys:
 models:
   primary_llm: "gemini-2.0-flash"              # Gemini — fast primary brain
   fallback_llm: "llama-3.3-70b-versatile"      # Groq — lightning fast fallback
-  local_llm: "qwen2.5"                         # Ollama — offline local fallback
+  local_llm: "qwen3-coder:480b-cloud"           # Ollama — offline local fallback
   whisper_model: "small.en"                    # Speech-to-text (runs on RTX GPU)
   tts_voice: "en-GB-RyanNeural"                # Professional British Male Voice (Edge-TTS, free)
 
