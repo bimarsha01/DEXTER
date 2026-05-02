@@ -5,6 +5,7 @@ from typing import List, Optional
 import chromadb
 from chromadb.utils import embedding_functions
 from utils.logger import logger
+from utils.config import DexterConfig
 
 
 @dataclass
@@ -23,11 +24,11 @@ class IntentMatch:
 
 
 class IntentRAG:
-    def __init__(self, config: dict, persist_directory: str = "./memory_db"):
-        rag_config = config.get("rag", {})
-        self.catalog_path = rag_config.get("intent_catalog_path", "intent_catalog.md")
-        self.top_k = int(rag_config.get("intent_top_k", 3))
-        self.min_score = float(rag_config.get("intent_min_score", 0.72))
+    def __init__(self, config: DexterConfig, persist_directory: str = "./memory_db"):
+        rag = config.rag
+        self.catalog_path = rag.intent_catalog_path
+        self.top_k = rag.intent_top_k
+        self.min_score = rag.intent_min_score
         self._last_indexed = 0.0
 
         self.client = chromadb.PersistentClient(path=persist_directory)

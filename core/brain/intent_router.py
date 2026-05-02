@@ -3,6 +3,8 @@ import time
 from dataclasses import dataclass, field
 from typing import Dict, Optional
 
+from utils.config import DexterConfig
+
 
 @dataclass
 class IntentDecision:
@@ -25,9 +27,8 @@ class PendingAction:
 
 
 class IntentRouter:
-    def __init__(self, config: dict):
-        defaults = config.get("defaults", {})
-        self.default_city = (defaults.get("city") or "").strip()
+    def __init__(self, config: DexterConfig):
+        self.default_city = (config.defaults.city or "").strip()
 
     def resolve_pending(self, text: str, pending: PendingAction) -> IntentDecision:
         lowered = text.lower().strip()

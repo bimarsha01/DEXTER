@@ -2,7 +2,7 @@ import os
 import subprocess
 import ctypes
 from utils.logger import logger
-from utils.config import load_config
+from utils.config import get_config
 
 
 APP_MAP = {
@@ -176,9 +176,8 @@ def lock_workstation() -> str:
 
 
 def _get_allowed_apps() -> set:
-    config = load_config()
-    security = config.get("security", {})
-    allowed = security.get("allowed_apps")
+    security = get_config().security
+    allowed = security.allowed_apps
     if isinstance(allowed, list) and allowed:
         return {str(item).lower().strip() for item in allowed}
     return DEFAULT_ALLOWED_APPS

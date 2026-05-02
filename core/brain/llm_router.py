@@ -10,33 +10,37 @@ MIGRATED: Uses the new `google-genai` SDK (replaces deprecated `google-generativ
 import yaml
 import json
 import asyncio
-import inspect
 import time
 import random
 import base64
 from utils.logger import logger
 from utils.metrics import metrics
 from tools.registry import load_tools, execute_tool
+from tools.schema_registry import get_tool_schema
 from core.brain.intent_router import IntentRouter, PendingAction
+from utils.config import DexterConfig, get_config
+
+
+class _StreamingFallback(Exception):
+    pass
 
 
 class Brain:
     """Dexter's cognitive center — routes commands to the best available LLM."""
 
-    MAX_SHARED_HISTORY = 20  # Keep conversation manageable for token limits
     RATE_LIMIT_BACKOFF_BASE = 2
     RATE_LIMIT_BACKOFF_MAX = 60
 
     def __init__(self):
         logger.info("Initializing Dexter's Brain (Multi-LLM Router)...")
 
-        with open("config.yaml", "r") as file:
-            self.config = yaml.safe_load(file)
+        self._cfg: DexterConfig = get_config()
 
         self.tools_list = load_tools()
-        self.intent_router = IntentRouter(self.config)
+        self.intent_router = IntentRouter(self._cfg)
         self.shared_history = []
         self.pending_action = None
+        self.max_history_tokens = int(self._cfg.history.max_tokens)
         self.provider_state = {
             "gemini": {"failures": 0, "score": 1.0, "cooldown_until": 0.0, "last_error": ""},
             "groq": {"failures": 0, "score": 1.0, "cooldown_until": 0.0, "last_error": ""},
@@ -63,11 +67,11 @@ class Brain:
         # Report status
         available = []
         if self.gemini_available:
-            available.append(f"Gemini ({self.config['models']['primary_llm']})")
+            available.append(f"Gemini ({self._cfg.models.primary_llm})")
         if self.groq_available:
-            available.append(f"Groq ({self.config['models']['fallback_llm']})")
+            available.append(f"Groq ({self._cfg.models.fallback_llm})")
         if self.ollama_available:
-            available.append(f"Ollama ({self.config['models']['local_llm']})")
+            available.append(f"Ollama ({self._cfg.models.local_llm})")
 
         if available:
             logger.info(f"Brain ONLINE → {' → '.join(available)}")
@@ -87,7 +91,7 @@ class Brain:
             from google import genai
             from google.genai import types
 
-            gemini_key = self.config.get("api_keys", {}).get("gemini", "")
+            gemini_key = self._cfg.gemini_api_key
             if not gemini_key or "YOUR" in gemini_key.upper():
                 logger.info("Gemini: No valid API key configured. Skipping.")
                 return
@@ -97,7 +101,7 @@ class Brain:
             self._genai_types = types
 
             # Store model name for later use
-            self.gemini_model_name = self.config["models"]["primary_llm"]
+            self.gemini_model_name = self._cfg.models.primary_llm
 
             self.gemini_available = True
             logger.info(f"PRIMARY: Gemini ({self.gemini_model_name}) ✓ [google-genai SDK]")
@@ -113,7 +117,7 @@ class Brain:
         try:
             from groq import AsyncGroq
 
-            groq_key = self.config.get("api_keys", {}).get("groq", "")
+            groq_key = self._cfg.groq_api_key
             if not groq_key or "YOUR" in groq_key.upper():
                 logger.info("Groq: No valid API key configured. Skipping.")
                 return
@@ -121,7 +125,7 @@ class Brain:
             self.groq_client = AsyncGroq(api_key=groq_key)
             self.groq_tools = self._build_groq_tool_schemas()
             self.groq_available = True
-            logger.info(f"FALLBACK: Groq ({self.config['models']['fallback_llm']}) ✓")
+            logger.info(f"FALLBACK: Groq ({self._cfg.models.fallback_llm}) ✓")
 
         except ImportError:
             logger.warning("Groq: 'groq' package not installed. pip install groq")
@@ -138,7 +142,7 @@ class Brain:
             # Quick connection test — if Ollama server isn't running, this fails fast
             ollama_lib.list()
             self.ollama_available = True
-            logger.info(f"LOCAL: Ollama ({self.config['models']['local_llm']}) ✓")
+            logger.info(f"LOCAL: Ollama ({self._cfg.models.local_llm}) ✓")
 
         except ImportError:
             logger.info("Ollama: package not installed (optional). pip install ollama")
@@ -149,34 +153,11 @@ class Brain:
 
     def _build_groq_tool_schemas(self):
         """
-        Auto-generates OpenAI-compatible tool schemas from Python functions
-        using inspect.signature(). No more brittle hardcoded parameter checks.
+        Builds OpenAI-compatible tool schemas from explicit JSON schema files.
         """
         schemas = []
         for func in self.tools_list:
-            sig = inspect.signature(func)
-            properties = {}
-            required = []
-
-            for param_name, param in sig.parameters.items():
-                # Map Python type annotations to JSON Schema types
-                ptype = "string"
-                if param.annotation == int:
-                    ptype = "integer"
-                elif param.annotation == float:
-                    ptype = "number"
-                elif param.annotation == bool:
-                    ptype = "boolean"
-
-                properties[param_name] = {
-                    "type": ptype,
-                    "description": f"The {param_name} to provide.",
-                }
-
-                # If no default value, it's required
-                if param.default == inspect.Parameter.empty:
-                    required.append(param_name)
-
+            schema = get_tool_schema(func.__name__)
             tool_schema = {
                 "type": "function",
                 "function": {
@@ -185,25 +166,38 @@ class Brain:
                 },
             }
 
-            # Only add parameters block if the function actually takes arguments
-            if properties:
-                tool_schema["function"]["parameters"] = {
-                    "type": "object",
-                    "properties": properties,
-                    "required": required,
-                }
+            if schema and schema.get("properties"):
+                tool_schema["function"]["parameters"] = schema
 
             schemas.append(tool_schema)
 
-        logger.debug(f"Built {len(schemas)} Groq tool schemas via inspect.")
+        logger.debug(f"Built {len(schemas)} Groq tool schemas via explicit JSON.")
         return schemas
 
     # ─── History Management ──────────────────────────────────────────────────
 
+    def _estimate_tokens(self, text: str) -> int:
+        if not text:
+            return 0
+        return max(1, int(len(text) / 4))
+
+    def _prune_history_by_tokens(self) -> None:
+        if self.max_history_tokens <= 0:
+            return
+
+        total = 0
+        pruned = []
+        for msg in reversed(self.shared_history):
+            total += self._estimate_tokens(msg.get("content", "")) + 4
+            if total > self.max_history_tokens and pruned:
+                break
+            pruned.append(msg)
+
+        self.shared_history = list(reversed(pruned))
+
     def _add_history(self, role: str, content: str) -> None:
         self.shared_history.append({"role": role, "content": content})
-        if len(self.shared_history) > self.MAX_SHARED_HISTORY:
-            self.shared_history = self.shared_history[-self.MAX_SHARED_HISTORY :]
+        self._prune_history_by_tokens()
 
     def _build_shared_messages(self):
         return [
@@ -395,6 +389,69 @@ class Brain:
             "Please verify your API keys in config.yaml and check your internet connection."
         )
 
+    async def process_command_stream(self, user_command: str, long_term_memory: str = ""):
+        if self.pending_action:
+            response_text = await self.process_command(user_command, long_term_memory)
+            yield response_text
+            return
+
+        decision = self.intent_router.detect_intent(user_command)
+        if decision.action != "none":
+            response_text = await self.process_command(user_command, long_term_memory)
+            yield response_text
+            return
+
+        prompt = user_command
+        if long_term_memory:
+            prompt = f"{long_term_memory}\n\nCurrent User Command: {user_command}"
+
+        if self._can_use_provider("gemini", self.gemini_available):
+            try:
+                response_text = ""
+                async for chunk in self._stream_gemini(prompt):
+                    response_text += chunk
+                    yield chunk
+                if response_text:
+                    self._record_provider_success("gemini")
+                    self._add_history("user", user_command)
+                    self._add_history("assistant", response_text)
+                    return
+            except Exception as e:
+                rate_limited = self._is_rate_limit_error(e)
+                self._record_provider_failure("gemini", e, rate_limited)
+                logger.warning(f"Gemini streaming failed: {e}")
+
+        if self._can_use_provider("groq", self.groq_available):
+            try:
+                response_text = ""
+                async for chunk in self._stream_groq_with_tools(prompt, allow_tools=True):
+                    response_text += chunk
+                    yield chunk
+                if response_text:
+                    self._record_provider_success("groq")
+                    self._add_history("user", user_command)
+                    self._add_history("assistant", response_text)
+                    return
+            except Exception as e:
+                rate_limited = self._is_rate_limit_error(e)
+                self._record_provider_failure("groq", e, rate_limited)
+                logger.warning(f"Groq streaming failed: {e}")
+
+        if self._can_use_provider("ollama", self.ollama_available):
+            try:
+                response_text = await self._process_ollama(prompt)
+                if response_text:
+                    self._record_provider_success("ollama")
+                    self._add_history("user", user_command)
+                    self._add_history("assistant", response_text)
+                    yield response_text
+                    return
+            except Exception as e:
+                self._record_provider_failure("ollama", e, False)
+
+        response_text = await self.process_command(user_command, long_term_memory)
+        yield response_text
+
     def _requires_confirmation(self, tool_name: str) -> bool:
         return tool_name in {"shutdown_pc", "restart_pc", "sleep_pc"}
 
@@ -488,6 +545,46 @@ class Brain:
 
         return "Command executed, sir."
 
+    async def _stream_gemini(self, prompt: str):
+        types = self._genai_types
+        contents = self._build_gemini_contents(types)
+        contents.append(
+            types.Content(
+                role="user",
+                parts=[types.Part(text=prompt)],
+            )
+        )
+
+        queue: asyncio.Queue = asyncio.Queue()
+        loop = asyncio.get_running_loop()
+
+        def _worker():
+            llm_start = time.perf_counter()
+            try:
+                for chunk in self.gemini_client.models.generate_content_stream(
+                    model=self.gemini_model_name,
+                    contents=contents,
+                    config=types.GenerateContentConfig(
+                        system_instruction=self.system_instruction,
+                    ),
+                ):
+                    text = getattr(chunk, "text", "")
+                    if text:
+                        loop.call_soon_threadsafe(queue.put_nowait, text)
+            finally:
+                metrics.record_latency(
+                    "llm_gemini_ms", (time.perf_counter() - llm_start) * 1000
+                )
+                loop.call_soon_threadsafe(queue.put_nowait, None)
+
+        worker_task = asyncio.create_task(asyncio.to_thread(_worker))
+        while True:
+            item = await queue.get()
+            if item is None:
+                break
+            yield item
+        await worker_task
+
     async def _process_gemini_vision(self, prompt: str, image_bytes: bytes) -> str:
         types = self._genai_types
         contents = self._build_gemini_contents(types)
@@ -528,7 +625,7 @@ class Brain:
 
         llm_start = time.perf_counter()
         response = await self.groq_client.chat.completions.create(
-            model=self.config["models"]["fallback_llm"],
+            model=self._cfg.models.fallback_llm,
             messages=base_messages,
             tools=self.groq_tools if self.groq_tools else None,
             tool_choice="auto",
@@ -583,7 +680,7 @@ class Brain:
 
             followup_start = time.perf_counter()
             followup = await self.groq_client.chat.completions.create(
-                model=self.config["models"]["fallback_llm"],
+                model=self._cfg.models.fallback_llm,
                 messages=tool_messages,
             )
             elapsed_ms += (time.perf_counter() - followup_start) * 1000
@@ -601,6 +698,109 @@ class Brain:
 
         return "Command executed, sir."
 
+    async def _stream_groq(self, prompt: str):
+        async for chunk in self._stream_groq_with_tools(prompt, allow_tools=False):
+            yield chunk
+
+    async def _stream_groq_with_tools(self, prompt: str, allow_tools: bool = True):
+        base_messages = [{"role": "system", "content": self.system_instruction}]
+        base_messages += self._build_shared_messages()
+        base_messages.append({"role": "user", "content": prompt})
+
+        llm_start = time.perf_counter()
+        stream = await self.groq_client.chat.completions.create(
+            model=self._cfg.models.fallback_llm,
+            messages=base_messages,
+            tools=self.groq_tools if allow_tools and self.groq_tools else None,
+            tool_choice="auto" if allow_tools else "none",
+            stream=True,
+        )
+
+        assistant_text = ""
+        tool_buffers: dict[int, dict] = {}
+
+        async for chunk in stream:
+            choice = chunk.choices[0]
+            delta = getattr(choice, "delta", None)
+            if not delta:
+                continue
+            text = getattr(delta, "content", None)
+            if text:
+                assistant_text += text
+                yield text
+
+            streamed_tool_calls = getattr(delta, "tool_calls", None)
+            if streamed_tool_calls:
+                for tool_delta in streamed_tool_calls:
+                    index = getattr(tool_delta, "index", 0)
+                    buffer = tool_buffers.setdefault(
+                        index,
+                        {
+                            "id": None,
+                            "type": "function",
+                            "function": {"name": "", "arguments": ""},
+                        },
+                    )
+
+                    if getattr(tool_delta, "id", None):
+                        buffer["id"] = tool_delta.id
+                    if getattr(tool_delta, "type", None):
+                        buffer["type"] = tool_delta.type
+
+                    function_delta = getattr(tool_delta, "function", None)
+                    if function_delta:
+                        if getattr(function_delta, "name", None):
+                            buffer["function"]["name"] = function_delta.name
+                        if getattr(function_delta, "arguments", None):
+                            buffer["function"]["arguments"] += function_delta.arguments
+
+        if tool_buffers and allow_tools:
+            tool_calls = [tool_buffers[idx] for idx in sorted(tool_buffers)]
+            tool_messages = list(base_messages)
+            tool_messages.append(
+                {
+                    "role": "assistant",
+                    "content": assistant_text or None,
+                    "tool_calls": tool_calls,
+                }
+            )
+
+            for tool_call in tool_calls:
+                func_name = tool_call["function"]["name"]
+                raw_args = tool_call["function"].get("arguments") or "{}"
+                try:
+                    args = json.loads(raw_args)
+                except json.JSONDecodeError:
+                    args = {}
+
+                logger.info(f"Groq requested tool: {func_name}")
+                tool_result = await execute_tool(func_name, args)
+                tool_messages.append(
+                    {
+                        "tool_call_id": tool_call.get("id"),
+                        "role": "tool",
+                        "name": func_name,
+                        "content": str(tool_result),
+                    }
+                )
+
+            followup = await self.groq_client.chat.completions.create(
+                model=self._cfg.models.fallback_llm,
+                messages=tool_messages,
+                stream=True,
+            )
+
+            async for follow_chunk in followup:
+                choice = follow_chunk.choices[0]
+                delta = getattr(choice, "delta", None)
+                if not delta:
+                    continue
+                text = getattr(delta, "content", None)
+                if text:
+                    yield text
+
+        metrics.record_latency("llm_groq_ms", (time.perf_counter() - llm_start) * 1000)
+
     # ─── Ollama Processing ───────────────────────────────────────────────────
 
     async def _process_ollama(self, prompt: str) -> str:
@@ -616,7 +816,7 @@ class Brain:
         llm_start = time.perf_counter()
         response = await asyncio.to_thread(
             self.ollama.chat,
-            model=self.config["models"]["local_llm"],
+            model=self._cfg.models.local_llm,
             messages=messages,
         )
         metrics.record_latency("llm_ollama_ms", (time.perf_counter() - llm_start) * 1000)

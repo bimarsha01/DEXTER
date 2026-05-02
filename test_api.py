@@ -1,22 +1,21 @@
 """Quick test to verify Gemini and Groq API connectivity."""
-import yaml
-import traceback
 import sys
 
+from utils.config import get_config
+
 # Force UTF-8 output
-sys.stdout.reconfigure(encoding='utf-8')
+sys.stdout.reconfigure(encoding="utf-8")
 
 results = []
 
-with open("config.yaml", "r") as f:
-    config = yaml.safe_load(f)
+cfg = get_config()
 
 # Test 1: Gemini (NEW google-genai SDK)
 results.append("[1] Testing Gemini API (google-genai SDK)...")
 try:
     from google import genai
 
-    key = config["api_keys"]["gemini"]
+    key = cfg.gemini_api_key
     client = genai.Client(api_key=key)
     response = client.models.generate_content(
         model="gemini-2.0-flash",
@@ -32,12 +31,13 @@ except Exception as e:
 results.append("[2] Testing Groq API...")
 try:
     from groq import Groq
-    key = config["api_keys"]["groq"]
+
+    key = cfg.groq_api_key
     client = Groq(api_key=key)
     response = client.chat.completions.create(
-        model=config["models"]["fallback_llm"],
+        model=cfg.models.fallback_llm,
         messages=[{"role": "user", "content": "Reply with exactly one word: HELLO"}],
-        max_tokens=10
+        max_tokens=10,
     )
     results.append(f"    RESULT: {response.choices[0].message.content.strip()}")
     results.append("    STATUS: PASS")
@@ -49,8 +49,9 @@ except Exception as e:
 results.append("[3] Testing Ollama (local)...")
 try:
     import ollama
+
     models = ollama.list()
-    names = [m.get('name', m.get('model', '?')) for m in models.get('models', [])]
+    names = [m.get("name", m.get("model", "?")) for m in models.get("models", [])]
     results.append(f"    Models: {names}")
     results.append("    STATUS: PASS")
 except Exception as e:

@@ -9,7 +9,7 @@ import urllib.request
 import urllib.parse
 from datetime import datetime
 from utils.logger import logger
-from utils.config import load_config
+from utils.config import get_config
 from utils.metrics import metrics
 
 
@@ -191,6 +191,4 @@ def get_health_report() -> str:
 
 
 def _requires_confirm() -> bool:
-    config = load_config()
-    security = config.get("security", {})
-    return bool(security.get("require_confirm_power_actions", True))
+    return bool(get_config().security.require_confirm_power_actions)

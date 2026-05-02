@@ -2,6 +2,9 @@
 faster-whisper
 edge-tts
 pyyaml
+python-dotenv
+pydantic
+structlog
 
 # ─── LLM Backends ───
 google-genai            # NEW: replaces deprecated google-generativeai
@@ -23,6 +26,12 @@ torchaudio
 pyautogui
 pillow
 
+# ─── Audio Playback ───
+pygame-ce
+
 # ─── Volume Control (optional but recommended) ───
 pycaw
 comtypes
+
+# ─── Tool Safety ───
+jsonschema
