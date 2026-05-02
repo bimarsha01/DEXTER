@@ -10,7 +10,9 @@ from tools import input_tools
 from tools import system_tools
 from tools import vision_tools
 from tools.executor import ToolExecutor
-from utils.logger import logger
+from utils.logger import get_logger
+
+logger = get_logger("tool_registry")
 
 
 # ─── Master list of all callable tools ───────────────────────────────────────
@@ -67,7 +69,7 @@ def load_tools():
     - Gemini SDK reads type hints + docstrings natively from these functions.
     - Groq/OpenAI schemas are auto-generated via inspect in the Brain class.
     """
-    logger.info(f"Loaded {len(AVAILABLE_TOOLS)} tools into Dexter's arsenal.")
+    logger.info("tools_loaded", count=len(AVAILABLE_TOOLS))
     return AVAILABLE_TOOLS
 
 
@@ -83,5 +85,9 @@ async def execute_tool(func_name: str, arguments: dict):
             return json.dumps(data)
         return data
 
-    logger.error(f"Tool execution failed — {func_name}: {result.error}")
+    logger.warning(
+        "tool_dispatch_failed",
+        tool_name=func_name,
+        error=result.error or "",
+    )
     return result.error or f"Execution of {func_name} failed."

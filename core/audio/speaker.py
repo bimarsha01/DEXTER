@@ -8,8 +8,10 @@ import os
 import time
 import uuid
 import threading
-from utils.logger import logger
+from utils.logger import get_logger
 from utils.metrics import metrics
+
+logger = get_logger("speaker")
 
 _PYGAME_READY = False
 _PYGAME_LOCK = threading.Lock()
@@ -29,8 +31,8 @@ class TTSManager:
         if self._current_process and self._current_process.returncode is None:
             try:
                 self._current_process.terminate()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("tts_process_terminate_failed", error=str(e))
 
     async def speak(self, text: str, interrupt: bool = True) -> None:
         if not text or not text.strip():
@@ -45,7 +47,8 @@ class TTSManager:
             self._cancel_event = threading.Event()
             cancel_event = self._cancel_event
 
-        logger.info(f"Speaking: '{text[:80]}...'") if len(text) > 80 else logger.info(f"Speaking: '{text}'")
+        preview = text[:80] + "..." if len(text) > 80 else text
+        logger.info("tts_speak_started", text_preview=preview, text_length=len(text))
         audio_file = os.path.join(os.path.dirname(__file__), "..", "..", f"temp_response_{uuid.uuid4().hex}.mp3")
         audio_file = os.path.abspath(audio_file)
 
@@ -60,7 +63,7 @@ class TTSManager:
             metrics.record_latency("tts_play_ms", (time.perf_counter() - play_start) * 1000)
 
         except Exception as e:
-            logger.error(f"TTS Error: {e}")
+            logger.error("tts_synthesis_failed", error=str(e), exc_info=True)
         finally:
             _safe_delete(audio_file)
 
@@ -81,9 +84,9 @@ async def _play_audio_windows(filepath: str, cancel_event: threading.Event, mana
         await asyncio.to_thread(_play_audio_pygame, filepath, cancel_event, manager)
         return
     except ImportError:
-        logger.debug("pygame-ce not installed, trying next fallback...")
+        logger.debug("tts_playback_fallback", stage="pygame", reason="not_installed")
     except Exception as e:
-        logger.debug(f"pygame playback failed: {e}, trying fallback...")
+        logger.debug("tts_playback_fallback", stage="pygame", reason="playback_failed", error=str(e))
 
     # Approach 2: Use PowerShell with .NET MediaPlayer (legacy fallback)
     try:
@@ -111,7 +114,7 @@ async def _play_audio_windows(filepath: str, cancel_event: threading.Event, mana
         await _wait_or_cancel(process, cancel_event, manager)
         return
     except Exception as e:
-        logger.debug(f"PowerShell MediaPlayer failed: {e}, trying fallback...")
+        logger.debug("tts_playback_fallback", stage="powershell", error=str(e))
 
     # Approach 3: Use ffplay if available (from ffmpeg)
     try:
@@ -124,7 +127,7 @@ async def _play_audio_windows(filepath: str, cancel_event: threading.Event, mana
         await _wait_or_cancel(process, cancel_event, manager)
         return
     except FileNotFoundError:
-        logger.debug("ffplay not found, trying next fallback...")
+        logger.debug("tts_playback_fallback", stage="ffplay", reason="not_found")
 
     # Approach 4: Use Windows start command (opens default media player)
     try:
@@ -136,7 +139,7 @@ async def _play_audio_windows(filepath: str, cancel_event: threading.Event, mana
         manager._current_process = process
         await _wait_or_cancel(process, cancel_event, manager)
     except Exception as e:
-        logger.error(f"All audio playback methods failed: {e}")
+        logger.error("tts_all_playback_methods_failed", error=str(e), exc_info=True)
 
 
 def _ensure_pygame_ready() -> None:
@@ -170,16 +173,16 @@ async def _wait_or_cancel(process: asyncio.subprocess.Process, cancel_event: thr
         if cancel_event.is_set() or manager._global_cancel.is_set():
             try:
                 process.terminate()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("tts_process_terminate_failed", error=str(e))
             break
         if process.returncode is not None:
             break
         await asyncio.sleep(0.1)
     try:
         await process.wait()
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug("tts_process_wait_failed", error=str(e))
     manager._current_process = None
 
 
@@ -188,5 +191,5 @@ def _safe_delete(filepath: str):
     try:
         if os.path.exists(filepath):
             os.remove(filepath)
-    except OSError:
-        pass
+    except OSError as e:
+        logger.debug("tts_temp_file_delete_failed", path=filepath, error=str(e))

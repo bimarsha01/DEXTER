@@ -2,6 +2,10 @@ import re
 from dataclasses import dataclass
 from difflib import SequenceMatcher
 
+from utils.logger import get_logger
+
+logger = get_logger("wake_word")
+
 
 @dataclass
 class WakeDetection:
@@ -23,6 +27,11 @@ class WakeWordDetector:
         self.match_mode = match_mode if match_mode in {"prefix", "any"} else "prefix"
         self.min_confidence = float(min_confidence)
         self.max_prefix_tokens = max(1, int(max_prefix_tokens))
+        logger.info(
+            "wake_word_detector_initialized",
+            phrase_count=len(self.wake_phrases),
+            match_mode=self.match_mode,
+        )
 
     def detect(self, text: str) -> WakeDetection:
         if not text or not self.wake_phrases:

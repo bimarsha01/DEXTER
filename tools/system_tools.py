@@ -8,9 +8,11 @@ import time
 import urllib.request
 import urllib.parse
 from datetime import datetime
-from utils.logger import logger
+from utils.logger import get_logger
 from utils.config import get_config
 from utils.metrics import metrics
+
+logger = get_logger("system_tools")
 
 
 def get_current_datetime() -> str:
@@ -34,7 +36,7 @@ def get_weather(city: str) -> str:
     except urllib.error.URLError:
         return f"I could not reach the weather service for {city}, sir. Please check your internet connection."
     except Exception as e:
-        logger.error(f"Weather fetch error: {e}")
+        logger.error("weather_fetch_failed", error=str(e), exc_info=True)
         return f"I was unable to retrieve the weather for {city} at this time."
 
 
@@ -52,7 +54,8 @@ def get_system_status() -> str:
         cpu = result.stdout.strip()
         if cpu:
             info_parts.append(f"CPU Usage: {cpu}%")
-    except Exception:
+    except Exception as e:
+        logger.debug("system_status_cpu_unavailable", error=str(e))
         info_parts.append("CPU: unavailable")
 
     # RAM Usage
@@ -68,7 +71,8 @@ def get_system_status() -> str:
         ram = result.stdout.strip()
         if ram:
             info_parts.append(f"RAM: {ram}")
-    except Exception:
+    except Exception as e:
+        logger.debug("system_status_ram_unavailable", error=str(e))
         info_parts.append("RAM: unavailable")
 
     # Battery
@@ -82,8 +86,8 @@ def get_system_status() -> str:
         battery = result.stdout.strip()
         if battery:
             info_parts.append(f"Battery: {battery}")
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug("system_status_battery_unavailable", error=str(e))
 
     return "System Status: " + " | ".join(info_parts) if info_parts else "Could not retrieve system information."
 
@@ -100,7 +104,7 @@ def read_clipboard() -> str:
             return f"Clipboard contains: {content}"
         return "The clipboard is currently empty, sir."
     except Exception as e:
-        logger.error(f"Clipboard read error: {e}")
+        logger.error("clipboard_read_failed", error=str(e), exc_info=True)
         return "I was unable to read the clipboard."
 
 
@@ -118,7 +122,7 @@ def copy_to_clipboard(text: str) -> str:
         preview = text[:80] + "..." if len(text) > 80 else text
         return f"Copied to clipboard: {preview}"
     except Exception as e:
-        logger.error(f"Clipboard write error: {e}")
+        logger.error("clipboard_write_failed", error=str(e), exc_info=True)
         return "I was unable to copy the text to the clipboard."
 
 
@@ -132,56 +136,60 @@ def take_screenshot() -> str:
 
         screenshot = pyautogui.screenshot()
         screenshot.save(filepath)
-        logger.info(f"Screenshot saved: {filepath}")
+        logger.info("screenshot_saved", path=filepath)
         return f"Screenshot saved to your Desktop as dexter_screenshot_{timestamp}.png"
     except Exception as e:
-        logger.error(f"Screenshot error: {e}")
+        logger.error("screenshot_failed", error=str(e), exc_info=True)
         return f"I was unable to capture the screenshot: {str(e)}"
 
 
 def shutdown_pc(confirm: bool = False) -> str:
     """Shuts down the computer after a 30-second delay. The user can cancel with 'cancel shutdown'."""
-    logger.info("Initiating system shutdown in 30 seconds...")
+    logger.info("system_shutdown_scheduled", delay_seconds=30)
     try:
         if _requires_confirm() and not confirm:
             return "Shutdown requested. Please confirm by saying 'confirm shutdown'."
         os.system("shutdown /s /t 30 /c \"Dexter is shutting down the system in 30 seconds.\"")
         return "Initiating shutdown in 30 seconds, sir. Say 'cancel shutdown' if you change your mind."
     except Exception as e:
+        logger.error("system_shutdown_failed", error=str(e), exc_info=True)
         return f"Failed to initiate shutdown: {str(e)}"
 
 
 def restart_pc(confirm: bool = False) -> str:
     """Restarts the computer after a 30-second delay. The user can cancel with 'cancel shutdown'."""
-    logger.info("Initiating system restart in 30 seconds...")
+    logger.info("system_restart_scheduled", delay_seconds=30)
     try:
         if _requires_confirm() and not confirm:
             return "Restart requested. Please confirm by saying 'confirm restart'."
         os.system("shutdown /r /t 30 /c \"Dexter is restarting the system in 30 seconds.\"")
         return "Initiating restart in 30 seconds, sir. Say 'cancel shutdown' to abort."
     except Exception as e:
+        logger.error("system_restart_failed", error=str(e), exc_info=True)
         return f"Failed to initiate restart: {str(e)}"
 
 
 def cancel_shutdown() -> str:
     """Cancels any pending shutdown or restart command."""
-    logger.info("Cancelling pending shutdown/restart...")
+    logger.info("system_shutdown_cancel_requested")
     try:
         os.system("shutdown /a")
         return "Shutdown cancelled successfully, sir."
     except Exception as e:
+        logger.error("system_shutdown_cancel_failed", error=str(e), exc_info=True)
         return f"Could not cancel shutdown: {str(e)}"
 
 
 def sleep_pc(confirm: bool = False) -> str:
     """Puts the computer into sleep mode immediately."""
-    logger.info("Putting system to sleep...")
+    logger.info("system_sleep_requested")
     try:
         if _requires_confirm() and not confirm:
             return "Sleep requested. Please confirm by saying 'confirm sleep'."
         os.system("rundll32.exe powrprof.dll,SetSuspendState 0,1,0")
         return "Putting the system to sleep now, sir."
     except Exception as e:
+        logger.error("system_sleep_failed", error=str(e), exc_info=True)
         return f"Failed to sleep the system: {str(e)}"
 
 

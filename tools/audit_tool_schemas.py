@@ -12,6 +12,9 @@ from pathlib import Path
 
 from tools.registry import RAW_TOOLS
 from tools.schema_registry import load_tool_schemas
+from utils.logger import get_logger
+
+logger = get_logger("audit_tool_schemas")
 
 
 def build_report() -> dict:
@@ -42,13 +45,16 @@ def main() -> int:
     report = build_report()
 
     if args.json:
-        print(json.dumps(report, indent=2))
+        logger.info("schema_audit_report", report_json=json.dumps(report))
     else:
-        print(f"Tools registered: {report['tool_count']}")
-        print(f"Schemas defined:   {report['schema_count']}")
-        print(f"Covered:           {report['covered_count']}")
-        print(f"Missing:           {', '.join(report['missing']) if report['missing'] else 'none'}")
-        print(f"Extra:             {', '.join(report['extra']) if report['extra'] else 'none'}")
+        logger.info(
+            "schema_audit_summary",
+            tool_count=report["tool_count"],
+            schema_count=report["schema_count"],
+            covered_count=report["covered_count"],
+            missing=report["missing"],
+            extra=report["extra"],
+        )
 
     return 0 if report["ok"] else 1
 

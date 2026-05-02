@@ -13,8 +13,10 @@ import asyncio
 import os
 import site
 import ctypes
-from utils.logger import logger
+from utils.logger import get_logger
 from utils.config import get_config, config_validation_warnings
+
+logger = get_logger("main")
 
 # ─── Add Nvidia DLLs for faster-whisper CUDA support on Windows ──────────────
 try:
@@ -30,9 +32,9 @@ try:
                     elif "cudnn" in lib:
                         ctypes.CDLL(os.path.join(bin_path, "cudnn64_9.dll"))
                 except OSError:
-                    pass
+                    logger.debug("nvidia_dll_preload_skipped", lib=lib)
 except Exception as e:
-    logger.warning(f"Could not load Nvidia DLLs: {e}")
+    logger.warning("nvidia_dll_setup_failed", error=str(e))
 
 # ─── Module Imports ──────────────────────────────────────────────────────────
 from core.audio.vad import VADListener
@@ -45,20 +47,20 @@ from core.pipeline import AsyncPipeline
 
 
 async def main():
-    logger.info("=" * 60)
-    logger.info("  DEXTER AI ASSISTANT — Booting Up...")
-    logger.info("=" * 60)
+    logger.info("boot_banner_top", char="=", repeat=60)
+    logger.info("boot_title", title="DEXTER AI ASSISTANT — Booting Up")
+    logger.info("boot_banner_bottom", char="=", repeat=60)
 
     # 1. Load Configuration
     runtime_config = get_config()
-    logger.info(f"Configuration loaded for: {runtime_config.bot_name}")
+    logger.info("configuration_loaded", bot_name=runtime_config.bot_name)
     for warning in config_validation_warnings(runtime_config):
-        logger.warning(warning)
-    logger.info("Typed runtime configuration validated successfully.")
+        logger.warning("configuration_warning", detail=warning)
+    logger.info("configuration_validated")
 
     try:
         # 2. Boot up all components
-        logger.info("─── Initializing Audio Pipeline ───")
+        logger.info("initializing_stage", stage="audio_pipeline")
 
         # Load Whisper on GPU for speech-to-text
         transcriber = DexterTranscriber(
@@ -72,11 +74,11 @@ async def main():
         # TTS manager with cancellation support
         tts_manager = TTSManager(voice=runtime_config.models.tts_voice)
 
-        logger.info("─── Initializing Memory System ───")
+        logger.info("initializing_stage", stage="memory_system")
         # Load ChromaDB long-term memory
         memory_vault = DexterMemory()
 
-        logger.info("─── Initializing Neural Network ───")
+        logger.info("initializing_stage", stage="neural_network")
         # Connect to LLM backends (Gemini → Groq → Ollama)
         event_bus = EventBus()
         brain = Brain(event_bus=event_bus)
@@ -85,11 +87,10 @@ async def main():
         await tts_manager.speak(
             "All systems online, sir. Dexter is ready for your command."
         )
-        logger.info("")
-        logger.info("═" * 60)
-        logger.info("  DEXTER IS READY — Listening for wake word...")
-        logger.info(f"  Wake words: {runtime_config.wake_words}")
-        logger.info("═" * 60)
+        logger.info("boot_spacer")
+        logger.info("boot_banner_top", char="═", repeat=60)
+        logger.info("assistant_ready", wake_words=list(runtime_config.wake_words))
+        logger.info("boot_banner_bottom", char="═", repeat=60)
 
         pipeline = AsyncPipeline(
             config=runtime_config,
@@ -103,13 +104,11 @@ async def main():
         await pipeline.run()
 
     except Exception as e:
-        logger.error(f"Critical System Error: {e}")
-        import traceback
-        traceback.print_exc()
+        logger.error("critical_system_error", error=str(e), exc_info=True)
 
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        logger.info("Dexter shutting down. Goodbye, sir.")
+        logger.info("shutdown_requested", reason="keyboard_interrupt")

@@ -1,7 +1,9 @@
 import json
 import os
 from functools import lru_cache
-from utils.logger import logger
+from utils.logger import get_logger
+
+logger = get_logger("schema_registry")
 
 
 @lru_cache(maxsize=1)
@@ -12,10 +14,10 @@ def load_tool_schemas() -> dict:
         with open(schema_path, "r", encoding="utf-8") as file:
             return json.load(file)
     except FileNotFoundError:
-        logger.warning(f"Tool schema file not found: {schema_path}")
+        logger.warning("tool_schema_file_not_found", path=schema_path)
         return {}
     except json.JSONDecodeError as e:
-        logger.warning(f"Tool schema JSON is invalid: {e}")
+        logger.warning("tool_schema_json_invalid", error=str(e))
         return {}
 
 

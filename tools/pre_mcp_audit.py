@@ -14,11 +14,13 @@ from pathlib import Path
 _root = Path(__file__).resolve().parent.parent
 if str(_root) not in sys.path:
     sys.path.insert(0, str(_root))
-import json
 from dataclasses import asdict, dataclass
 
 from tools.audit_tool_schemas import build_report
 from utils.config import get_config
+from utils.logger import get_logger
+
+logger = get_logger("pre_mcp_audit")
 
 
 CORE_IMPORTS = [
@@ -54,11 +56,16 @@ def run_audit() -> AuditResult:
         get_config()
     except Exception as e:
         config_ok = False
+        logger.error("audit_config_load_failed", error=str(e), exc_info=True)
         import_failures.append(f"config: {e}")
 
     schema_report = build_report()
     schemas_ok = bool(schema_report.get("ok", False))
     if not schemas_ok:
+        logger.warning(
+            "audit_schema_coverage_incomplete",
+            missing=schema_report.get("missing", []),
+        )
         import_failures.append(
             f"schema coverage missing: {', '.join(schema_report.get('missing', [])) or 'unknown'}"
         )
@@ -68,6 +75,7 @@ def run_audit() -> AuditResult:
             importlib.import_module(module_name)
         except Exception as e:
             imports_ok = False
+            logger.error("audit_module_import_failed", module=module_name, error=str(e), exc_info=True)
             import_failures.append(f"{module_name}: {e}")
 
     ok = config_ok and schemas_ok and imports_ok
@@ -83,7 +91,8 @@ def run_audit() -> AuditResult:
 
 def main() -> int:
     result = run_audit()
-    print(json.dumps(asdict(result), indent=2))
+    payload = asdict(result)
+    logger.info("pre_mcp_audit_completed", **payload)
     return 0 if result.ok else 1
 
 

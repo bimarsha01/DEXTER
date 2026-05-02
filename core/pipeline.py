@@ -7,9 +7,11 @@ from typing import Optional
 from core.event_bus import EventBus
 from core.state_machine import AssistantState
 from core.wake_word.detector import WakeWordDetector
-from utils.logger import logger, set_correlation_id, clear_correlation_id
+from utils.logger import get_logger, bind_correlation_id, clear_correlation_id
 from utils.metrics import metrics
 from utils.config import DexterConfig
+
+logger = get_logger("pipeline")
 
 
 class AsyncPipeline:
@@ -46,8 +48,14 @@ class AsyncPipeline:
 
     def _set_state(self, state: AssistantState) -> None:
         if self.state != state:
+            old = self.state
             self.state = state
             self._state_changed_at = time.time()
+            logger.info(
+                "state_transition",
+                from_state=old.name,
+                to_state=state.name,
+            )
             self.event_bus.emit("state_changed", {"state": state.name})
 
     def _is_awake(self) -> bool:
@@ -97,7 +105,7 @@ class AsyncPipeline:
             results = await asyncio.gather(*tts_tasks, return_exceptions=True)
             for result in results:
                 if isinstance(result, Exception):
-                    logger.error(f"TTS task failed: {result}")
+                    logger.error("tts_task_failed", error=str(result), exc_info=True)
                     self.event_bus.emit(
                         "error_occurred",
                         {"component": "tts", "error": str(result)},
@@ -111,11 +119,13 @@ class AsyncPipeline:
             stuck_for = time.time() - self._state_changed_at
             if stuck_for > 60:
                 logger.warning(
-                    f"Pipeline appears stuck in {self.state.name} for {int(stuck_for)}s"
+                    "pipeline_stuck",
+                    state=self.state.name,
+                    stuck_seconds=int(stuck_for),
                 )
 
     async def run(self) -> None:
-        logger.info("Pipeline online. Awaiting wake word...")
+        logger.info("pipeline_online")
         watchdog = asyncio.create_task(self._watchdog())
         try:
             while True:
@@ -124,7 +134,7 @@ class AsyncPipeline:
             watchdog.cancel()
 
     async def _handle_once(self) -> None:
-        correlation_id = set_correlation_id(uuid4().hex)
+        cid = bind_correlation_id(uuid4().hex)
         self._set_state(AssistantState.LISTENING)
         try:
             vad_start = time.perf_counter()
@@ -151,8 +161,13 @@ class AsyncPipeline:
                 self._set_state(AssistantState.IDLE)
                 return
 
-            self.event_bus.emit("transcript_received", {"text": identified_text, "correlation_id": correlation_id})
-            logger.debug(f"Whisper heard: '{identified_text}'")
+            logger.info(
+                "utterance_started",
+                cid=cid,
+                transcript=identified_text,
+            )
+            self.event_bus.emit("transcript_received", {"text": identified_text, "correlation_id": cid})
+            logger.debug("transcript_final", text=identified_text)
 
             detection = self.wake_detector.detect(identified_text)
 
@@ -161,7 +176,8 @@ class AsyncPipeline:
                 clean_command = detection.cleaned_text
                 if not clean_command.strip():
                     logger.info(
-                        f"Wake word detected. Listening for the next {self.wake_window_seconds}s."
+                        "wake_word_detected",
+                        wake_window_seconds=self.wake_window_seconds,
                     )
                     self._set_state(AssistantState.IDLE)
                     return
@@ -171,19 +187,19 @@ class AsyncPipeline:
                 self._set_state(AssistantState.IDLE)
                 return
 
-            logger.info(f"Command: {clean_command}")
+            logger.info("command_accepted", command=clean_command)
             self._set_state(AssistantState.PROCESSING)
 
             memory_context = self.memory.recall_context(clean_command)
             response_text = await self._stream_response(clean_command, memory_context)
 
-            self.event_bus.emit("response_generated", {"text": response_text, "correlation_id": correlation_id})
-            logger.info(f"Dexter: {response_text}")
+            self.event_bus.emit("response_generated", {"text": response_text, "correlation_id": cid})
+            logger.info("response_complete", response_preview=response_text[:500])
 
             try:
                 self.memory.remember(f"User: {clean_command} | Dexter: {response_text}")
             except Exception as e:
-                logger.error(f"Memory save failed: {e}")
+                logger.error("memory_save_failed", error=str(e), exc_info=True)
 
             self._set_state(AssistantState.IDLE)
         finally:

@@ -1,7 +1,9 @@
 import os
 import subprocess
 import ctypes
-from utils.logger import logger
+from utils.logger import get_logger
+
+logger = get_logger("pc_controls")
 from utils.config import get_config
 
 
@@ -55,7 +57,7 @@ DEFAULT_ALLOWED_APPS = set(APP_MAP.keys())
 def open_application(app_name: str) -> str:
     """Opens a Windows application by name (e.g., 'notepad', 'calculator', 'chrome', 'spotify')."""
     app_name = app_name.lower().strip()
-    logger.info(f"Attempting to open application: {app_name}")
+    logger.info("app_open_requested", app_name=app_name)
 
     if any(ch in app_name for ch in ["&", "|", ";"]):
         return "Application name contains unsafe characters."
@@ -71,7 +73,7 @@ def open_application(app_name: str) -> str:
             os.startfile(command)
             return f"Successfully opened {app_name}, sir."
         except Exception as e:
-            logger.error(f"Failed to open {app_name}: {e}")
+            logger.error("app_open_failed", app_name=app_name, error=str(e), exc_info=True)
             return f"Error opening {app_name}: {str(e)}"
 
     # Fallback: try to launch it via Windows Start
@@ -79,13 +81,14 @@ def open_application(app_name: str) -> str:
         subprocess.Popen(["cmd", "/c", "start", "", app_name])
         return f"Attempted to open {app_name} via Windows, sir."
     except Exception as e:
+        logger.error("app_open_start_failed", app_name=app_name, error=str(e), exc_info=True)
         return f"I could not find or launch '{app_name}', sir."
 
 
 def close_application(app_name: str) -> str:
     """Closes a running application by its process name (e.g., 'notepad', 'chrome')."""
     app_name = app_name.lower().strip()
-    logger.info(f"Attempting to close application: {app_name}")
+    logger.info("app_close_requested", app_name=app_name)
 
     # Map friendly names to process names
     process_map = {
@@ -117,7 +120,7 @@ def close_application(app_name: str) -> str:
         else:
             return f"Could not find a running instance of {app_name}."
     except Exception as e:
-        logger.error(f"Failed to close {app_name}: {e}")
+        logger.error("app_close_failed", app_name=app_name, error=str(e), exc_info=True)
         return f"Error closing {app_name}: {str(e)}"
 
 
@@ -126,7 +129,7 @@ def set_system_volume(level: int) -> str:
     if level < 0 or level > 100:
         return "Volume level must be between 0 and 100 percent, sir."
 
-    logger.info(f"Setting system volume to {level}%")
+    logger.info("system_volume_set_requested", level_percent=level)
 
     # Try using pycaw for precise volume control
     try:
@@ -142,9 +145,9 @@ def set_system_volume(level: int) -> str:
         return f"Volume set to {level}%, sir."
 
     except ImportError:
-        logger.warning("pycaw not installed. Falling back to key simulation.")
+        logger.warning("volume_control_fallback", reason="pycaw_not_installed")
     except Exception as e:
-        logger.warning(f"pycaw volume control failed: {e}. Falling back to key simulation.")
+        logger.warning("volume_control_fallback", reason="pycaw_failed", error=str(e), exc_info=True)
 
     # Fallback: simulate volume keys via PowerShell
     try:
@@ -161,17 +164,18 @@ def set_system_volume(level: int) -> str:
         )
         return f"Volume set to approximately {level}%, sir."
     except Exception as e:
-        logger.error(f"Volume fallback also failed: {e}")
+        logger.error("volume_key_simulation_failed", error=str(e), exc_info=True)
         return "I was unable to adjust the volume, sir."
 
 
 def lock_workstation() -> str:
     """Locks the Windows computer screen immediately."""
-    logger.info("Locking workstation...")
+    logger.info("workstation_lock_requested")
     try:
         ctypes.windll.user32.LockWorkStation()
         return "Workstation locked successfully, sir."
     except Exception as e:
+        logger.error("workstation_lock_failed", error=str(e), exc_info=True)
         return f"Failed to lock workstation: {str(e)}"
 
 

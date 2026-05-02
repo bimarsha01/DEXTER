@@ -2,10 +2,15 @@ import asyncio
 import time
 from typing import Any, Dict
 
+from utils.logger import get_logger
+
+logger = get_logger("event_bus")
+
 
 class EventBus:
     def __init__(self) -> None:
         self._subscribers: set[asyncio.Queue] = set()
+        logger.info("event_bus_initialized")
 
     def subscribe(self) -> asyncio.Queue:
         queue: asyncio.Queue = asyncio.Queue()
@@ -25,4 +30,4 @@ class EventBus:
             try:
                 queue.put_nowait(event)
             except asyncio.QueueFull:
-                pass
+                logger.warning("event_bus_subscriber_queue_full", event_type=event_type)

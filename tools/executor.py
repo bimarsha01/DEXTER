@@ -8,7 +8,9 @@ from typing import Any, Callable, Dict, List, Optional
 
 from jsonschema import ValidationError, validate
 
-from utils.logger import logger
+from utils.logger import get_logger
+
+logger = get_logger("tool_executor")
 from utils.config import DexterConfig, get_workspace_root, get_config
 from utils.metrics import metrics
 from tools.schema_registry import get_tool_schema
@@ -37,7 +39,7 @@ class ToolExecutor:
         if tool_name not in self._schemas:
             schema = get_tool_schema(tool_name)
             if not schema:
-                logger.warning(f"No explicit schema for tool '{tool_name}'.")
+                logger.warning("tool_schema_implicit_fallback", tool_name=tool_name)
                 schema = {"type": "object", "properties": {}, "additionalProperties": True}
             self._schemas[tool_name] = schema
         return self._schemas[tool_name]
@@ -57,8 +59,8 @@ class ToolExecutor:
             clean[key] = value
         return clean
 
-    def _get_allowed_roots(self, config: dict) -> List[str]:
-        roots = config.get("security", {}).get("allowed_file_roots") or []
+    def _get_allowed_roots(self, config: DexterConfig) -> List[str]:
+        roots = config.security.allowed_file_roots or []
         workspace_root = get_workspace_root()
         if not roots:
             home = os.path.expanduser("~")
@@ -110,6 +112,13 @@ class ToolExecutor:
     async def execute(self, tool_name: str, args: dict) -> ToolResult:
         func = self._tools.get(tool_name)
         if not func:
+            logger.info(
+                "tool_executed",
+                tool_name=tool_name,
+                success=False,
+                duration_ms=0.0,
+                error="tool_not_available",
+            )
             return ToolResult(
                 success=False,
                 data=None,
@@ -123,6 +132,7 @@ class ToolExecutor:
         timeout_sec = float(config.security.tool_timeout_sec)
 
         start = time.perf_counter()
+        logger.info("tool_execution_started", tool_name=tool_name)
         try:
             schema = self._get_schema(tool_name, func)
             clean_args = self._sanitize_args(args or {}, schema)
@@ -135,6 +145,13 @@ class ToolExecutor:
             )
             duration_ms = (time.perf_counter() - start) * 1000
             metrics.record_latency("tool_ms", duration_ms)
+            logger.info(
+                "tool_executed",
+                tool_name=tool_name,
+                success=True,
+                duration_ms=duration_ms,
+                error=None,
+            )
             return ToolResult(
                 success=True,
                 data=result,
@@ -146,10 +163,18 @@ class ToolExecutor:
         except ValidationError as e:
             duration_ms = (time.perf_counter() - start) * 1000
             metrics.record_latency("tool_ms", duration_ms)
+            err_msg = f"Invalid arguments: {e.message}"
+            logger.info(
+                "tool_executed",
+                tool_name=tool_name,
+                success=False,
+                duration_ms=duration_ms,
+                error=err_msg,
+            )
             return ToolResult(
                 success=False,
                 data=None,
-                error=f"Invalid arguments: {e.message}",
+                error=err_msg,
                 tool_name=tool_name,
                 duration_ms=duration_ms,
                 timestamp=datetime.utcnow(),
@@ -157,10 +182,18 @@ class ToolExecutor:
         except ValueError as e:
             duration_ms = (time.perf_counter() - start) * 1000
             metrics.record_latency("tool_ms", duration_ms)
+            err_msg = str(e)
+            logger.info(
+                "tool_executed",
+                tool_name=tool_name,
+                success=False,
+                duration_ms=duration_ms,
+                error=err_msg,
+            )
             return ToolResult(
                 success=False,
                 data=None,
-                error=str(e),
+                error=err_msg,
                 tool_name=tool_name,
                 duration_ms=duration_ms,
                 timestamp=datetime.utcnow(),
@@ -168,10 +201,18 @@ class ToolExecutor:
         except asyncio.TimeoutError:
             duration_ms = (time.perf_counter() - start) * 1000
             metrics.record_latency("tool_ms", duration_ms)
+            err_msg = f"Tool '{tool_name}' timed out after {timeout_sec:.0f}s."
+            logger.info(
+                "tool_executed",
+                tool_name=tool_name,
+                success=False,
+                duration_ms=duration_ms,
+                error=err_msg,
+            )
             return ToolResult(
                 success=False,
                 data=None,
-                error=f"Tool '{tool_name}' timed out after {timeout_sec:.0f}s.",
+                error=err_msg,
                 tool_name=tool_name,
                 duration_ms=duration_ms,
                 timestamp=datetime.utcnow(),
@@ -179,11 +220,24 @@ class ToolExecutor:
         except Exception as e:
             duration_ms = (time.perf_counter() - start) * 1000
             metrics.record_latency("tool_ms", duration_ms)
-            logger.error(f"Tool execution failed: {tool_name}: {e}")
+            logger.error(
+                "tool_execution_exception",
+                tool_name=tool_name,
+                error=str(e),
+                exc_info=True,
+            )
+            err_msg = f"Execution of {tool_name} failed: {str(e)}"
+            logger.info(
+                "tool_executed",
+                tool_name=tool_name,
+                success=False,
+                duration_ms=duration_ms,
+                error=err_msg,
+            )
             return ToolResult(
                 success=False,
                 data=None,
-                error=f"Execution of {tool_name} failed: {str(e)}",
+                error=err_msg,
                 tool_name=tool_name,
                 duration_ms=duration_ms,
                 timestamp=datetime.utcnow(),

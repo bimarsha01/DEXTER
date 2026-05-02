@@ -15,8 +15,10 @@ import random
 import base64
 from typing import Any, Optional
 
-from utils.logger import logger, get_correlation_id
+from utils.logger import get_logger, get_correlation_id
 from utils.metrics import metrics
+
+logger = get_logger("llm_router")
 from tools.registry import load_tools, execute_tool, EXECUTOR
 from tools.schema_registry import get_tool_schema
 from core.brain.intent_router import IntentRouter, PendingAction
@@ -35,7 +37,7 @@ class Brain:
     RATE_LIMIT_BACKOFF_MAX = 60
 
     def __init__(self, event_bus: Optional[EventBus] = None):
-        logger.info("Initializing Dexter's Brain (Multi-LLM Router)...")
+        logger.info("brain_initializing")
 
         self._cfg: DexterConfig = get_config()
         self._event_bus: Optional[EventBus] = event_bus
@@ -78,9 +80,9 @@ class Brain:
             available.append(f"Ollama ({self._cfg.models.local_llm})")
 
         if available:
-            logger.info(f"Brain ONLINE → {' → '.join(available)}")
+            logger.info("brain_online", providers=available)
         else:
-            logger.error("CRITICAL: No LLM backend is available. Dexter cannot think!")
+            logger.error("brain_no_llm_available")
 
         metrics.update_provider_health("gemini", self.gemini_available, 1.0 if self.gemini_available else 0.0)
         metrics.update_provider_health("groq", self.groq_available, 1.0 if self.groq_available else 0.0)
@@ -97,7 +99,7 @@ class Brain:
 
             gemini_key = self._cfg.gemini_api_key
             if not gemini_key or "YOUR" in gemini_key.upper():
-                logger.info("Gemini: No valid API key configured. Skipping.")
+                logger.info("gemini_skipped", reason="no_api_key")
                 return
 
             # New SDK: create a Client with the API key
@@ -108,12 +110,12 @@ class Brain:
             self.gemini_model_name = self._cfg.models.primary_llm
 
             self.gemini_available = True
-            logger.info(f"PRIMARY: Gemini ({self.gemini_model_name}) ✓ [google-genai SDK]")
+            logger.info("gemini_ready", model=self.gemini_model_name, sdk="google-genai")
 
         except ImportError:
-            logger.warning("Gemini: 'google-genai' package not installed. pip install google-genai")
+            logger.warning("gemini_import_failed", hint="pip install google-genai")
         except Exception as e:
-            logger.warning(f"Gemini initialization failed: {e}")
+            logger.warning("gemini_init_failed", error=str(e), exc_info=True)
 
     def _init_groq(self):
         """Initialize Groq as the fallback LLM with manual function calling."""
@@ -123,18 +125,18 @@ class Brain:
 
             groq_key = self._cfg.groq_api_key
             if not groq_key or "YOUR" in groq_key.upper():
-                logger.info("Groq: No valid API key configured. Skipping.")
+                logger.info("groq_skipped", reason="no_api_key")
                 return
 
             self.groq_client = AsyncGroq(api_key=groq_key)
             self.groq_tools = self._build_groq_tool_schemas()
             self.groq_available = True
-            logger.info(f"FALLBACK: Groq ({self._cfg.models.fallback_llm}) ✓")
+            logger.info("groq_ready", model=self._cfg.models.fallback_llm)
 
         except ImportError:
-            logger.warning("Groq: 'groq' package not installed. pip install groq")
+            logger.warning("groq_import_failed", hint="pip install groq")
         except Exception as e:
-            logger.warning(f"Groq initialization failed: {e}")
+            logger.warning("groq_init_failed", error=str(e), exc_info=True)
 
     def _init_ollama(self):
         """Initialize local Ollama as the offline emergency fallback (text-only, no tools)."""
@@ -146,12 +148,12 @@ class Brain:
             # Quick connection test — if Ollama server isn't running, this fails fast
             ollama_lib.list()
             self.ollama_available = True
-            logger.info(f"LOCAL: Ollama ({self._cfg.models.local_llm}) ✓")
+            logger.info("ollama_ready", model=self._cfg.models.local_llm)
 
         except ImportError:
-            logger.info("Ollama: package not installed (optional). pip install ollama")
-        except Exception:
-            logger.info("Ollama: server not running (optional offline fallback).")
+            logger.info("ollama_optional_missing", hint="pip install ollama")
+        except Exception as e:
+            logger.info("ollama_unavailable", error=str(e))
 
     # ─── Tool Schema Generation ──────────────────────────────────────────────
 
@@ -175,7 +177,7 @@ class Brain:
 
             schemas.append(tool_schema)
 
-        logger.debug(f"Built {len(schemas)} Groq tool schemas via explicit JSON.")
+        logger.debug("groq_tool_schemas_built", count=len(schemas))
         return schemas
 
     # ─── History Management ──────────────────────────────────────────────────
@@ -273,7 +275,7 @@ class Brain:
         if long_term_memory:
             prompt = f"{long_term_memory}\n\nCurrent User Command: {user_command}"
 
-        logger.info("Thinking...")
+        logger.info("command_processing_started")
 
         # Clear expired pending action
         if self.pending_action and time.time() > self.pending_action.expires_at:
@@ -351,7 +353,10 @@ class Brain:
         # ── Try Gemini (Primary) ──
         if self._can_use_provider("gemini", self.gemini_available):
             try:
+                _t0 = time.perf_counter()
                 response_text = await self._process_gemini(prompt)
+                _ms = (time.perf_counter() - _t0) * 1000
+                logger.info("llm_call_completed", provider="gemini", duration_ms=_ms)
                 self._record_provider_success("gemini")
                 self._add_history("user", user_command)
                 self._add_history("assistant", response_text)
@@ -359,13 +364,16 @@ class Brain:
             except Exception as e:
                 rate_limited = self._is_rate_limit_error(e)
                 self._record_provider_failure("gemini", e, rate_limited)
-                logger.warning(f"Gemini failed: {e}")
-                logger.info("Falling back to Groq...")
+                logger.warning("gemini_request_failed", error=str(e), exc_info=True)
+                logger.info("llm_fallback", from_provider="gemini", to_provider="groq")
 
         # ── Try Groq (Fallback) ──
         if self._can_use_provider("groq", self.groq_available):
             try:
+                _t0 = time.perf_counter()
                 response_text = await self._process_groq(prompt)
+                _ms = (time.perf_counter() - _t0) * 1000
+                logger.info("llm_call_completed", provider="groq", duration_ms=_ms)
                 self._record_provider_success("groq")
                 self._add_history("user", user_command)
                 self._add_history("assistant", response_text)
@@ -373,20 +381,23 @@ class Brain:
             except Exception as e:
                 rate_limited = self._is_rate_limit_error(e)
                 self._record_provider_failure("groq", e, rate_limited)
-                logger.warning(f"Groq failed: {e}")
-                logger.info("Falling back to Ollama...")
+                logger.warning("groq_request_failed", error=str(e), exc_info=True)
+                logger.info("llm_fallback", from_provider="groq", to_provider="ollama")
 
         # ── Try Ollama (Local Offline) ──
         if self._can_use_provider("ollama", self.ollama_available):
             try:
+                _t0 = time.perf_counter()
                 response_text = await self._process_ollama(prompt)
+                _ms = (time.perf_counter() - _t0) * 1000
+                logger.info("llm_call_completed", provider="ollama", duration_ms=_ms)
                 self._record_provider_success("ollama")
                 self._add_history("user", user_command)
                 self._add_history("assistant", response_text)
                 return response_text
             except Exception as e:
                 self._record_provider_failure("ollama", e, False)
-                logger.error(f"Ollama also failed: {e}")
+                logger.error("ollama_request_failed", error=str(e), exc_info=True)
 
         return (
             "I apologize, sir. All of my neural networks are currently unreachable. "
@@ -412,10 +423,13 @@ class Brain:
         if self._can_use_provider("gemini", self.gemini_available):
             try:
                 response_text = ""
+                _t0 = time.perf_counter()
                 async for chunk in self._stream_gemini(prompt):
                     response_text += chunk
                     yield chunk
                 if response_text:
+                    _ms = (time.perf_counter() - _t0) * 1000
+                    logger.info("llm_stream_completed", provider="gemini", duration_ms=_ms)
                     self._record_provider_success("gemini")
                     self._add_history("user", user_command)
                     self._add_history("assistant", response_text)
@@ -423,15 +437,18 @@ class Brain:
             except Exception as e:
                 rate_limited = self._is_rate_limit_error(e)
                 self._record_provider_failure("gemini", e, rate_limited)
-                logger.warning(f"Gemini streaming failed: {e}")
+                logger.warning("gemini_stream_failed", error=str(e), exc_info=True)
 
         if self._can_use_provider("groq", self.groq_available):
             try:
                 response_text = ""
+                _t0 = time.perf_counter()
                 async for chunk in self._stream_groq_with_tools(prompt, allow_tools=True):
                     response_text += chunk
                     yield chunk
                 if response_text:
+                    _ms = (time.perf_counter() - _t0) * 1000
+                    logger.info("llm_stream_completed", provider="groq", duration_ms=_ms)
                     self._record_provider_success("groq")
                     self._add_history("user", user_command)
                     self._add_history("assistant", response_text)
@@ -439,12 +456,15 @@ class Brain:
             except Exception as e:
                 rate_limited = self._is_rate_limit_error(e)
                 self._record_provider_failure("groq", e, rate_limited)
-                logger.warning(f"Groq streaming failed: {e}")
+                logger.warning("groq_stream_failed", error=str(e), exc_info=True)
 
         if self._can_use_provider("ollama", self.ollama_available):
             try:
+                _t0 = time.perf_counter()
                 response_text = await self._process_ollama(prompt)
                 if response_text:
+                    _ms = (time.perf_counter() - _t0) * 1000
+                    logger.info("llm_stream_completed", provider="ollama", duration_ms=_ms)
                     self._record_provider_success("ollama")
                     self._add_history("user", user_command)
                     self._add_history("assistant", response_text)
@@ -452,6 +472,7 @@ class Brain:
                     return
             except Exception as e:
                 self._record_provider_failure("ollama", e, False)
+                logger.warning("ollama_stream_failed", error=str(e), exc_info=True)
 
         response_text = await self.process_command(user_command, long_term_memory)
         yield response_text
@@ -467,7 +488,8 @@ class Brain:
             try:
                 encoded = image_b64.split("base64,", 1)[1]
                 image_bytes = base64.b64decode(encoded)
-            except Exception:
+            except Exception as e:
+                logger.error("vision_image_decode_failed", error=str(e), exc_info=True)
                 return "I could not decode the captured image."
             if self._can_use_provider("gemini", self.gemini_available):
                 return await self._process_gemini_vision(prompt, image_bytes)
@@ -491,6 +513,7 @@ class Brain:
             except Exception as e:
                 rate_limited = self._is_rate_limit_error(e)
                 self._record_provider_failure("gemini", e, rate_limited)
+                logger.warning("text_fallback_gemini_failed", error=str(e), exc_info=True)
 
         if self._can_use_provider("groq", self.groq_available):
             try:
@@ -500,6 +523,7 @@ class Brain:
             except Exception as e:
                 rate_limited = self._is_rate_limit_error(e)
                 self._record_provider_failure("groq", e, rate_limited)
+                logger.warning("text_fallback_groq_failed", error=str(e), exc_info=True)
 
         if self._can_use_provider("ollama", self.ollama_available):
             try:
@@ -508,6 +532,7 @@ class Brain:
                 return response_text
             except Exception as e:
                 self._record_provider_failure("ollama", e, False)
+                logger.warning("text_fallback_ollama_failed", error=str(e), exc_info=True)
 
         return "I cannot access any LLM providers at the moment, sir."
 
@@ -753,9 +778,9 @@ class Brain:
                 "llm_gemini_ms", (time.perf_counter() - llm_start) * 1000
             )
             logger.error(
-                "Gemini streaming failed [cid=%s]: %s",
-                get_correlation_id(),
-                e,
+                "gemini_stream_exception",
+                correlation_id=get_correlation_id(),
+                error=str(e),
                 exc_info=True,
             )
             buffered_tool_calls.clear()
@@ -840,7 +865,7 @@ class Brain:
                     args = json.loads(tc.function.arguments)
                 except json.JSONDecodeError:
                     args = {}
-                logger.info(f"Groq requested tool: {func_name}")
+                logger.info("groq_tool_call", tool_name=func_name)
 
                 tool_result = await execute_tool(func_name, args)
                 tool_summaries.append(f"[tool:{func_name}] {tool_result}")
@@ -949,7 +974,7 @@ class Brain:
                 except json.JSONDecodeError:
                     args = {}
 
-                logger.info(f"Groq requested tool: {func_name}")
+                logger.info("groq_tool_call", tool_name=func_name)
                 tool_result = await execute_tool(func_name, args)
                 tool_messages.append(
                     {

@@ -1,6 +1,8 @@
 import chromadb
 import time
-from utils.logger import logger
+from utils.logger import get_logger
+
+logger = get_logger("memory")
 
 class DexterMemory:
     def __init__(self, persist_directory="./memory_db"):
@@ -10,7 +12,7 @@ class DexterMemory:
         
         # Collection is like a table in a database
         self.collection = self.client.get_or_create_collection(name="dexter_memory")
-        logger.info(f"Long-Term Memory loaded. {self.collection.count()} memories on file.")
+        logger.info("memory_initialized", document_count=self.collection.count())
 
     def remember(self, text: str, role: str = "user"):
         """Stores an interaction into the vector database for future recall."""
@@ -21,9 +23,9 @@ class DexterMemory:
                 metadatas=[{"role": role, "timestamp": time.time()}],
                 ids=[doc_id]
             )
-            logger.debug(f"Saved memory: {text[:60]}...")
+            logger.debug("memory_document_saved", doc_id=doc_id, preview=text[:60])
         except Exception as e:
-            logger.error(f"Memory save error (non-fatal): {e}")
+            logger.error("memory_save_failed", error=str(e), exc_info=True)
 
     def recall_context(self, query: str, n_results: int = 3) -> str:
         """
@@ -48,7 +50,7 @@ class DexterMemory:
             return context
             
         except Exception as e:
-            logger.error(f"Memory recall error: {e}")
+            logger.error("memory_recall_failed", error=str(e), exc_info=True)
             return ""
 
     def get_memory_count(self) -> int:

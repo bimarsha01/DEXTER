@@ -4,7 +4,9 @@ from typing import List, Optional
 
 import chromadb
 from chromadb.utils import embedding_functions
-from utils.logger import logger
+from utils.logger import get_logger
+
+logger = get_logger("intent_rag")
 from utils.config import DexterConfig
 
 
@@ -92,8 +94,8 @@ class IntentRAG:
 
         try:
             self.client.delete_collection(self.collection_name)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("intent_rag_collection_delete_failed", error=str(e), exc_info=True)
 
         self.collection = self._get_collection()
 
@@ -107,7 +109,7 @@ class IntentRAG:
             metadatas.append({"intent": entry.intent, "tool": entry.tool_name})
 
         self.collection.add(documents=documents, metadatas=metadatas, ids=ids)
-        logger.info(f"Indexed {len(ids)} intent examples for RAG routing.")
+        logger.info("intent_rag_indexed", example_count=len(ids))
 
     def _parse_catalog(self) -> List[IntentExample]:
         examples = []
@@ -118,7 +120,7 @@ class IntentRAG:
             with open(self.catalog_path, "r", encoding="utf-8") as file:
                 lines = file.readlines()
         except Exception as e:
-            logger.error(f"Intent catalog read failed: {e}")
+            logger.error("intent_catalog_read_failed", error=str(e), exc_info=True)
             return []
 
         for raw_line in lines:

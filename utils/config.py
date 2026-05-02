@@ -4,6 +4,10 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
+from utils.logger import get_logger
+
+logger = get_logger("config")
+
 # Workspace root (DEXTER project directory)
 ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 
@@ -166,7 +170,7 @@ def _load_raw_config() -> dict:
         with open(config_path, "r", encoding="utf-8") as file:
             config = yaml.safe_load(file) or {}
     except FileNotFoundError:
-        print(f"Error: Could not find config.yaml at {config_path}")
+        logger.error("config_file_not_found", path=config_path)
         return {}
 
     config = _ensure_config_shape(config)

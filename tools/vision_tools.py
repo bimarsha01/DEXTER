@@ -1,7 +1,9 @@
 import base64
 import io
 import os
-from utils.logger import logger
+from utils.logger import get_logger
+
+logger = get_logger("vision_tools")
 from utils.config import get_workspace_root
 
 
@@ -36,7 +38,7 @@ def read_workspace_file(relative_path: str, max_chars: int = 4000) -> str:
             return data[:max_chars] + "\n...[truncated]"
         return data
     except Exception as e:
-        logger.error(f"Failed to read file {clean_path}: {e}")
+        logger.error("workspace_file_read_failed", path=clean_path, error=str(e), exc_info=True)
         return f"I could not read {clean_path}."
 
 
@@ -58,5 +60,5 @@ def capture_screen(max_dimension: int = 1280) -> str:
         encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
         return f"image/png;base64,{encoded}"
     except Exception as e:
-        logger.error(f"Screen capture failed: {e}")
+        logger.error("screen_capture_failed", error=str(e), exc_info=True)
         return "I was unable to capture the screen."

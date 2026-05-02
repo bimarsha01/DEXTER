@@ -7,7 +7,9 @@ import sounddevice as sd
 import soundfile as sf
 import torch
 import time
-from utils.logger import logger
+from utils.logger import get_logger
+
+logger = get_logger("vad")
 
 class VADListener:
     def __init__(self, sample_rate=16000, chunk_size=512):
@@ -15,7 +17,7 @@ class VADListener:
         self.chunk_size = chunk_size
         self.q = queue.Queue()
         
-        logger.info("Initializing Silero VAD (Voice Activity Detection)...")
+        logger.info("vad_initializing")
         # Load Silero VAD from PyTorch Hub
         self.model, utils = torch.hub.load(
             repo_or_dir='snakers4/silero-vad',
@@ -29,12 +31,12 @@ class VADListener:
          self.VADIterator,
          self.collect_chunks) = utils
         
-        logger.info("VAD loaded successfully. Dexter's ears are ready.")
+        logger.info("vad_initialized")
 
     def _audio_callback(self, indata, frames, time_info, status):
         """This is called for each audio block by sounddevice."""
         if status:
-            logger.warning(f"Audio status warning: {status}")
+            logger.warning("audio_input_status", detail=str(status))
         # Put the raw numpy array chunk into our queue
         self.q.put(indata.copy())
 
@@ -55,12 +57,13 @@ class VADListener:
         silence_start_time = None
         output_file = self._resolve_output_path(output_file)
         
-        logger.info("Listening for voice...")
+        logger.info("vad_listening_started")
 
         while not self.q.empty():
             try:
                 self.q.get_nowait()
-            except Exception:
+            except Exception as e:
+                logger.debug("vad_queue_drain_stopped", error=str(e))
                 break
         
         try:
@@ -83,13 +86,17 @@ class VADListener:
 
                     if speech_prob > 0.5:
                         if not is_speaking:
-                            logger.debug("Speech started!")
+                            logger.debug("vad_speech_started")
                             is_speaking = True
                             if on_speech_start:
                                 try:
                                     on_speech_start()
-                                except Exception:
-                                    pass
+                                except Exception as e:
+                                    logger.warning(
+                                        "vad_speech_start_callback_failed",
+                                        error=str(e),
+                                        exc_info=True,
+                                    )
                         recording.append(chunk)
                         silence_start_time = None  # Reset silence timer
                     else:
@@ -100,10 +107,10 @@ class VADListener:
                             
                             # If they have been silent for X seconds, stop recording
                             if time.time() - silence_start_time > silence_threshold:
-                                logger.debug("Speech ended.")
+                                logger.debug("vad_speech_ended")
                                 break
         except Exception as e:
-            logger.error(f"Microphone error: {e}")
+            logger.error("vad_microphone_error", error=str(e), exc_info=True)
             return None
 
         # If we captured audio, save it to a file
