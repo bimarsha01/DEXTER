@@ -40,6 +40,7 @@ from core.audio.transcriber import DexterTranscriber
 from core.audio.speaker import TTSManager
 from core.brain.llm_router import Brain
 from core.brain.memory import DexterMemory
+from core.event_bus import EventBus
 from core.pipeline import AsyncPipeline
 
 
@@ -77,7 +78,8 @@ async def main():
 
         logger.info("─── Initializing Neural Network ───")
         # Connect to LLM backends (Gemini → Groq → Ollama)
-        brain = Brain()
+        event_bus = EventBus()
+        brain = Brain(event_bus=event_bus)
 
         # 3. Greet the user
         await tts_manager.speak(
@@ -96,6 +98,7 @@ async def main():
             tts_manager=tts_manager,
             memory_vault=memory_vault,
             brain=brain,
+            event_bus=event_bus,
         )
         await pipeline.run()
 

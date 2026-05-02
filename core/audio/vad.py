@@ -1,4 +1,7 @@
 import queue
+import os
+import tempfile
+import uuid
 import numpy as np
 import sounddevice as sd
 import soundfile as sf
@@ -35,7 +38,13 @@ class VADListener:
         # Put the raw numpy array chunk into our queue
         self.q.put(indata.copy())
 
-    def listen(self, output_file="temp_mic.wav", silence_threshold=1.5, on_speech_start=None):
+    def _resolve_output_path(self, output_file: str | None) -> str:
+        if output_file:
+            return output_file
+        filename = f"dexter_mic_{uuid.uuid4().hex}.wav"
+        return os.path.join(tempfile.gettempdir(), filename)
+
+    def listen(self, output_file=None, silence_threshold=1.5, on_speech_start=None):
         """
         Listens to the microphone continuously. 
         Only records when VAD detects a human voice.
@@ -44,6 +53,7 @@ class VADListener:
         recording = []
         is_speaking = False
         silence_start_time = None
+        output_file = self._resolve_output_path(output_file)
         
         logger.info("Listening for voice...")
 

@@ -2,27 +2,15 @@
 Dexter Tool Registry — Central hub for all available tools.
 Handles tool loading and dynamic execution for any LLM backend.
 """
-import time
-from functools import wraps
+import json
 from tools import pc_controls
 from tools import web_browser
 from tools import file_tools
 from tools import input_tools
 from tools import system_tools
 from tools import vision_tools
+from tools.executor import ToolExecutor
 from utils.logger import logger
-from utils.metrics import metrics
-
-def _wrap_tool(func):
-    @wraps(func)
-    def wrapper(*args, **kwargs):
-        start = time.perf_counter()
-        try:
-            return func(*args, **kwargs)
-        finally:
-            metrics.record_latency("tool_ms", (time.perf_counter() - start) * 1000)
-
-    return wrapper
 
 
 # ─── Master list of all callable tools ───────────────────────────────────────
@@ -69,7 +57,8 @@ RAW_TOOLS = [
     vision_tools.capture_screen,
 ]
 
-AVAILABLE_TOOLS = [_wrap_tool(tool) for tool in RAW_TOOLS]
+AVAILABLE_TOOLS = list(RAW_TOOLS)
+EXECUTOR = ToolExecutor(AVAILABLE_TOOLS)
 
 
 def load_tools():
@@ -87,25 +76,12 @@ async def execute_tool(func_name: str, arguments: dict):
     Dynamically finds and executes a tool by name with the given arguments.
     Called by the LLM router when the AI decides to use a tool.
     """
-    func = None
-    for item in AVAILABLE_TOOLS:
-        if item.__name__ == func_name:
-            func = item
-            break
+    result = await EXECUTOR.execute(func_name, arguments)
+    if result.success:
+        data = result.data
+        if isinstance(data, (dict, list)):
+            return json.dumps(data)
+        return data
 
-    if not func:
-        logger.error(f"LLM requested unknown tool: {func_name}")
-        return f"Tool '{func_name}' is not available."
-
-    try:
-        logger.info(f"Executing tool: {func_name}({arguments})")
-        result = func(**arguments)
-        logger.debug(f"Tool result: {str(result)[:100]}")
-        return result
-
-    except TypeError as te:
-        logger.error(f"Argument mismatch for {func_name}: {te}")
-        return f"Tool {func_name} received incorrect arguments: {str(te)}"
-    except Exception as e:
-        logger.error(f"Tool execution failed — {func_name}: {e}")
-        return f"Execution of {func_name} failed: {str(e)}"
+    logger.error(f"Tool execution failed — {func_name}: {result.error}")
+    return result.error or f"Execution of {func_name} failed."

@@ -1,11 +1,16 @@
 bot_name: "Dexter"
-wake_words: 
-  - "hey dexter"
-  - "dexter"
+wake_words:
+  - "hey"
+
+wake_behavior:
+  active_seconds: 30
+  match_mode: "prefix"    # prefix or any
+  min_confidence: 0.86
+  max_prefix_tokens: 4
 
 api_keys:
-  gemini: "GEMINI_API_KEY"
-  groq: "GROQ_API_KEY"    # Fallback — Groq Cloud (free)
+  gemini: ""               # Set GEMINI_API_KEY in .env or environment
+  groq: ""                 # Set GROQ_API_KEY in .env or environment
 
 models:
   primary_llm: "gemini-2.0-flash"              # Gemini — fast primary brain
@@ -20,19 +25,16 @@ defaults:
 security:
   require_confirm_power_actions: true
   allowed_apps: []
+  allowed_file_roots:
+    - "%USERPROFILE%/Documents"
+    - "%USERPROFILE%/Desktop"
+    - "."
+  tool_timeout_sec: 10
 
 rag:
   intent_catalog_path: "intent_catalog.md"
   intent_top_k: 3
   intent_min_score: 0.72
-
-clap_wake:
-  enabled: true
-  sensitivity: "medium"
-  min_gap_ms: 150
-  max_gap_ms: 800
-  cooldown_ms: 1500
-  awake_seconds: 30
 
 audio_settings:
   sample_rate: 16000
@@ -40,3 +42,6 @@ audio_settings:
 
 speed:
   whisper_beam_size: 1     # 1 = fastest (greedy), 5 = most accurate. Recommended: 1 for real-time.
+
+history:
+  max_tokens: 1800

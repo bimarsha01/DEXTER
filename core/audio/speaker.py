@@ -1,6 +1,6 @@
 """
 Dexter TTS Speaker — Converts text to speech using Edge-TTS
-and plays audio using sounddevice (no pygame dependency needed).
+and plays audio using pygame for low-latency playback, with fallbacks.
 """
 import edge_tts
 import asyncio
@@ -11,15 +11,20 @@ import threading
 from utils.logger import logger
 from utils.metrics import metrics
 
+_PYGAME_READY = False
+_PYGAME_LOCK = threading.Lock()
+
 
 class TTSManager:
     def __init__(self, voice: str = "en-GB-RyanNeural"):
         self.voice = voice
         self._cancel_event = threading.Event()
+        self._global_cancel = threading.Event()
         self._current_process = None
         self._lock = asyncio.Lock()
 
     def stop(self) -> None:
+        self._global_cancel.set()
         self._cancel_event.set()
         if self._current_process and self._current_process.returncode is None:
             try:
@@ -27,12 +32,16 @@ class TTSManager:
             except Exception:
                 pass
 
-    async def speak(self, text: str) -> None:
+    async def speak(self, text: str, interrupt: bool = True) -> None:
         if not text or not text.strip():
             return
 
         async with self._lock:
-            self.stop()
+            if interrupt:
+                self.stop()
+                self._global_cancel.clear()
+            if self._global_cancel.is_set():
+                return
             self._cancel_event = threading.Event()
             cancel_event = self._cancel_event
 
@@ -67,7 +76,16 @@ async def _play_audio_windows(filepath: str, cancel_event: threading.Event, mana
     Play an audio file using Windows' built-in capabilities.
     Tries multiple approaches for maximum compatibility.
     """
-    # Approach 1: Use PowerShell with .NET MediaPlayer (most reliable)
+    # Approach 1: pygame for low-latency playback
+    try:
+        await asyncio.to_thread(_play_audio_pygame, filepath, cancel_event, manager)
+        return
+    except ImportError:
+        logger.debug("pygame-ce not installed, trying next fallback...")
+    except Exception as e:
+        logger.debug(f"pygame playback failed: {e}, trying fallback...")
+
+    # Approach 2: Use PowerShell with .NET MediaPlayer (legacy fallback)
     try:
         ps_script = (
             f"$player = New-Object System.Media.SoundPlayer; "
@@ -95,7 +113,7 @@ async def _play_audio_windows(filepath: str, cancel_event: threading.Event, mana
     except Exception as e:
         logger.debug(f"PowerShell MediaPlayer failed: {e}, trying fallback...")
 
-    # Approach 2: Use ffplay if available (from ffmpeg)
+    # Approach 3: Use ffplay if available (from ffmpeg)
     try:
         process = await asyncio.create_subprocess_exec(
             "ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", filepath,
@@ -108,7 +126,7 @@ async def _play_audio_windows(filepath: str, cancel_event: threading.Event, mana
     except FileNotFoundError:
         logger.debug("ffplay not found, trying next fallback...")
 
-    # Approach 3: Use Windows start command (opens default media player)
+    # Approach 4: Use Windows start command (opens default media player)
     try:
         process = await asyncio.create_subprocess_shell(
             f'start /wait "" "{filepath}"',
@@ -121,9 +139,35 @@ async def _play_audio_windows(filepath: str, cancel_event: threading.Event, mana
         logger.error(f"All audio playback methods failed: {e}")
 
 
+def _ensure_pygame_ready() -> None:
+    global _PYGAME_READY
+    if _PYGAME_READY:
+        return
+    with _PYGAME_LOCK:
+        if _PYGAME_READY:
+            return
+        import pygame
+
+        pygame.mixer.init()
+        _PYGAME_READY = True
+
+
+def _play_audio_pygame(filepath: str, cancel_event: threading.Event, manager: TTSManager) -> None:
+    _ensure_pygame_ready()
+    import pygame
+
+    pygame.mixer.music.load(filepath)
+    pygame.mixer.music.play()
+    while pygame.mixer.music.get_busy():
+        if cancel_event.is_set() or manager._global_cancel.is_set():
+            pygame.mixer.music.stop()
+            break
+        time.sleep(0.05)
+
+
 async def _wait_or_cancel(process: asyncio.subprocess.Process, cancel_event: threading.Event, manager: TTSManager) -> None:
     while True:
-        if cancel_event.is_set():
+        if cancel_event.is_set() or manager._global_cancel.is_set():
             try:
                 process.terminate()
             except Exception:

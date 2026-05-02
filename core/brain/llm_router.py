@@ -7,18 +7,21 @@ Ollama serves as a text-only emergency fallback.
 
 MIGRATED: Uses the new `google-genai` SDK (replaces deprecated `google-generativeai`).
 """
-import yaml
+import re
 import json
 import asyncio
 import time
 import random
 import base64
-from utils.logger import logger
+from typing import Any, Optional
+
+from utils.logger import logger, get_correlation_id
 from utils.metrics import metrics
-from tools.registry import load_tools, execute_tool
+from tools.registry import load_tools, execute_tool, EXECUTOR
 from tools.schema_registry import get_tool_schema
 from core.brain.intent_router import IntentRouter, PendingAction
 from utils.config import DexterConfig, get_config
+from core.event_bus import EventBus
 
 
 class _StreamingFallback(Exception):
@@ -31,10 +34,11 @@ class Brain:
     RATE_LIMIT_BACKOFF_BASE = 2
     RATE_LIMIT_BACKOFF_MAX = 60
 
-    def __init__(self):
+    def __init__(self, event_bus: Optional[EventBus] = None):
         logger.info("Initializing Dexter's Brain (Multi-LLM Router)...")
 
         self._cfg: DexterConfig = get_config()
+        self._event_bus: Optional[EventBus] = event_bus
 
         self.tools_list = load_tools()
         self.intent_router = IntentRouter(self._cfg)
@@ -545,9 +549,93 @@ class Brain:
 
         return "Command executed, sir."
 
+    @staticmethod
+    def _split_sentences_for_stream(text: str) -> tuple[list[str], str]:
+        parts = re.split(r"(?<=[.!?])\s+", text)
+        if len(parts) <= 1:
+            return [], text
+        if parts and not parts[-1].strip():
+            return [p for p in parts[:-1] if p.strip()], ""
+        return [p for p in parts[:-1] if p.strip()], parts[-1]
+
+    def _emit_tts_sentences(self, fragment: str, sentence_carry: list[str]) -> None:
+        if not self._event_bus or not fragment:
+            return
+        buf = sentence_carry[0] + fragment
+        sentences, rest = self._split_sentences_for_stream(buf)
+        for s in sentences:
+            self._event_bus.emit("tts_sentence", {"text": s})
+        sentence_carry[0] = rest
+
+    @staticmethod
+    def _normalize_fc_args(raw: Any) -> Optional[dict[str, Any]]:
+        if raw is None:
+            return None
+        if isinstance(raw, dict):
+            return dict(raw)
+        try:
+            return dict(raw)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _merge_function_call_chunk(
+        buffered_tool_calls: dict[str, dict[str, Any]],
+        fc,
+    ) -> None:
+        key = fc.id if getattr(fc, "id", None) else "0"
+        slot = buffered_tool_calls.setdefault(
+            key, {"name": "", "args": None, "args_nonempty": False}
+        )
+        if fc.name:
+            slot["name"] = fc.name
+        merged = Brain._normalize_fc_args(getattr(fc, "args", None))
+        if merged is not None:
+            if slot["args"] is None:
+                slot["args"] = {}
+            slot["args"].update(merged)
+            if len(slot["args"]) > 0:
+                slot["args_nonempty"] = True
+
+    @staticmethod
+    def _gemini_text_delta(chunk, last_cumulative: str) -> tuple[str, str]:
+        cur = chunk.text or ""
+        if cur.startswith(last_cumulative):
+            delta = cur[len(last_cumulative) :]
+        else:
+            delta = cur
+        return delta, cur
+
+    @staticmethod
+    def _slot_waiting_args(slot: dict[str, Any]) -> bool:
+        name = (slot.get("name") or "").strip()
+        if not name:
+            return False
+        args = slot.get("args")
+        if args is None:
+            return True
+        if len(args) == 0 and not slot.get("args_nonempty"):
+            return True
+        return False
+
+    def _finalize_executable_tool_calls(
+        self, buffered_tool_calls: dict[str, dict[str, Any]]
+    ) -> list[tuple[str, dict[str, Any]]]:
+        ready: list[tuple[str, dict[str, Any]]] = []
+        for key in sorted(buffered_tool_calls.keys()):
+            slot = buffered_tool_calls[key]
+            if self._slot_waiting_args(slot):
+                continue
+            name = (slot.get("name") or "").strip()
+            args = slot.get("args")
+            if not name or args is None:
+                continue
+            ready.append((name, dict(args)))
+        return ready
+
     async def _stream_gemini(self, prompt: str):
         types = self._genai_types
-        contents = self._build_gemini_contents(types)
+        contents: list = list(self._build_gemini_contents(types))
         contents.append(
             types.Content(
                 role="user",
@@ -555,35 +643,123 @@ class Brain:
             )
         )
 
-        queue: asyncio.Queue = asyncio.Queue()
-        loop = asyncio.get_running_loop()
+        afc_off = types.AutomaticFunctionCallingConfig(disable=True)
+        stream_config = types.GenerateContentConfig(
+            system_instruction=self.system_instruction,
+            tools=self.tools_list,
+            automatic_function_calling=afc_off,
+        )
 
-        def _worker():
-            llm_start = time.perf_counter()
-            try:
-                for chunk in self.gemini_client.models.generate_content_stream(
-                    model=self.gemini_model_name,
-                    contents=contents,
-                    config=types.GenerateContentConfig(
-                        system_instruction=self.system_instruction,
-                    ),
-                ):
-                    text = getattr(chunk, "text", "")
-                    if text:
-                        loop.call_soon_threadsafe(queue.put_nowait, text)
-            finally:
+        llm_start = time.perf_counter()
+        buffered_tool_calls: dict[str, dict[str, Any]] = {}
+        last_cumulative = ""
+        sentence_carry = [""]
+        model_text_parts: list = []
+        current_text_buf = ""
+
+        try:
+            stream = await self.gemini_client.aio.models.generate_content_stream(
+                model=self.gemini_model_name,
+                contents=contents,
+                config=stream_config,
+            )
+            async for chunk in stream:
+                delta, last_cumulative = self._gemini_text_delta(chunk, last_cumulative)
+                if delta:
+                    incomplete_fc = any(
+                        self._slot_waiting_args(s) for s in buffered_tool_calls.values()
+                    )
+                    if not incomplete_fc:
+                        yield delta
+                        self._emit_tts_sentences(delta, sentence_carry)
+                        current_text_buf += delta
+
+                cand = chunk.candidates[0] if chunk.candidates else None
+                parts = (
+                    cand.content.parts
+                    if cand and cand.content and cand.content.parts
+                    else []
+                )
+                for part in parts:
+                    fc = getattr(part, "function_call", None)
+                    if fc is None:
+                        continue
+                    if current_text_buf.strip():
+                        model_text_parts.append(types.Part(text=current_text_buf))
+                        current_text_buf = ""
+                    self._merge_function_call_chunk(buffered_tool_calls, fc)
+
+            if current_text_buf.strip():
+                model_text_parts.append(types.Part(text=current_text_buf))
+
+            ready_calls = self._finalize_executable_tool_calls(buffered_tool_calls)
+            if not ready_calls:
                 metrics.record_latency(
                     "llm_gemini_ms", (time.perf_counter() - llm_start) * 1000
                 )
-                loop.call_soon_threadsafe(queue.put_nowait, None)
+                if self._event_bus and sentence_carry[0].strip():
+                    self._event_bus.emit("tts_sentence", {"text": sentence_carry[0].strip()})
+                return
 
-        worker_task = asyncio.create_task(asyncio.to_thread(_worker))
-        while True:
-            item = await queue.get()
-            if item is None:
-                break
-            yield item
-        await worker_task
+            fc_parts = [
+                types.Part(
+                    function_call=types.FunctionCall(name=name, args=args)
+                )
+                for name, args in ready_calls
+            ]
+            model_text_parts.extend(fc_parts)
+            contents.append(types.Content(role="model", parts=model_text_parts))
+
+            response_parts = []
+            for tool_name, args in ready_calls:
+                tr = await EXECUTOR.execute(tool_name, args)
+                if tr.success:
+                    data = tr.data
+                    if isinstance(data, (dict, list)):
+                        body = {"result": json.dumps(data)}
+                    else:
+                        body = {"result": str(data)}
+                else:
+                    body = {"error": str(tr.error or "execution failed")}
+                response_parts.append(
+                    types.Part.from_function_response(name=tool_name, response=body)
+                )
+            contents.append(types.Content(role="user", parts=response_parts))
+
+            follow_config = types.GenerateContentConfig(
+                system_instruction=self.system_instruction,
+                automatic_function_calling=afc_off,
+            )
+            follow_stream = await self.gemini_client.aio.models.generate_content_stream(
+                model=self.gemini_model_name,
+                contents=contents,
+                config=follow_config,
+            )
+            last2 = ""
+            async for chunk in follow_stream:
+                delta, last2 = self._gemini_text_delta(chunk, last2)
+                if delta:
+                    yield delta
+                    self._emit_tts_sentences(delta, sentence_carry)
+
+            metrics.record_latency(
+                "llm_gemini_ms", (time.perf_counter() - llm_start) * 1000
+            )
+            if self._event_bus and sentence_carry[0].strip():
+                self._event_bus.emit("tts_sentence", {"text": sentence_carry[0].strip()})
+
+        except Exception as e:
+            metrics.record_latency(
+                "llm_gemini_ms", (time.perf_counter() - llm_start) * 1000
+            )
+            logger.error(
+                "Gemini streaming failed [cid=%s]: %s",
+                get_correlation_id(),
+                e,
+                exc_info=True,
+            )
+            buffered_tool_calls.clear()
+            raise
 
     async def _process_gemini_vision(self, prompt: str, image_bytes: bytes) -> str:
         types = self._genai_types

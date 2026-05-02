@@ -1,0 +1,253 @@
+{
+  "open_application": {
+    "type": "object",
+    "properties": {
+      "app_name": {
+        "type": "string",
+        "description": "The application name to open."
+      }
+    },
+    "required": ["app_name"],
+    "additionalProperties": false
+  },
+  "close_application": {
+    "type": "object",
+    "properties": {
+      "app_name": {
+        "type": "string",
+        "description": "The application name to close."
+      }
+    },
+    "required": ["app_name"],
+    "additionalProperties": false
+  },
+  "lock_workstation": {
+    "type": "object",
+    "properties": {},
+    "additionalProperties": false
+  },
+  "set_system_volume": {
+    "type": "object",
+    "properties": {
+      "level": {
+        "type": "integer",
+        "description": "Volume percentage 0-100.",
+        "minimum": 0,
+        "maximum": 100
+      }
+    },
+    "required": ["level"],
+    "additionalProperties": false
+  },
+  "search_google": {
+    "type": "object",
+    "properties": {
+      "query": {
+        "type": "string",
+        "description": "Search query for Google."
+      }
+    },
+    "required": ["query"],
+    "additionalProperties": false
+  },
+  "open_url": {
+    "type": "object",
+    "properties": {
+      "url": {
+        "type": "string",
+        "description": "URL to open in the browser."
+      }
+    },
+    "required": ["url"],
+    "additionalProperties": false
+  },
+  "search_youtube": {
+    "type": "object",
+    "properties": {
+      "search_term": {
+        "type": "string",
+        "description": "Search term for YouTube."
+      }
+    },
+    "required": ["search_term"],
+    "additionalProperties": false
+  },
+  "create_note": {
+    "type": "object",
+    "properties": {
+      "filename": {
+        "type": "string",
+        "description": "Filename for the note."
+      },
+      "content": {
+        "type": "string",
+        "description": "Note content to write."
+      }
+    },
+    "required": ["filename", "content"],
+    "additionalProperties": false
+  },
+  "read_note": {
+    "type": "object",
+    "properties": {
+      "filename": {
+        "type": "string",
+        "description": "Filename of the note to read."
+      }
+    },
+    "required": ["filename"],
+    "additionalProperties": false
+  },
+  "list_notes": {
+    "type": "object",
+    "properties": {},
+    "additionalProperties": false
+  },
+  "type_text": {
+    "type": "object",
+    "properties": {
+      "text": {
+        "type": "string",
+        "description": "Text to type into the active window."
+      }
+    },
+    "required": ["text"],
+    "additionalProperties": false
+  },
+  "press_shortcut": {
+    "type": "object",
+    "properties": {
+      "keys": {
+        "type": "string",
+        "description": "Shortcut keys (e.g., 'ctrl c')."
+      }
+    },
+    "required": ["keys"],
+    "additionalProperties": false
+  },
+  "enter_key": {
+    "type": "object",
+    "properties": {},
+    "additionalProperties": false
+  },
+  "minimize_all_windows": {
+    "type": "object",
+    "properties": {},
+    "additionalProperties": false
+  },
+  "get_current_datetime": {
+    "type": "object",
+    "properties": {},
+    "additionalProperties": false
+  },
+  "get_weather": {
+    "type": "object",
+    "properties": {
+      "city": {
+        "type": "string",
+        "description": "City name for the weather lookup."
+      }
+    },
+    "required": ["city"],
+    "additionalProperties": false
+  },
+  "get_system_status": {
+    "type": "object",
+    "properties": {},
+    "additionalProperties": false
+  },
+  "read_clipboard": {
+    "type": "object",
+    "properties": {},
+    "additionalProperties": false
+  },
+  "copy_to_clipboard": {
+    "type": "object",
+    "properties": {
+      "text": {
+        "type": "string",
+        "description": "Text to copy to the clipboard."
+      }
+    },
+    "required": ["text"],
+    "additionalProperties": false
+  },
+  "take_screenshot": {
+    "type": "object",
+    "properties": {},
+    "additionalProperties": false
+  },
+  "shutdown_pc": {
+    "type": "object",
+    "properties": {
+      "confirm": {
+        "type": "boolean",
+        "description": "Confirmation flag for power action."
+      }
+    },
+    "required": [],
+    "additionalProperties": false
+  },
+  "restart_pc": {
+    "type": "object",
+    "properties": {
+      "confirm": {
+        "type": "boolean",
+        "description": "Confirmation flag for power action."
+      }
+    },
+    "required": [],
+    "additionalProperties": false
+  },
+  "cancel_shutdown": {
+    "type": "object",
+    "properties": {},
+    "additionalProperties": false
+  },
+  "sleep_pc": {
+    "type": "object",
+    "properties": {
+      "confirm": {
+        "type": "boolean",
+        "description": "Confirmation flag for power action."
+      }
+    },
+    "required": [],
+    "additionalProperties": false
+  },
+  "get_health_report": {
+    "type": "object",
+    "properties": {},
+    "additionalProperties": false
+  },
+  "read_workspace_file": {
+    "type": "object",
+    "properties": {
+      "relative_path": {
+        "type": "string",
+        "description": "Workspace-relative file path."
+      },
+      "max_chars": {
+        "type": "integer",
+        "description": "Maximum characters to read.",
+        "minimum": 256,
+        "maximum": 20000
+      }
+    },
+    "required": ["relative_path"],
+    "additionalProperties": false
+  },
+  "capture_screen": {
+    "type": "object",
+    "properties": {
+      "max_dimension": {
+        "type": "integer",
+        "description": "Maximum width/height for the screenshot.",
+        "minimum": 256,
+        "maximum": 4096
+      }
+    },
+    "required": [],
+    "additionalProperties": false
+  }
+}
