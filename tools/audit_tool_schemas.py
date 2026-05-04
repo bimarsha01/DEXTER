@@ -10,7 +10,7 @@ import json
 import sys
 from pathlib import Path
 
-from tools.registry import RAW_TOOLS
+from tools.registry import load_tools
 from tools.schema_registry import load_tool_schemas
 from utils.logger import get_logger
 
@@ -18,7 +18,7 @@ logger = get_logger("audit_tool_schemas")
 
 
 def build_report() -> dict:
-    tools = {tool.__name__ for tool in RAW_TOOLS}
+    tools = {tool.__name__ for tool in load_tools()}
     schemas = load_tool_schemas()
     schema_names = set(schemas.keys())
 

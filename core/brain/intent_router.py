@@ -80,9 +80,31 @@ class IntentRouter:
 
     def detect_intent(self, text: str) -> IntentDecision:
         lowered = text.lower().strip()
+        normalized = self._strip_filler_prefixes(lowered)
+
+        # Screenshot tool intents
+        if (
+            "screenshot" in normalized
+            or "screen shot" in normalized
+            or "screen capture" in normalized
+            or (
+                "screen" in normalized
+                and any(kw in normalized for kw in ["take", "capture", "grab", "save"])
+            )
+        ):
+            return IntentDecision(action="tool", tool_name="take_screenshot", args={})
 
         # Vision intents
-        if any(kw in lowered for kw in ["look at", "see", "screen", "screenshot", "what's on my screen"]):
+        if any(
+            kw in normalized
+            for kw in [
+                "look at",
+                "see",
+                "analyze",
+                "what's on my screen",
+                "what is on my screen",
+            ]
+        ):
             return IntentDecision(action="vision", vision_mode="screen")
 
         file_match = re.search(r"([\w\-./\\]+\.(py|txt|md|json|yaml|yml))", text, re.IGNORECASE)
@@ -92,7 +114,7 @@ class IntentRouter:
             return IntentDecision(action="ask", vision_mode="file", prompt="Which file should I inspect, sir? Provide a relative path.")
 
         # Weather
-        if "weather" in lowered or "forecast" in lowered:
+        if "weather" in normalized or "forecast" in normalized:
             city = self._extract_city(text)
             if not city:
                 if self.default_city:
@@ -106,7 +128,7 @@ class IntentRouter:
             return IntentDecision(action="tool", tool_name="get_weather", args={"city": city})
 
         # App launch
-        app_match = re.match(r"(?:open|launch|start)\s+(.+)$", lowered)
+        app_match = re.match(r"(?:open|launch|start)\s+(.+)$", normalized)
         if app_match:
             app_name = app_match.group(1).strip()
             if app_name:
@@ -114,7 +136,9 @@ class IntentRouter:
             return IntentDecision(action="ask", tool_name="open_application", prompt="Which application should I open, sir?")
 
         # Clipboard
-        if "clipboard" in lowered and any(kw in lowered for kw in ["read", "show", "what's on", "what is on", "check"]):
+        if "clipboard" in normalized and any(
+            kw in normalized for kw in ["read", "show", "what's on", "what is on", "check"]
+        ):
             return IntentDecision(action="tool", tool_name="read_clipboard", args={})
 
         copy_match = re.match(r"(?:copy|set clipboard)\s+(.+)$", text, re.IGNORECASE)
@@ -125,6 +149,16 @@ class IntentRouter:
             return IntentDecision(action="ask", tool_name="copy_to_clipboard", prompt="What should I copy to the clipboard, sir?")
 
         return IntentDecision(action="none")
+
+    def _strip_filler_prefixes(self, text: str) -> str:
+        cleaned = re.sub(r"\s+", " ", text).strip()
+        if not cleaned:
+            return cleaned
+        tokens = cleaned.split(" ")
+        fillers = {"ok", "okay", "hey", "hi", "dexter", "please"}
+        while tokens and tokens[0] in fillers:
+            tokens.pop(0)
+        return " ".join(tokens)
 
     def build_pending_slot(self, decision: IntentDecision, ttl_seconds: int = 45) -> PendingAction:
         return PendingAction(

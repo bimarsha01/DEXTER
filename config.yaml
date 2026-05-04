@@ -1,5 +1,7 @@
 bot_name: "Dexter"
 wake_words:
+  - "hey "
+  - "ok hey"
   - "hey"
 
 wake_behavior:

@@ -15,7 +15,7 @@ from utils.config import DexterConfig, get_workspace_root, get_config
 from utils.metrics import metrics
 from tools.schema_registry import get_tool_schema
 
-UNSAFE_PATTERN = re.compile(r"(;|&&|\|\||`|\$\()")
+UNSAFE_PATTERN = re.compile(r"(;|\||\|\||&&|`|\$\(|\n)")
 PATH_ARG_NAMES = {"path", "file_path", "filepath", "root", "directory", "folder", "output_path"}
 RELATIVE_PATH_NAMES = {"relative_path"}
 

@@ -129,7 +129,17 @@ class AsyncPipeline:
         watchdog = asyncio.create_task(self._watchdog())
         try:
             while True:
-                await self._handle_once()
+                try:
+                    await self._handle_once()
+                except Exception as e:
+                    logger.error("pipeline_loop_error", error=str(e), exc_info=True)
+                    try:
+                        # Ensure we return to IDLE to avoid stuck states
+                        self._set_state(AssistantState.IDLE)
+                    except Exception:
+                        pass
+                    # small delay before retrying to avoid busy-looping on persistent errors
+                    await asyncio.sleep(1)
         finally:
             watchdog.cancel()
 

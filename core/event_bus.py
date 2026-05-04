@@ -8,12 +8,17 @@ logger = get_logger("event_bus")
 
 
 class EventBus:
-    def __init__(self) -> None:
+    def __init__(self, maxsize: int = 200) -> None:
         self._subscribers: set[asyncio.Queue] = set()
-        logger.info("event_bus_initialized")
+        self._default_maxsize = maxsize
+        logger.info("event_bus_initialized", maxsize=maxsize)
 
-    def subscribe(self) -> asyncio.Queue:
-        queue: asyncio.Queue = asyncio.Queue()
+    def subscribe(self, maxsize: int | None = None) -> asyncio.Queue:
+        size = self._default_maxsize if maxsize is None else maxsize
+        if size is not None and size > 0:
+            queue = asyncio.Queue(maxsize=size)
+        else:
+            queue = asyncio.Queue()
         self._subscribers.add(queue)
         return queue
 
