@@ -22,7 +22,7 @@ class IntentDecision:
 
 @dataclass
 class PendingAction:
-    kind: str  # confirm | slot
+    kind: str  # confirm | slot | open_choice
     tool_name: str
     args: Dict
     prompt: str
@@ -68,6 +68,16 @@ class IntentRouter:
                     return IntentDecision(action="tool", tool_name=pending.tool_name, args=args)
                 return IntentDecision(action="ask", prompt=pending.prompt)
 
+        if pending.kind == "open_choice":
+            match_id = pending.args.get("match_id")
+            if match_id:
+                return IntentDecision(
+                    action="tool",
+                    tool_name="resolve_open_target",
+                    args={"match_id": match_id, "selection": text.strip()},
+                )
+            return IntentDecision(action="ask", prompt=pending.prompt)
+
             if pending.tool_name == "copy_to_clipboard":
                 content = text.strip()
                 if content:
@@ -81,6 +91,23 @@ class IntentRouter:
     def detect_intent(self, text: str) -> IntentDecision:
         lowered = text.lower().strip()
         normalized = self._strip_filler_prefixes(lowered)
+
+        browser_match = re.match(r"open\s+(.+?)\s+in\s+(chrome|edge|firefox|brave)$", normalized)
+        if browser_match:
+            target = browser_match.group(1).strip()
+            browser = browser_match.group(2).strip()
+            url = self._resolve_known_url(target)
+            if url:
+                return IntentDecision(
+                    action="tool",
+                    tool_name="open_url_in_browser",
+                    args={"url": url, "browser": browser},
+                )
+            return IntentDecision(
+                action="tool",
+                tool_name="search_google",
+                args={"query": target},
+            )
 
         # Screenshot tool intents
         if (
@@ -132,8 +159,8 @@ class IntentRouter:
         if app_match:
             app_name = app_match.group(1).strip()
             if app_name:
-                return IntentDecision(action="tool", tool_name="open_application", args={"app_name": app_name})
-            return IntentDecision(action="ask", tool_name="open_application", prompt="Which application should I open, sir?")
+                return IntentDecision(action="tool", tool_name="resolve_open_target", args={"query": app_name})
+            return IntentDecision(action="ask", tool_name="resolve_open_target", prompt="What should I open, sir?")
 
         # Clipboard
         if "clipboard" in normalized and any(
@@ -160,6 +187,19 @@ class IntentRouter:
             tokens.pop(0)
         return " ".join(tokens)
 
+    def _resolve_known_url(self, target: str) -> str:
+        clean = target.strip().lower()
+        if not clean:
+            return ""
+        if "." in clean:
+            return clean
+        mapping = {
+            "youtube": "https://www.youtube.com",
+            "gmail": "https://mail.google.com",
+            "google": "https://www.google.com",
+        }
+        return mapping.get(clean, "")
+
     def build_pending_slot(self, decision: IntentDecision, ttl_seconds: int = 45) -> PendingAction:
         return PendingAction(
             kind="slot",
@@ -179,7 +219,7 @@ class IntentRouter:
         )
 
     def _extract_city(self, text: str) -> str:
-        match = re.search(r"in\s+([A-Za-z\s]+)$", text)
+        match = re.search(r"(?:in|for|of)\s+([A-Za-z\s]+)$", text)
         if match:
             return match.group(1).strip()
         return ""

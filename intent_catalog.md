@@ -1,7 +1,7 @@
 # Dexter Intent Catalog
 
 ## Intent: open_application
-Tool: open_application
+Tool: resolve_open_target
 Examples:
 - open word
 - launch excel

@@ -16,6 +16,10 @@ class VADListener:
         self.sample_rate = sample_rate
         self.chunk_size = chunk_size
         self.q = queue.Queue()
+        self._ambient_rms = 0.0
+        self._clap_active = False
+        self._clap_start = 0.0
+        self._last_clap_time = 0.0
         
         logger.info("vad_initializing")
         # Load Silero VAD from PyTorch Hub
@@ -46,7 +50,16 @@ class VADListener:
         filename = f"dexter_mic_{uuid.uuid4().hex}.wav"
         return os.path.join(tempfile.gettempdir(), filename)
 
-    def listen(self, output_file=None, silence_threshold=1.5, on_speech_start=None):
+    def listen(
+        self,
+        output_file=None,
+        silence_threshold=1.5,
+        on_speech_start=None,
+        on_clap=None,
+        clap_sensitivity: float = 3.0,
+        clap_max_ms: int = 150,
+        clap_pair_window: float = 1.5,
+    ):
         """
         Listens to the microphone continuously. 
         Only records when VAD detects a human voice.
@@ -73,6 +86,15 @@ class VADListener:
                                 blocksize=self.chunk_size):
                 while True:
                     chunk = self.q.get()
+                    if on_clap is not None:
+                        rms = float(np.sqrt(np.mean(chunk**2))) if chunk.size else 0.0
+                        self._detect_clap(
+                            rms,
+                            clap_sensitivity=clap_sensitivity,
+                            clap_max_seconds=clap_max_ms / 1000.0,
+                            clap_pair_window=clap_pair_window,
+                            on_clap=on_clap,
+                        )
                     
                     # Convert chunk to a PyTorch tensor (required by Silero)
                     tensor_chunk = torch.from_numpy(chunk).float().flatten()
@@ -120,3 +142,39 @@ class VADListener:
             return output_file
             
         return None
+
+    def _detect_clap(
+        self,
+        rms: float,
+        clap_sensitivity: float,
+        clap_max_seconds: float,
+        clap_pair_window: float,
+        on_clap,
+    ) -> None:
+        now = time.time()
+        if self._ambient_rms <= 0.0:
+            self._ambient_rms = max(rms, 1e-6)
+            return
+
+        threshold = max(self._ambient_rms * clap_sensitivity, 1e-6)
+        if rms > threshold:
+            if not self._clap_active:
+                self._clap_active = True
+                self._clap_start = now
+            return
+
+        if self._clap_active:
+            duration = now - self._clap_start
+            self._clap_active = False
+            if duration <= clap_max_seconds:
+                if self._last_clap_time and (now - self._last_clap_time) <= clap_pair_window:
+                    self._last_clap_time = 0.0
+                    logger.info("clap_activation_detected")
+                    try:
+                        on_clap()
+                    except Exception as e:
+                        logger.warning("clap_callback_failed", error=str(e), exc_info=True)
+                else:
+                    self._last_clap_time = now
+
+        self._ambient_rms = (self._ambient_rms * 0.9) + (rms * 0.1)

@@ -6,7 +6,18 @@ import os
 
 
 class DexterTranscriber:
-    def __init__(self, model_size="small.en", beam_size=1):
+    def __init__(
+        self,
+        model_size: str = "small.en",
+        beam_size: int = 3,
+        best_of: int = 5,
+        temperature: float = 0.0,
+        patience: float = 1.0,
+        log_prob_threshold: float = -1.0,
+        no_speech_threshold: float = 0.6,
+        condition_on_previous_text: bool = False,
+        initial_prompt: str = "",
+    ):
         """
         Initialize Whisper speech-to-text model.
         
@@ -15,8 +26,21 @@ class DexterTranscriber:
             beam_size: Beam search width. Lower = faster, Higher = more accurate.
                        1 = greedy (fastest), 5 = thorough (default whisper).
         """
-        self.beam_size = beam_size
-        logger.info("transcriber_loading", model_size=model_size, beam_size=beam_size)
+        self.beam_size = int(beam_size)
+        self.best_of = int(best_of)
+        self.temperature = float(temperature)
+        self.patience = float(patience)
+        self.log_prob_threshold = float(log_prob_threshold)
+        self.no_speech_threshold = float(no_speech_threshold)
+        self.condition_on_previous_text = bool(condition_on_previous_text)
+        self.initial_prompt = (initial_prompt or "").strip()
+        logger.info(
+            "transcriber_loading",
+            model_size=model_size,
+            beam_size=self.beam_size,
+            best_of=self.best_of,
+            temperature=self.temperature,
+        )
         
         try:
             # Use float16 for RTX GPUs to maximize speed and save VRAM
@@ -40,7 +64,14 @@ class DexterTranscriber:
         segments, info = self.model.transcribe(
             audio_file,
             beam_size=self.beam_size,
-            vad_filter=True  # Skip silence segments for speed
+            best_of=self.best_of,
+            temperature=self.temperature,
+            patience=self.patience,
+            log_prob_threshold=self.log_prob_threshold,
+            no_speech_threshold=self.no_speech_threshold,
+            condition_on_previous_text=self.condition_on_previous_text,
+            initial_prompt=self.initial_prompt or None,
+            vad_filter=True,  # Skip silence segments for speed
         )
 
         # Join all spoken segments

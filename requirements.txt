@@ -35,3 +35,6 @@ comtypes
 
 # ─── Tool Safety ───
 jsonschema
+
+# ─── Fuzzy Matching ───
+rapidfuzz

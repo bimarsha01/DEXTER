@@ -10,6 +10,25 @@
     "required": ["app_name"],
     "additionalProperties": false
   },
+  "resolve_open_target": {
+    "type": "object",
+    "properties": {
+      "query": {
+        "type": "string",
+        "description": "User request to resolve (e.g., app, folder, or file name)."
+      },
+      "match_id": {
+        "type": "string",
+        "description": "Match session id for follow-up selections."
+      },
+      "selection": {
+        "type": "string",
+        "description": "User follow-up selection (option number or name)."
+      }
+    },
+    "required": [],
+    "additionalProperties": false
+  },
   "close_application": {
     "type": "object",
     "properties": {
@@ -59,6 +78,21 @@
       }
     },
     "required": ["url"],
+    "additionalProperties": false
+  },
+  "open_url_in_browser": {
+    "type": "object",
+    "properties": {
+      "url": {
+        "type": "string",
+        "description": "URL to open."
+      },
+      "browser": {
+        "type": "string",
+        "description": "Browser name (chrome, edge, firefox, brave)."
+      }
+    },
+    "required": ["url", "browser"],
     "additionalProperties": false
   },
   "search_youtube": {

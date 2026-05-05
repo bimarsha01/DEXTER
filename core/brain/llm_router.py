@@ -60,6 +60,8 @@ class Brain:
             "You can control the user's PC, search the web, take screenshots, manage notes, "
             "check weather, system status, clipboard, and more using your tools. "
             "If you do not have a tool to perform an action, tell the user politely. "
+            "Speech transcription may contain minor errors; infer likely intended app names or commands "
+            "from context and ask for confirmation if ambiguous. "
             "Never use emojis. Start confirmations with 'Yes sir', 'Right away sir', or 'Understood'. "
             "If a request is ambiguous, politely ask for clarification. "
             "Keep responses short — 1 to 3 sentences maximum unless the user asks for detail."
@@ -305,7 +307,7 @@ class Brain:
                     args["confirm"] = True
                 self.pending_action = None
                 tool_result = await execute_tool(decision.tool_name, args)
-                response_text = str(tool_result)
+                response_text = self._handle_tool_response(decision.tool_name, tool_result)
                 self._add_history("user", user_command)
                 self._add_history("assistant", response_text)
                 return response_text
@@ -339,7 +341,7 @@ class Brain:
                 return self.pending_action.prompt
 
             tool_result = await execute_tool(decision.tool_name, decision.args)
-            response_text = str(tool_result)
+            response_text = self._handle_tool_response(decision.tool_name, tool_result)
             self._add_history("user", user_command)
             self._add_history("assistant", response_text)
             return response_text
@@ -479,6 +481,41 @@ class Brain:
 
     def _requires_confirmation(self, tool_name: str) -> bool:
         return tool_name in {"shutdown_pc", "restart_pc", "sleep_pc"}
+
+    def _handle_tool_response(self, tool_name: str, tool_result: Any) -> str:
+        if tool_name != "resolve_open_target":
+            return str(tool_result)
+
+        payload = self._parse_tool_payload(tool_result)
+        if not isinstance(payload, dict):
+            return str(tool_result)
+
+        status = payload.get("status")
+        if status == "ask":
+            prompt = payload.get("message") or "Please choose an option, sir."
+            match_id = payload.get("match_id")
+            if match_id:
+                self.pending_action = PendingAction(
+                    kind="open_choice",
+                    tool_name="resolve_open_target",
+                    args={"match_id": match_id},
+                    prompt=prompt,
+                    expires_at=time.time() + 45,
+                )
+            return prompt
+
+        message = payload.get("message")
+        return message or str(tool_result)
+
+    def _parse_tool_payload(self, tool_result: Any) -> Any:
+        if isinstance(tool_result, dict):
+            return tool_result
+        if isinstance(tool_result, str):
+            try:
+                return json.loads(tool_result)
+            except Exception:
+                return tool_result
+        return tool_result
 
     async def _handle_vision(self, decision, prompt: str) -> str:
         if decision.vision_mode == "screen":

@@ -24,12 +24,16 @@ _TOOL_MODULES: dict[str, list[str]] = {
     "tools.web_browser": [
         "search_google",
         "open_url",
+        "open_url_in_browser",
         "search_youtube",
     ],
     "tools.file_tools": [
         "create_note",
         "read_note",
         "list_notes",
+    ],
+    "tools.open_resolver": [
+        "resolve_open_target",
     ],
     "tools.input_tools": [
         "type_text",

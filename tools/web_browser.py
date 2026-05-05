@@ -1,3 +1,4 @@
+import subprocess
 import webbrowser
 import urllib.parse
 from utils.logger import get_logger
@@ -39,6 +40,39 @@ def open_url(url: str) -> str:
          
     except Exception as e:
          return f"Failed to open the requested URL."
+
+
+def open_url_in_browser(url: str, browser: str) -> str:
+    """
+    Opens a URL in a specific browser (chrome, edge, firefox, brave).
+    """
+    if not url:
+        return "You must provide a URL to open."
+    if not browser:
+        return open_url(url)
+
+    if not url.startswith("http"):
+        url = f"https://{url}"
+
+    browser_key = browser.lower().strip()
+    browser_map = {
+        "chrome": "chrome",
+        "google chrome": "chrome",
+        "edge": "msedge",
+        "microsoft edge": "msedge",
+        "firefox": "firefox",
+        "brave": "brave",
+    }
+    exe = browser_map.get(browser_key)
+    if not exe:
+        return open_url(url)
+
+    try:
+        subprocess.Popen(["cmd", "/c", "start", "", exe, url])
+        return f"Successfully opened {url} in {browser_key}."
+    except Exception as e:
+        logger.error("browser_open_failed", error=str(e), exc_info=True)
+        return f"Failed to open {url} in {browser_key}."
 
 def search_youtube(search_term: str) -> str:
     """

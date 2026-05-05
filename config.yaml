@@ -1,14 +1,23 @@
 bot_name: "Dexter"
 wake_words:
-  - "hey "
-  - "ok hey"
   - "hey"
+  - "hey dexter"
 
 wake_behavior:
   active_seconds: 30
   match_mode: "prefix"    # prefix or any
   min_confidence: 0.86
   max_prefix_tokens: 4
+
+activation:
+  mode: "clap"  # options: "wake_word" or "clap"
+  clap_sensitivity: 3.0
+  active_window_seconds: 30
+  start_active: true
+  min_command_words: 2
+  wake_words:
+    - "hey"
+    - "hey dexter"
 
 api_keys:
   gemini: ""               # Set GEMINI_API_KEY in .env or environment
@@ -42,8 +51,15 @@ audio_settings:
   sample_rate: 16000
   chunk_size: 512
 
-speed:
-  whisper_beam_size: 1     # 1 = fastest (greedy), 5 = most accurate. Recommended: 1 for real-time.
+stt:
+  beam_size: 3
+  best_of: 5
+  temperature: 0.0
+  patience: 1.0
+  log_prob_threshold: -1.0
+  no_speech_threshold: 0.6
+  condition_on_previous_text: false
+  initial_prompt: "Common Windows assistant commands and app names: open, close, start, launch, take screenshot, screen capture, set volume, clipboard, Chrome, Google Chrome, Edge, Microsoft Edge, Firefox, Spotify, Discord, Notepad, Calculator, Settings, File Explorer, Visual Studio Code, VS Code."
 
 history:
   max_tokens: 1800

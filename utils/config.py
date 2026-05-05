@@ -56,6 +56,17 @@ class WakeBehaviorConfig(BaseModel):
     max_prefix_tokens: int = 4
 
 
+class ActivationConfig(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    mode: str = "wake_word"
+    clap_sensitivity: float = 3.0
+    active_window_seconds: int = 30
+    start_active: bool = False
+    min_command_words: int = 2
+    wake_words: list[str] = Field(default_factory=lambda: ["hey", "hey dexter"])
+
+
 class AudioSettingsConfig(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
@@ -68,6 +79,24 @@ class SpeedConfig(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     whisper_beam_size: int = 1
+
+
+class SttConfig(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    beam_size: int = 3
+    best_of: int = 5
+    temperature: float = 0.0
+    patience: float = 1.0
+    log_prob_threshold: float = -1.0
+    no_speech_threshold: float = 0.6
+    condition_on_previous_text: bool = False
+    initial_prompt: str = (
+        "Common Windows assistant commands and app names: open, close, start, launch, "
+        "take screenshot, screen capture, set volume, clipboard, Chrome, Google Chrome, "
+        "Edge, Microsoft Edge, Firefox, Spotify, Discord, Notepad, Calculator, Settings, "
+        "File Explorer, Visual Studio Code, VS Code."
+    )
 
 
 class HistoryConfig(BaseModel):
@@ -87,12 +116,14 @@ class DexterConfig(BaseModel):
     bot_name: str = "Dexter"
     wake_words: list[str] = Field(default_factory=lambda: ["hey"])
     wake_behavior: WakeBehaviorConfig = Field(default_factory=WakeBehaviorConfig)
+    activation: ActivationConfig = Field(default_factory=ActivationConfig)
     models: ModelsConfig = Field(default_factory=ModelsConfig)
     defaults: DefaultsConfig = Field(default_factory=DefaultsConfig)
     security: SecurityConfig = Field(default_factory=SecurityConfig)
     rag: RagConfig = Field(default_factory=RagConfig)
     audio_settings: AudioSettingsConfig = Field(default_factory=AudioSettingsConfig)
     speed: SpeedConfig = Field(default_factory=SpeedConfig)
+    stt: SttConfig = Field(default_factory=SttConfig)
     history: HistoryConfig = Field(default_factory=HistoryConfig)
 
     gemini_api_key: str = ""
@@ -136,6 +167,8 @@ def _ensure_config_shape(config: dict) -> dict:
     config.setdefault("security", {})
     config.setdefault("audio_settings", {})
     config.setdefault("speed", {})
+    config.setdefault("stt", {})
+    config.setdefault("activation", {})
     return config
 
 
@@ -188,8 +221,9 @@ def config_validation_warnings(cfg: DexterConfig) -> list[str]:
         warnings.append("Gemini API key is not configured. Set GEMINI_API_KEY in .env or environment.")
     if not cfg.groq_api_key:
         warnings.append("Groq API key is not configured. Set GROQ_API_KEY in .env or environment.")
-    if not cfg.wake_words:
-        warnings.append("Wake words are missing. Add at least one wake word in config.yaml.")
+    activation_mode = (cfg.activation.mode or "wake_word").strip().lower()
+    if activation_mode == "wake_word" and not cfg.activation.wake_words:
+        warnings.append("Wake words are missing for wake_word mode. Add activation.wake_words in config.yaml.")
     return warnings
 
 

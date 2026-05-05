@@ -5,10 +5,13 @@ and plays audio using pygame for low-latency playback, with fallbacks.
 import edge_tts
 import asyncio
 import io
+import math
 import os
+import struct
 import time
 import uuid
 import threading
+import wave
 from utils.logger import get_logger
 from utils.metrics import metrics
 
@@ -65,7 +68,7 @@ class TTSManager:
             _safe_delete(audio_file)
 
             play_start = time.perf_counter()
-            await _play_audio_bytes(audio_bytes, cancel_event, self)
+            await _play_audio_bytes(audio_bytes, cancel_event, self, track_channel=True)
             metrics.record_latency("tts_play_ms", (time.perf_counter() - play_start) * 1000)
 
         except Exception as e:
@@ -73,6 +76,13 @@ class TTSManager:
         finally:
             _safe_delete(audio_file)
             self._channel = None
+
+    async def play_chime(self) -> None:
+        try:
+            audio_bytes = _load_chime_bytes()
+            await _play_audio_bytes(audio_bytes, threading.Event(), self, track_channel=False)
+        except Exception as e:
+            logger.debug("tts_chime_failed", error=str(e))
 
 
 async def speak(text: str, voice: str = "en-GB-RyanNeural"):
@@ -95,7 +105,12 @@ def _ensure_pygame_ready() -> None:
         _PYGAME_READY = True
 
 
-async def _play_audio_bytes(audio_bytes: bytes, cancel_event: threading.Event, manager: TTSManager) -> None:
+async def _play_audio_bytes(
+    audio_bytes: bytes,
+    cancel_event: threading.Event,
+    manager: TTSManager,
+    track_channel: bool = True,
+) -> None:
     _ensure_pygame_ready()
     import pygame
 
@@ -105,7 +120,8 @@ async def _play_audio_bytes(audio_bytes: bytes, cancel_event: threading.Event, m
     if channel is None:
         raise RuntimeError("pygame_failed_to_start_playback")
 
-    manager._channel = channel
+    if track_channel:
+        manager._channel = channel
     try:
         while channel.get_busy():
             if cancel_event.is_set() or manager._global_cancel.is_set():
@@ -114,8 +130,45 @@ async def _play_audio_bytes(audio_bytes: bytes, cancel_event: threading.Event, m
             await asyncio.sleep(0.05)
         logger.info("tts_playback_complete")
     finally:
-        if manager._channel is channel:
+        if track_channel and manager._channel is channel:
             manager._channel = None
+
+
+def _load_chime_bytes() -> bytes:
+    chime_path = _get_chime_path()
+    if os.path.exists(chime_path):
+        with open(chime_path, "rb") as handle:
+            return handle.read()
+
+    os.makedirs(os.path.dirname(chime_path), exist_ok=True)
+    audio_bytes = _generate_chime_wav_bytes()
+    with open(chime_path, "wb") as handle:
+        handle.write(audio_bytes)
+    logger.info("activation_chime_generated", path=chime_path)
+    return audio_bytes
+
+
+def _get_chime_path() -> str:
+    base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+    return os.path.join(base_dir, "assets", "sounds", "activate.mp3")
+
+
+def _generate_chime_wav_bytes(
+    duration_s: float = 0.3,
+    frequency: float = 880.0,
+    sample_rate: int = 48000,
+    volume: float = 0.25,
+) -> bytes:
+    frames = int(duration_s * sample_rate)
+    buffer = io.BytesIO()
+    with wave.open(buffer, "wb") as wav:
+        wav.setnchannels(1)
+        wav.setsampwidth(2)
+        wav.setframerate(sample_rate)
+        for i in range(frames):
+            sample = volume * math.sin(2 * math.pi * frequency * (i / sample_rate))
+            wav.writeframes(struct.pack("<h", int(sample * 32767)))
+    return buffer.getvalue()
 
 
 def _safe_delete(filepath: str):

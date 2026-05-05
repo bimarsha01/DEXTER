@@ -65,7 +65,14 @@ async def main():
         # Load Whisper on GPU for speech-to-text
         transcriber = DexterTranscriber(
             model_size=runtime_config.models.whisper_model,
-            beam_size=runtime_config.speed.whisper_beam_size,
+            beam_size=runtime_config.stt.beam_size,
+            best_of=runtime_config.stt.best_of,
+            temperature=runtime_config.stt.temperature,
+            patience=runtime_config.stt.patience,
+            log_prob_threshold=runtime_config.stt.log_prob_threshold,
+            no_speech_threshold=runtime_config.stt.no_speech_threshold,
+            condition_on_previous_text=runtime_config.stt.condition_on_previous_text,
+            initial_prompt=runtime_config.stt.initial_prompt,
         )
 
         # Load Silero VAD for voice activity detection
@@ -89,7 +96,9 @@ async def main():
         )
         logger.info("boot_spacer")
         logger.info("boot_banner_top", char="═", repeat=60)
-        logger.info("assistant_ready", wake_words=list(runtime_config.wake_words))
+        activation_mode = (runtime_config.activation.mode or "wake_word").strip().lower()
+        wake_words = list(runtime_config.activation.wake_words or runtime_config.wake_words)
+        logger.info("assistant_ready", activation_mode=activation_mode, wake_words=wake_words)
         logger.info("boot_banner_bottom", char="═", repeat=60)
 
         pipeline = AsyncPipeline(
