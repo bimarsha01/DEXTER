@@ -12,7 +12,6 @@ import json
 import asyncio
 import time
 import random
-import base64
 from typing import Any, Optional
 
 from utils.logger import get_logger, get_correlation_id
@@ -22,6 +21,7 @@ logger = get_logger("llm_router")
 from tools.registry import load_tools, execute_tool, EXECUTOR
 from tools.schema_registry import get_tool_schema
 from core.brain.intent_router import IntentRouter, PendingAction
+from tools.vision_tools import capture_screen_for_vision
 from utils.config import DexterConfig, get_config
 from core.event_bus import EventBus
 
@@ -59,6 +59,15 @@ class Brain:
             "Your tone is polite, calm, slightly formal, and extremely concise. "
             "You can control the user's PC, search the web, take screenshots, manage notes, "
             "check weather, system status, clipboard, and more using your tools. "
+            "When the user asks about weather, extract the city from the request and use get_weather with that city. "
+            "If no city is mentioned, use the configured default city before asking a follow-up. "
+            "When the user asks for the current time in a city, use get_current_time with that city. "
+            "When the user says open X in Y where X is a website and Y is a browser, always use the open_url_in_browser tool with both parameters. "
+            "When the user asks to open an application by name (e.g., 'open Spotify', 'open Discord', 'open Word'), ALWAYS use the open_application tool first. Never use a web browser to open a desktop application. "
+            "When the user asks to play, watch, find, search, or open content on a platform such as Spotify, YouTube Music, Netflix, ESPN, SoundCloud, Apple Music, Prime Video, or another site, use search_content_platform with both the content query and platform. "
+            "If no platform is mentioned, infer a sensible default from the content type, such as music, video, podcast, sports, or movie. "
+            "Use search_google only for general web searches, and use open_url or open_url_in_browser only when the user provides a direct URL. "
+            "Never confuse this with opening an application. "
             "If you do not have a tool to perform an action, tell the user politely. "
             "Speech transcription may contain minor errors; infer likely intended app names or commands "
             "from context and ask for confirmation if ambiguous. "
@@ -513,23 +522,28 @@ class Brain:
         if isinstance(tool_result, str):
             try:
                 return json.loads(tool_result)
-            except Exception:
+            except Exception as e:
+                logger.debug("tool_payload_parse_failed", error=str(e), exc_info=True)
                 return tool_result
         return tool_result
 
     async def _handle_vision(self, decision, prompt: str) -> str:
         if decision.vision_mode == "screen":
-            image_b64 = await execute_tool("capture_screen", {})
-            if not isinstance(image_b64, str) or "base64," not in image_b64:
-                return str(image_b64)
             try:
-                encoded = image_b64.split("base64,", 1)[1]
-                image_bytes = base64.b64decode(encoded)
+                capture = await asyncio.to_thread(capture_screen_for_vision)
             except Exception as e:
-                logger.error("vision_image_decode_failed", error=str(e), exc_info=True)
-                return "I could not decode the captured image."
+                logger.error("vision_capture_failed", error=str(e), exc_info=True)
+                return "I was unable to capture the screen for analysis."
             if self._can_use_provider("gemini", self.gemini_available):
-                return await self._process_gemini_vision(prompt, image_bytes)
+                vision_prompt = f"{prompt}\n\nCapture mode: {capture.capture_mode}\n"
+                if capture.foreground_window:
+                    vision_prompt += f"Foreground window (Active App): {capture.foreground_window}\n"
+                vision_prompt += (
+                    "Describe what is visible naturally and directly. Do not mention screenshots or files. "
+                    "If a Foreground window is provided, focus your description primarily on that application's content, as it is what the user is currently interacting with. "
+                    "CRITICAL: If you see a terminal, IDE, or code editor (e.g., VS Code, PyCharm, Command Prompt) running this assistant, COMPLETELY IGNORE IT. Describe the other applications visible on the screen (like web browsers, video players, etc.) instead."
+                )
+                return await self._process_gemini_vision(vision_prompt, capture.image_bytes)
             return "Vision analysis is only available with Gemini at the moment."
 
         if decision.vision_mode == "file":
@@ -637,7 +651,8 @@ class Brain:
             return dict(raw)
         try:
             return dict(raw)
-        except Exception:
+        except Exception as e:
+            logger.debug("function_call_args_normalize_failed", error=str(e), exc_info=True)
             return None
 
     @staticmethod
@@ -774,7 +789,7 @@ class Brain:
 
             response_parts = []
             for tool_name, args in ready_calls:
-                tr = await EXECUTOR.execute(tool_name, args)
+                tr = await EXECUTOR.execute(tool_name, args, event_bus=self._event_bus)
                 if tr.success:
                     data = tr.data
                     if isinstance(data, (dict, list)):

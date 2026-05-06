@@ -19,31 +19,49 @@ from utils.config import get_config, config_validation_warnings
 logger = get_logger("main")
 
 # ─── Add Nvidia DLLs for faster-whisper CUDA support on Windows ──────────────
-try:
-    for sp in site.getsitepackages():
-        for lib in ["cublas", "cudnn"]:
-            bin_path = os.path.join(sp, "nvidia", lib, "bin")
-            if os.path.exists(bin_path):
-                os.add_dll_directory(bin_path)
-                # Force-load critical DLLs
-                try:
-                    if "cublas" in lib:
-                        ctypes.CDLL(os.path.join(bin_path, "cublas64_12.dll"))
-                    elif "cudnn" in lib:
-                        ctypes.CDLL(os.path.join(bin_path, "cudnn64_9.dll"))
-                except OSError:
-                    logger.debug("nvidia_dll_preload_skipped", lib=lib)
-except Exception as e:
-    logger.warning("nvidia_dll_setup_failed", error=str(e))
+def _setup_cuda_dlls():
+    """Setup CUDA DLL paths for faster-whisper GPU support."""
+    cuda_paths = []
+    
+    # Add DLL directories for os.add_dll_directory (Windows 10.0.14286+)
+    try:
+        for sp in site.getsitepackages():
+            for lib in ["cublas", "cudnn", "cublaslt", "nccl", "cusparse"]:
+                bin_path = os.path.join(sp, "nvidia", lib, "bin")
+                if os.path.exists(bin_path):
+                    try:
+                        os.add_dll_directory(bin_path)
+                        logger.debug("cuda_dll_directory_added", lib=lib, path=bin_path)
+                        cuda_paths.append(bin_path)
+                    except Exception as e:
+                        logger.debug("cuda_dll_directory_failed", lib=lib, error=str(e))
+    except Exception as e:
+        logger.debug("cuda_dll_setup_exception", error=str(e))
+    
+    # Also add to PATH for broader compatibility
+    if cuda_paths:
+        current_path = os.environ.get("PATH", "")
+        os.environ["PATH"] = ";".join(cuda_paths) + ";" + current_path
+        logger.debug("cuda_paths_added_to_env", count=len(cuda_paths))
+
+_setup_cuda_dlls()
 
 # ─── Module Imports ──────────────────────────────────────────────────────────
-from core.audio.vad import VADListener
 from core.audio.transcriber import DexterTranscriber
 from core.audio.speaker import TTSManager
 from core.brain.llm_router import Brain
 from core.brain.memory import DexterMemory
 from core.event_bus import EventBus
 from core.pipeline import AsyncPipeline
+
+
+class _DisabledVADListener:
+    def listen(self, *args, **kwargs):
+        logger.warning(
+            "vad_disabled",
+            reason="VAD import failed at startup; microphone listening is unavailable in this session",
+        )
+        return None
 
 
 async def main():
@@ -75,8 +93,18 @@ async def main():
             initial_prompt=runtime_config.stt.initial_prompt,
         )
 
-        # Load Silero VAD for voice activity detection
-        ear = VADListener()
+        # Load Silero VAD for voice activity detection.
+        # If torch/VAD is unavailable, keep the assistant alive with listening disabled.
+        try:
+            from core.audio.vad import VADListener
+
+            ear = VADListener(
+                sample_rate=runtime_config.audio_settings.sample_rate,
+                chunk_size=runtime_config.audio_settings.chunk_size,
+            )
+        except Exception as e:
+            logger.warning("vad_import_failed", error=str(e), exc_info=True)
+            ear = _DisabledVADListener()
 
         # TTS manager with cancellation support
         tts_manager = TTSManager(voice=runtime_config.models.tts_voice)

@@ -88,7 +88,7 @@ class DexterMemory:
             if self._max_items and total <= self._max_items and not self._max_age_seconds:
                 return
 
-            payload = self.collection.get(include=["metadatas", "ids"])
+            payload = self.collection.get(include=["metadatas"])
             ids = payload.get("ids") or []
             metadatas = payload.get("metadatas") or []
             if not ids:

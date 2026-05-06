@@ -51,6 +51,15 @@ class TranscriptCorrector:
             "and",
             "with",
         }
+        self._mixed_command_markers = {
+            "in",
+            "on",
+            "from",
+            "to",
+            "with",
+            "via",
+            "into",
+        }
 
     def correct(self, text: str) -> CorrectionResult:
         if not text or not text.strip():
@@ -73,6 +82,10 @@ class TranscriptCorrector:
             for end in range(min(len(tokens), start + self._max_span_tokens), start, -1):
                 phrase_tokens = lowered[start:end]
                 if not phrase_tokens or all(t in self._stopwords for t in phrase_tokens):
+                    continue
+                if any(token in self._mixed_command_markers for token in phrase_tokens[:-1]):
+                    continue
+                if len(phrase_tokens) == 1 and phrase_tokens[0] != tokens[start].lower():
                     continue
                 phrase = " ".join(phrase_tokens)
 

@@ -1,11 +1,30 @@
 import os
 import subprocess
 import ctypes
+import shutil
 from utils.logger import get_logger
 
 logger = get_logger("pc_controls")
 from utils.config import get_config
 
+try:
+    import winreg
+except ImportError:  # pragma: no cover - only available on Windows
+    winreg = None
+
+try:
+    from rapidfuzz import process, fuzz
+except ImportError:
+    process = None
+    fuzz = None
+
+try:
+    import win32com.client
+except ImportError:
+    win32com = None
+
+_APP_CACHE = {}
+_APP_CACHE_LAST_REFRESH = 0
 
 APP_MAP = {
     "notepad": "notepad.exe",
@@ -54,6 +73,115 @@ APP_MAP = {
 DEFAULT_ALLOWED_APPS = set(APP_MAP.keys())
 
 
+import time
+
+def _search_registry_for_app(app_name: str) -> str:
+    if winreg is None:
+        return ""
+    app_name_exe = f"{app_name}.exe".lower()
+    for hive in (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE):
+        try:
+            with winreg.OpenKey(hive, r"Software\Microsoft\Windows\CurrentVersion\App Paths") as key:
+                for i in range(winreg.QueryInfoKey(key)[0]):
+                    subkey_name = winreg.EnumKey(key, i)
+                    if subkey_name.lower() == app_name_exe or subkey_name.lower().startswith(app_name.lower()):
+                        try:
+                            with winreg.OpenKey(key, subkey_name) as subkey:
+                                value, _ = winreg.QueryValueEx(subkey, "")
+                                if value and os.path.exists(value):
+                                    return value
+                        except OSError:
+                            pass
+        except OSError:
+            pass
+    return ""
+
+def _search_common_directories(app_name: str) -> str:
+    if not process or not fuzz:
+        return ""
+    
+    user_profile = os.environ.get("USERPROFILE", "")
+    program_files = os.environ.get("ProgramFiles", "C:\\Program Files")
+    program_files_x86 = os.environ.get("ProgramFiles(x86)", "C:\\Program Files (x86)")
+    
+    search_dirs = [
+        program_files,
+        program_files_x86,
+    ]
+    if user_profile:
+        search_dirs.extend([
+            os.path.join(user_profile, "AppData", "Roaming"),
+            os.path.join(user_profile, "AppData", "Local"),
+            os.path.join(user_profile, "AppData", "Local", "Microsoft", "WindowsApps"),
+        ])
+        
+    candidates = []
+    
+    for base_dir in search_dirs:
+        if not os.path.exists(base_dir):
+            continue
+        try:
+            for root, dirs, files in os.walk(base_dir):
+                depth = root[len(base_dir):].count(os.sep)
+                if depth > 3:
+                    dirs[:] = []
+                    continue
+                
+                for file in files:
+                    if file.lower().endswith(".exe"):
+                        candidates.append(os.path.join(root, file))
+        except Exception:
+            pass
+
+    if not candidates:
+        return ""
+
+    filenames = [os.path.basename(c).lower().replace(".exe", "") for c in candidates]
+    best = process.extractOne(app_name.lower(), filenames, scorer=fuzz.WRatio)
+    if best and best[1] > 85:
+        return candidates[best[2]]
+        
+    return ""
+
+def _search_start_menu(app_name: str) -> str:
+    if not process or not fuzz or not win32com:
+        return ""
+    
+    user_profile = os.environ.get("USERPROFILE", "")
+    search_dirs = [
+        r"C:\ProgramData\Microsoft\Windows\Start Menu\Programs"
+    ]
+    if user_profile:
+        search_dirs.append(os.path.join(user_profile, r"AppData\Roaming\Microsoft\Windows\Start Menu\Programs"))
+        
+    candidates = []
+    
+    for base_dir in search_dirs:
+        if not os.path.exists(base_dir):
+            continue
+        for root, _, files in os.walk(base_dir):
+            for file in files:
+                if file.lower().endswith(".lnk"):
+                    candidates.append(os.path.join(root, file))
+                    
+    if not candidates:
+        return ""
+
+    filenames = [os.path.basename(c).lower().replace(".lnk", "") for c in candidates]
+    best = process.extractOne(app_name.lower(), filenames, scorer=fuzz.WRatio)
+    if best and best[1] > 85:
+        lnk_path = candidates[best[2]]
+        try:
+            shell = win32com.client.Dispatch("WScript.Shell")
+            shortcut = shell.CreateShortCut(lnk_path)
+            target = shortcut.Targetpath
+            if target and os.path.exists(target):
+                return target
+        except Exception as e:
+            logger.error("shortcut_resolution_failed", path=lnk_path, error=str(e))
+            
+    return ""
+
 def open_application(app_name: str) -> str:
     """Opens a Windows application by name (e.g., 'notepad', 'calculator', 'chrome', 'spotify')."""
     app_name = app_name.lower().strip()
@@ -66,23 +194,67 @@ def open_application(app_name: str) -> str:
     if allowed and app_name not in allowed:
         return f"'{app_name}' is not in the allowed applications list."
 
-    # Comprehensive map of common app names to executables
-    command = APP_MAP.get(app_name)
-    if command:
+    global _APP_CACHE, _APP_CACHE_LAST_REFRESH
+    if time.time() - _APP_CACHE_LAST_REFRESH > 86400:
+        _APP_CACHE.clear()
+        _APP_CACHE_LAST_REFRESH = time.time()
+        
+    if app_name in _APP_CACHE:
+        cached_path = _APP_CACHE[app_name]
+        if os.path.exists(cached_path):
+            try:
+                subprocess.Popen([cached_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                return f"Successfully opened {app_name} (from cache), sir."
+            except Exception as e:
+                logger.error("app_open_cached_failed", app_name=app_name, error=str(e))
+
+    command = APP_MAP.get(app_name) or app_name
+    resolved = _resolve_command(command)
+    if resolved and (os.path.exists(resolved) or resolved == command):
         try:
-            os.startfile(command)
+            if resolved.endswith(".exe") or os.path.exists(resolved):
+                subprocess.Popen([resolved], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                _APP_CACHE[app_name] = resolved
+            else:
+                os.startfile(command)
             return f"Successfully opened {app_name}, sir."
         except Exception as e:
-            logger.error("app_open_failed", app_name=app_name, error=str(e), exc_info=True)
-            return f"Error opening {app_name}: {str(e)}"
+            logger.debug("app_open_s1_failed", error=str(e))
 
-    # Fallback: try to launch it via Windows Start
+    reg_path = _search_registry_for_app(app_name)
+    if reg_path:
+        try:
+            subprocess.Popen([reg_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            _APP_CACHE[app_name] = reg_path
+            return f"Successfully opened {app_name} (registry), sir."
+        except Exception as e:
+            logger.debug("app_open_s2_failed", error=str(e))
+
+    lnk_path = _search_start_menu(app_name)
+    if lnk_path:
+        try:
+            subprocess.Popen([lnk_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            _APP_CACHE[app_name] = lnk_path
+            return f"Successfully opened {app_name} (start menu), sir."
+        except Exception as e:
+            logger.debug("app_open_s5_failed", error=str(e))
+
+    fuzz_path = _search_common_directories(app_name)
+    if fuzz_path:
+        try:
+            subprocess.Popen([fuzz_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            _APP_CACHE[app_name] = fuzz_path
+            return f"Successfully opened {app_name} (fuzzy search), sir."
+        except Exception as e:
+            logger.debug("app_open_s3_failed", error=str(e))
+
     try:
         subprocess.Popen(["cmd", "/c", "start", "", app_name])
-        return f"Attempted to open {app_name} via Windows, sir."
+        return f"Attempted to open {app_name} via Windows Shell, sir."
     except Exception as e:
         logger.error("app_open_start_failed", app_name=app_name, error=str(e), exc_info=True)
-        return f"I could not find or launch '{app_name}', sir."
+
+    return f"I could not find {app_name} installed on your system sir. Would you like me to search for it online instead?"
 
 
 def close_application(app_name: str) -> str:
@@ -185,3 +357,25 @@ def _get_allowed_apps() -> set:
     if isinstance(allowed, list) and allowed:
         return {str(item).lower().strip() for item in allowed}
     return DEFAULT_ALLOWED_APPS
+
+
+def _resolve_command(command: str) -> str:
+    if not command.lower().endswith(".exe"):
+        return command
+
+    which_path = shutil.which(command)
+    if which_path:
+        return which_path
+
+    if winreg is not None:
+        reg_path = rf"Software\Microsoft\Windows\CurrentVersion\App Paths\{command}"
+        for hive in (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE):
+            try:
+                with winreg.OpenKey(hive, reg_path) as key:
+                    value, _ = winreg.QueryValueEx(key, "")
+                    if value and os.path.exists(value):
+                        return value
+            except OSError:
+                pass
+
+    return command

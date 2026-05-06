@@ -4,15 +4,33 @@ clipboard, screenshots, and power management.
 """
 import os
 import subprocess
-import time
 import urllib.request
 import urllib.parse
 from datetime import datetime
+from zoneinfo import ZoneInfo
 from utils.logger import get_logger
 from utils.config import get_config
 from utils.metrics import metrics
 
 logger = get_logger("system_tools")
+
+
+_CITY_TIMEZONES = {
+    "mumbai": "Asia/Kolkata",
+    "bombay": "Asia/Kolkata",
+    "delhi": "Asia/Kolkata",
+    "new delhi": "Asia/Kolkata",
+    "bangalore": "Asia/Kolkata",
+    "bengaluru": "Asia/Kolkata",
+    "kathmandu": "Asia/Kathmandu",
+    "london": "Europe/London",
+    "new york": "America/New_York",
+    "los angeles": "America/Los_Angeles",
+    "chicago": "America/Chicago",
+    "tokyo": "Asia/Tokyo",
+    "singapore": "Asia/Singapore",
+    "sydney": "Australia/Sydney",
+}
 
 
 def get_current_datetime() -> str:
@@ -21,6 +39,25 @@ def get_current_datetime() -> str:
     return (
         f"Today is {now.strftime('%A, %B %d, %Y')}. "
         f"The current time is {now.strftime('%I:%M %p')}."
+    )
+
+
+def get_current_time(city: str = "") -> str:
+    """Returns the current local time, or the current time in a named city when a timezone is known."""
+    clean_city = (city or "").strip()
+    if not clean_city:
+        now = datetime.now()
+        return f"The current time is {now.strftime('%I:%M %p')}."
+
+    timezone_name = _CITY_TIMEZONES.get(clean_city.lower())
+    if timezone_name:
+        now = datetime.now(ZoneInfo(timezone_name))
+        return f"The current time in {clean_city} is {now.strftime('%I:%M %p')}."
+
+    now = datetime.now()
+    return (
+        f"I can tell you the current local time, but I do not have a timezone mapping for {clean_city}. "
+        f"The current time here is {now.strftime('%I:%M %p')}."
     )
 
 
@@ -34,6 +71,7 @@ def get_weather(city: str) -> str:
         weather_data = response.read().decode("utf-8").strip()
         return f"Weather in {city}: {weather_data}"
     except urllib.error.URLError:
+        logger.warning("weather_service_unreachable", city=city)
         return f"I could not reach the weather service for {city}, sir. Please check your internet connection."
     except Exception as e:
         logger.error("weather_fetch_failed", error=str(e), exc_info=True)
@@ -127,17 +165,25 @@ def copy_to_clipboard(text: str) -> str:
 
 
 def take_screenshot() -> str:
-    """Takes a screenshot of the entire screen and saves it to the user's Desktop."""
+    """Takes a screenshot of the user's current screen and saves it to the Desktop."""
     try:
-        import pyautogui
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        desktop = os.path.join(os.path.expanduser("~"), "Desktop")
-        filepath = os.path.join(desktop, f"dexter_screenshot_{timestamp}.png")
+        from PIL import ImageGrab
+        from tools.vision_tools import hide_ide_if_foreground, restore_ide
+        
+        hidden_hwnd = hide_ide_if_foreground()
+        try:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            desktop = os.path.join(os.path.expanduser("~"), "Desktop")
+            filepath = os.path.join(desktop, f"dexter_screenshot_{timestamp}.png")
 
-        screenshot = pyautogui.screenshot()
-        screenshot.save(filepath)
-        logger.info("screenshot_saved", path=filepath)
-        return f"Screenshot saved to your Desktop as dexter_screenshot_{timestamp}.png"
+            # Always capture full screen — this shows exactly what the user sees
+            screenshot = ImageGrab.grab(all_screens=True)
+                
+            screenshot.save(filepath)
+            logger.info("screenshot_saved", path=filepath, ide_was_hidden=hidden_hwnd is not None)
+            return f"Screenshot saved to your Desktop as dexter_screenshot_{timestamp}.png, sir."
+        finally:
+            restore_ide(hidden_hwnd)
     except Exception as e:
         logger.error("screenshot_failed", error=str(e), exc_info=True)
         return f"I was unable to capture the screenshot: {str(e)}"

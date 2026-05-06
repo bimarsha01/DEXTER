@@ -27,7 +27,7 @@ class ModelsConfig(BaseModel):
 class DefaultsConfig(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
-    city: str = ""
+    city: str = "Kathmandu"
 
 
 class SecurityConfig(BaseModel):
@@ -105,6 +105,12 @@ class HistoryConfig(BaseModel):
     max_tokens: int = 1800
 
 
+class McpConfig(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    enabled: bool = False
+
+
 class DexterConfig(BaseModel):
     """
     Runtime configuration loaded from config.yaml plus .env (API keys).
@@ -122,9 +128,9 @@ class DexterConfig(BaseModel):
     security: SecurityConfig = Field(default_factory=SecurityConfig)
     rag: RagConfig = Field(default_factory=RagConfig)
     audio_settings: AudioSettingsConfig = Field(default_factory=AudioSettingsConfig)
-    speed: SpeedConfig = Field(default_factory=SpeedConfig)
     stt: SttConfig = Field(default_factory=SttConfig)
     history: HistoryConfig = Field(default_factory=HistoryConfig)
+    mcp: McpConfig = Field(default_factory=McpConfig)
 
     gemini_api_key: str = ""
     groq_api_key: str = ""
@@ -169,6 +175,7 @@ def _ensure_config_shape(config: dict) -> dict:
     config.setdefault("speed", {})
     config.setdefault("stt", {})
     config.setdefault("activation", {})
+    config.setdefault("mcp", {})
     return config
 
 

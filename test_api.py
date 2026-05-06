@@ -2,6 +2,7 @@
 import sys
 
 from utils.config import get_config
+from utils.logger import get_logger
 
 # Force UTF-8 output
 sys.stdout.reconfigure(encoding="utf-8")
@@ -59,6 +60,7 @@ except Exception as e:
 
 # Write to file
 with open("test_output.txt", "w", encoding="utf-8") as f:
+    logger = get_logger("test_api")
     for line in results:
         f.write(line + "\n")
-        print(line)
+        logger.info("api_test_result", line=line)

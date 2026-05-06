@@ -26,6 +26,7 @@ _TOOL_MODULES: dict[str, list[str]] = {
         "open_url",
         "open_url_in_browser",
         "search_youtube",
+        "search_content_platform",
     ],
     "tools.file_tools": [
         "create_note",
@@ -42,6 +43,7 @@ _TOOL_MODULES: dict[str, list[str]] = {
         "minimize_all_windows",
     ],
     "tools.system_tools": [
+        "get_current_time",
         "get_current_datetime",
         "get_weather",
         "get_system_status",
@@ -57,6 +59,9 @@ _TOOL_MODULES: dict[str, list[str]] = {
     "tools.vision_tools": [
         "read_workspace_file",
         "capture_screen",
+    ],
+    "tools.youtube_tool": [
+        "play_youtube",
     ],
 }
 

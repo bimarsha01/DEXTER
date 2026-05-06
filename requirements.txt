@@ -4,6 +4,7 @@ edge-tts
 pyyaml
 python-dotenv
 pydantic
+tzdata
 structlog
 
 # ─── LLM Backends ───
@@ -38,3 +39,4 @@ jsonschema
 
 # ─── Fuzzy Matching ───
 rapidfuzz
+yt-dlp

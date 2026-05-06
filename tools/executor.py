@@ -109,7 +109,7 @@ class ToolExecutor:
         if properties:
             validate(instance=args, schema=schema)
 
-    async def execute(self, tool_name: str, args: dict) -> ToolResult:
+    async def execute(self, tool_name: str, args: dict, event_bus: Any = None) -> ToolResult:
         func = self._tools.get(tool_name)
         if not func:
             logger.info(
@@ -152,6 +152,8 @@ class ToolExecutor:
                 duration_ms=duration_ms,
                 error=None,
             )
+            if event_bus is not None:
+                event_bus.emit("tool_called", {"tool_name": tool_name, "args": clean_args})
             return ToolResult(
                 success=True,
                 data=result,

@@ -5,6 +5,7 @@ from typing import Dict, Optional
 
 from utils.config import DexterConfig
 from utils.logger import get_logger
+from tools.pc_controls import APP_MAP
 
 logger = get_logger("intent_router")
 
@@ -31,7 +32,7 @@ class PendingAction:
 
 class IntentRouter:
     def __init__(self, config: DexterConfig):
-        self.default_city = (config.defaults.city or "").strip()
+        self.default_city = (config.defaults.city or "Kathmandu").strip()
         logger.info("intent_router_initialized", has_default_city=bool(self.default_city))
 
     def resolve_pending(self, text: str, pending: PendingAction) -> IntentDecision:
@@ -68,6 +69,14 @@ class IntentRouter:
                     return IntentDecision(action="tool", tool_name=pending.tool_name, args=args)
                 return IntentDecision(action="ask", prompt=pending.prompt)
 
+            if pending.tool_name == "copy_to_clipboard":
+                content = text.strip()
+                if content:
+                    args = dict(pending.args)
+                    args["text"] = content
+                    return IntentDecision(action="tool", tool_name=pending.tool_name, args=args)
+                return IntentDecision(action="ask", prompt=pending.prompt)
+
         if pending.kind == "open_choice":
             match_id = pending.args.get("match_id")
             if match_id:
@@ -78,21 +87,22 @@ class IntentRouter:
                 )
             return IntentDecision(action="ask", prompt=pending.prompt)
 
-            if pending.tool_name == "copy_to_clipboard":
-                content = text.strip()
-                if content:
-                    args = dict(pending.args)
-                    args["text"] = content
-                    return IntentDecision(action="tool", tool_name=pending.tool_name, args=args)
-                return IntentDecision(action="ask", prompt=pending.prompt)
-
         return IntentDecision(action="ask", prompt=pending.prompt)
 
     def detect_intent(self, text: str) -> IntentDecision:
         lowered = text.lower().strip()
         normalized = self._strip_filler_prefixes(lowered)
 
-        browser_match = re.match(r"open\s+(.+?)\s+in\s+(chrome|edge|firefox|brave)$", normalized)
+        direct_app_match = re.match(r"^(?:open|launch|start)\s+(.+)$", normalized)
+        if direct_app_match:
+            app_name = direct_app_match.group(1).strip()
+            if self._should_launch_directly(app_name):
+                return IntentDecision(action="tool", tool_name="open_application", args={"app_name": app_name})
+
+        browser_match = re.match(
+            r"open\s+(.+?)\s+in\s+(chrome|google chrome|edge|microsoft edge|firefox|brave)$",
+            normalized,
+        )
         if browser_match:
             target = browser_match.group(1).strip()
             browser = browser_match.group(2).strip()
@@ -108,6 +118,63 @@ class IntentRouter:
                 tool_name="search_google",
                 args={"query": target},
             )
+
+        bare_browser_match = re.match(
+            r"^(.+?)\s+(?:in|on)\s+(chrome|google chrome|edge|microsoft edge|firefox|brave)$",
+            normalized,
+        )
+        if bare_browser_match:
+            target = bare_browser_match.group(1).strip()
+            browser = bare_browser_match.group(2).strip()
+            url = self._resolve_known_url(target)
+            if url:
+                return IntentDecision(
+                    action="tool",
+                    tool_name="open_url_in_browser",
+                    args={"url": url, "browser": browser},
+                )
+            if self._looks_like_content_request(target):
+                return IntentDecision(
+                    action="tool",
+                    tool_name="search_content_platform",
+                    args={
+                        "query": target,
+                        "platform": browser,
+                        "content_type": self._infer_content_type("open", target, browser),
+                    },
+                )
+
+        content_request = self._detect_content_request(normalized)
+        if content_request:
+            action, query, platform = content_request
+            content_type = self._infer_content_type(action, query, platform)
+            if not platform:
+                platform = self._default_platform_for_content(content_type)
+            return IntentDecision(
+                action="tool",
+                tool_name="search_content_platform",
+                args={
+                    "query": query,
+                    "platform": platform,
+                    "content_type": content_type,
+                },
+            )
+
+        if self._is_temperature_request(normalized):
+            city = self._extract_city(text)
+            if not city and self.default_city:
+                city = self.default_city
+            if not city:
+                return IntentDecision(
+                    action="ask",
+                    tool_name="get_weather",
+                    prompt="Which city should I check, sir?",
+                )
+            return IntentDecision(action="tool", tool_name="get_weather", args={"city": city})
+
+        if self._is_time_request(normalized):
+            city = self._extract_city(text)
+            return IntentDecision(action="tool", tool_name="get_current_time", args={"city": city})
 
         # Screenshot tool intents
         if (
@@ -159,6 +226,8 @@ class IntentRouter:
         if app_match:
             app_name = app_match.group(1).strip()
             if app_name:
+                if self._should_launch_directly(app_name):
+                    return IntentDecision(action="tool", tool_name="open_application", args={"app_name": app_name})
                 return IntentDecision(action="tool", tool_name="resolve_open_target", args={"query": app_name})
             return IntentDecision(action="ask", tool_name="resolve_open_target", prompt="What should I open, sir?")
 
@@ -178,7 +247,8 @@ class IntentRouter:
         return IntentDecision(action="none")
 
     def _strip_filler_prefixes(self, text: str) -> str:
-        cleaned = re.sub(r"\s+", " ", text).strip()
+        cleaned = re.sub(r"[.!?]+$", "", text.strip())
+        cleaned = re.sub(r"\s+", " ", cleaned).strip()
         if not cleaned:
             return cleaned
         tokens = cleaned.split(" ")
@@ -195,10 +265,168 @@ class IntentRouter:
             return clean
         mapping = {
             "youtube": "https://www.youtube.com",
+            "youtube music": "https://music.youtube.com",
+            "spotify": "https://open.spotify.com",
+            "soundcloud": "https://soundcloud.com",
+            "netflix": "https://www.netflix.com",
+            "prime video": "https://www.primevideo.com",
+            "apple music": "https://music.apple.com",
+            "espn": "https://www.espn.com",
             "gmail": "https://mail.google.com",
             "google": "https://www.google.com",
         }
         return mapping.get(clean, "")
+
+    def _should_launch_directly(self, app_name: str) -> bool:
+        clean = app_name.strip().lower()
+        if not clean:
+            return False
+        if clean in APP_MAP:
+            return True
+        direct_keywords = {
+            "chrome",
+            "google chrome",
+            "edge",
+            "microsoft edge",
+            "firefox",
+            "brave",
+            "spotify",
+            "discord",
+            "word",
+            "excel",
+            "powerpoint",
+            "outlook",
+            "notepad",
+            "calculator",
+            "file explorer",
+            "explorer",
+            "vscode",
+            "visual studio code",
+            "vs code",
+        }
+        return clean in direct_keywords
+
+    def _detect_content_request(self, normalized: str) -> tuple[str, str, str] | None:
+        platform_match = re.match(
+            r"^(?:(play|watch|find|search|open)(?:\s+for)?\s+)?(.+?)\s+(?:on|in|from)\s+(.+)$",
+            normalized,
+        )
+        if platform_match:
+            action = (platform_match.group(1) or "open").strip()
+            query = platform_match.group(2).strip()
+            platform = platform_match.group(3).strip()
+            if not self._looks_like_content_request(query) and not self._is_known_platform(platform):
+                return None
+            return action, query, platform
+
+        simple_match = re.match(r"^(play|watch|find|open)(?:\s+for)?\s+(.+)$", normalized)
+        if simple_match:
+            action = simple_match.group(1).strip()
+            query = simple_match.group(2).strip()
+            if action == "open" and not self._looks_like_content_request(query):
+                return None
+            return action, query, ""
+
+        return None
+
+    def _is_known_platform(self, platform: str) -> bool:
+        clean = self._normalize_platform(platform)
+        known = {
+            "youtube",
+            "youtube music",
+            "spotify",
+            "soundcloud",
+            "apple music",
+            "netflix",
+            "prime video",
+            "espn",
+            "twitch",
+        }
+        return clean in known
+
+    def _normalize_platform(self, platform: str) -> str:
+        cleaned = (platform or "").strip().lower()
+        cleaned = cleaned.replace("https://", "").replace("http://", "")
+        cleaned = cleaned.split("/")[0]
+        cleaned = cleaned.replace("www.", "")
+        cleaned = re.sub(r"\s+", " ", cleaned)
+        aliases = {
+            "yt music": "youtube music",
+            "music.youtube": "youtube music",
+            "music.apple": "apple music",
+            "amazon prime video": "prime video",
+        }
+        return aliases.get(cleaned, cleaned)
+
+    def _looks_like_content_request(self, query: str) -> bool:
+        text = query.lower()
+        keywords = [
+            "song",
+            "music",
+            "playlist",
+            "album",
+            "track",
+            "artist",
+            "podcast",
+            "episode",
+            "movie",
+            "film",
+            "show",
+            "series",
+            "tv",
+            "video",
+            "highlight",
+            "highlights",
+            "sports",
+            "sport",
+            "match",
+            "game",
+            "stream",
+        ]
+        return any(keyword in text for keyword in keywords)
+
+    def _is_temperature_request(self, normalized: str) -> bool:
+        return bool(re.search(r"\b(temp|temperature|weather|forecast)\b", normalized))
+
+    def _is_time_request(self, normalized: str) -> bool:
+        if not re.search(r"\btime\b", normalized):
+            return False
+        if any(word in normalized for word in ["timer", "timesheet"]):
+            return False
+        return True
+
+    def _infer_content_type(self, action: str, query: str, platform: str = "") -> str:
+        text = f"{action} {query} {platform}".lower()
+        if any(keyword in text for keyword in ["netflix", "prime video", "apple tv", "disney+", "hulu"]):
+            if any(keyword in text for keyword in ["show", "series", "episode", "tv"]):
+                return "tv"
+            return "movie"
+        if any(keyword in text for keyword in ["youtube music", "spotify", "soundcloud", "apple music"]):
+            return "music"
+        if any(keyword in text for keyword in ["podcast", "episode", "interview"]):
+            return "podcast"
+        if any(keyword in text for keyword in ["movie", "film", "series", "show", "tv"]):
+            return "movie"
+        if any(keyword in text for keyword in ["highlight", "highlights", "sports", "sport", "match", "game", "f1", "nba", "nfl", "ucl"]):
+            return "sports"
+        if any(keyword in text for keyword in ["song", "music", "playlist", "album", "track", "artist", "lo-fi", "lofi"]):
+            return "music"
+        if action == "watch":
+            return "video"
+        if action == "play":
+            return "music"
+        return "general"
+
+    def _default_platform_for_content(self, content_type: str) -> str:
+        defaults = {
+            "music": "youtube music",
+            "podcast": "spotify",
+            "video": "youtube",
+            "movie": "netflix",
+            "sports": "youtube",
+            "general": "youtube",
+        }
+        return defaults.get(content_type, "youtube")
 
     def build_pending_slot(self, decision: IntentDecision, ttl_seconds: int = 45) -> PendingAction:
         return PendingAction(
@@ -219,7 +447,14 @@ class IntentRouter:
         )
 
     def _extract_city(self, text: str) -> str:
-        match = re.search(r"(?:in|for|of)\s+([A-Za-z\s]+)$", text)
+        cleaned = re.sub(r"[?.!,]+$", "", text.strip())
+        match = re.search(
+            r"\b(?:in|for|of)\s+([A-Za-z][A-Za-z\s\-']*?)(?:\s+(?:today|now|please|sir))?$",
+            cleaned,
+            re.IGNORECASE,
+        )
         if match:
-            return match.group(1).strip()
+            city = match.group(1).strip()
+            city = re.sub(r"\b(?:today|now|please|sir)\b$", "", city, flags=re.IGNORECASE).strip()
+            return city
         return ""

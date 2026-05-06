@@ -98,10 +98,70 @@ class AsyncPipeline:
             return [p for p in parts[:-1] if p.strip()], ""
         return [p for p in parts[:-1] if p.strip()], parts[-1]
 
+    @staticmethod
+    def _looks_actionable_utterance(text: str) -> bool:
+        normalized = (text or "").strip().lower()
+        if not normalized:
+            return False
+
+        command_starts = (
+            "open ",
+            "launch ",
+            "start ",
+            "close ",
+            "play ",
+            "watch ",
+            "find ",
+            "search ",
+            "set ",
+            "increase ",
+            "decrease ",
+            "turn ",
+            "lock ",
+            "shutdown",
+            "restart",
+            "sleep",
+            "take ",
+            "capture ",
+            "read ",
+            "copy ",
+            "type ",
+            "press ",
+            "describe ",
+            "analyze ",
+        )
+        if normalized.startswith(command_starts):
+            return True
+
+        query_hints = ("what is", "what's", "whats", "tell me", "how is", "how's", "what am", "what do")
+        tool_keywords = (
+            "weather",
+            "temperature",
+            "forecast",
+            "time",
+            "date",
+            "clipboard",
+            "screenshot",
+            "screen",
+            "volume",
+            "system status",
+            "battery",
+            "cpu",
+            "ram",
+            "looking at",
+            "look at",
+            "see",
+        )
+        if any(keyword in normalized for keyword in tool_keywords):
+            if normalized.endswith("?") or normalized.startswith(query_hints):
+                return True
+
+        return False
+
     async def _stream_response(self, command: str, memory_context: str) -> str:
         response_text = ""
         sentence_buffer = ""
-        tts_tasks: list[asyncio.Task] = []
+        sentences_queue: list[tuple[str, bool]] = []
         speaking_started = False
 
         async for chunk in self.brain.process_command_stream(command, long_term_memory=memory_context):
@@ -119,9 +179,7 @@ class AsyncPipeline:
                     interrupt = True
                 else:
                     interrupt = False
-                tts_tasks.append(
-                    asyncio.create_task(self.tts.speak(sentence, interrupt=interrupt))
-                )
+                sentences_queue.append((sentence, interrupt))
 
         if sentence_buffer.strip():
             if not speaking_started:
@@ -130,19 +188,18 @@ class AsyncPipeline:
                 interrupt = True
             else:
                 interrupt = False
-            tts_tasks.append(
-                asyncio.create_task(self.tts.speak(sentence_buffer.strip(), interrupt=interrupt))
-            )
+            sentences_queue.append((sentence_buffer.strip(), interrupt))
 
-        if tts_tasks:
-            results = await asyncio.gather(*tts_tasks, return_exceptions=True)
-            for result in results:
-                if isinstance(result, Exception):
-                    logger.error("tts_task_failed", error=str(result), exc_info=True)
-                    self.event_bus.emit(
-                        "error_occurred",
-                        {"component": "tts", "error": str(result)},
-                    )
+        # Play sentences sequentially to avoid overlapping audio
+        for sentence, interrupt in sentences_queue:
+            try:
+                await self.tts.speak(sentence, interrupt=interrupt)
+            except Exception as e:
+                logger.error("tts_speak_failed", error=str(e), exc_info=True)
+                self.event_bus.emit(
+                    "error_occurred",
+                    {"component": "tts", "error": str(e)},
+                )
 
         return response_text.strip()
 
@@ -173,8 +230,8 @@ class AsyncPipeline:
                     try:
                         # Ensure we return to IDLE to avoid stuck states
                         self._set_state(AssistantState.IDLE)
-                    except Exception:
-                        pass
+                    except Exception as reset_error:
+                        logger.error("pipeline_state_reset_failed", error=str(reset_error), exc_info=True)
                     # small delay before retrying to avoid busy-looping on persistent errors
                     await asyncio.sleep(1)
         finally:
@@ -226,6 +283,7 @@ class AsyncPipeline:
 
             if self.activation_mode == "wake_word":
                 detection = self.wake_detector.detect(identified_text) if self.wake_detector else None
+                bypass_activation = False
 
                 if detection and detection.triggered:
                     self._open_wake_window()
@@ -240,19 +298,35 @@ class AsyncPipeline:
                 elif self._is_awake():
                     clean_command = identified_text
                 else:
-                    self._set_state(AssistantState.IDLE)
-                    return
+                    if self._looks_actionable_utterance(identified_text):
+                        clean_command = identified_text
+                        bypass_activation = True
+                        self._open_wake_window()
+                        logger.info("activation_bypassed", mode="wake_word", reason="actionable_utterance")
+                    else:
+                        self._set_state(AssistantState.IDLE)
+                        return
 
                 correction = self.corrector.correct(clean_command)
                 clean_command = correction.corrected
             else:
+                bypass_activation = False
                 if not self._is_awake() and not self.brain.pending_action:
-                    self._set_state(AssistantState.IDLE)
-                    return
+                    if self._looks_actionable_utterance(identified_text):
+                        bypass_activation = True
+                        self._open_wake_window()
+                        logger.info("activation_bypassed", mode="clap", reason="actionable_utterance")
+                    else:
+                        self._set_state(AssistantState.IDLE)
+                        return
 
                 correction = self.corrector.correct(identified_text)
                 clean_command = correction.corrected
-                if not self.brain.pending_action and len(clean_command.split()) < self.min_command_words:
+                if (
+                    not bypass_activation
+                    and not self.brain.pending_action
+                    and len(clean_command.split()) < self.min_command_words
+                ):
                     self._set_state(AssistantState.IDLE)
                     return
 
@@ -262,7 +336,7 @@ class AsyncPipeline:
                 logger.info("activation_window_extended", seconds=self.command_window_seconds)
             self._set_state(AssistantState.PROCESSING)
 
-            memory_context = self.memory.recall_context(clean_command)
+            memory_context = await asyncio.to_thread(self.memory.recall_context, clean_command)
             response_text = await self._stream_response(clean_command, memory_context)
 
             if self.activation_mode == "clap" and self.brain.pending_action:
@@ -273,7 +347,10 @@ class AsyncPipeline:
             logger.info("response_complete", response_preview=response_text[:500])
 
             try:
-                self.memory.remember(f"User: {clean_command} | Dexter: {response_text}")
+                await asyncio.to_thread(
+                    self.memory.remember,
+                    f"User: {clean_command} | Dexter: {response_text}",
+                )
             except Exception as e:
                 logger.error("memory_save_failed", error=str(e), exc_info=True)
 

@@ -10,7 +10,7 @@ wake_behavior:
   max_prefix_tokens: 4
 
 activation:
-  mode: "clap"  # options: "wake_word" or "clap"
+  mode: "wake_word"  # options: "wake_word" or "clap"
   clap_sensitivity: 3.0
   active_window_seconds: 30
   start_active: true
@@ -31,7 +31,7 @@ models:
   tts_voice: "en-GB-RyanNeural"                # Professional British Male Voice (Edge-TTS, free)
 
 defaults:
-  city: ""
+  city: "Kathmandu"
 
 security:
   require_confirm_power_actions: true
@@ -63,3 +63,6 @@ stt:
 
 history:
   max_tokens: 1800
+
+mcp:
+  enabled: false

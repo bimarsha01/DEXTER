@@ -106,6 +106,49 @@
     "required": ["search_term"],
     "additionalProperties": false
   },
+  "search_content_platform": {
+    "type": "object",
+    "properties": {
+      "query": {
+        "type": "string",
+        "description": "What to search for on the platform."
+      },
+      "platform": {
+        "type": "string",
+        "description": "Target platform or site name, such as Spotify, YouTube Music, Netflix, ESPN, SoundCloud, Apple Music, or Prime Video."
+      },
+      "content_type": {
+        "type": "string",
+        "description": "Optional hint for content type such as music, video, podcast, sports, movie, tv, or general."
+      },
+      "browser": {
+        "type": "string",
+        "description": "Optional browser name to use, such as chrome, edge, firefox, or brave."
+      }
+    },
+    "required": ["query"],
+    "additionalProperties": false
+  },
+  "play_youtube": {
+    "type": "object",
+    "properties": {
+      "query": {
+        "type": "string",
+        "description": "Search term or direct YouTube URL/video identifier."
+      },
+      "browser": {
+        "type": "string",
+        "description": "Optional browser name to use, such as chrome, edge, firefox, or brave."
+      },
+      "mode": {
+        "type": "string",
+        "description": "Playback mode, currently browser only.",
+        "enum": ["browser", "stream"]
+      }
+    },
+    "required": ["query"],
+    "additionalProperties": false
+  },
   "create_note": {
     "type": "object",
     "properties": {
@@ -167,6 +210,16 @@
   "minimize_all_windows": {
     "type": "object",
     "properties": {},
+    "additionalProperties": false
+  },
+  "get_current_time": {
+    "type": "object",
+    "properties": {
+      "city": {
+        "type": "string",
+        "description": "Optional city name or timezone-friendly location to check the time for."
+      }
+    },
     "additionalProperties": false
   },
   "get_current_datetime": {
