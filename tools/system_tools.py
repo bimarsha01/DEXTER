@@ -11,6 +11,7 @@ from zoneinfo import ZoneInfo
 from utils.logger import get_logger
 from utils.config import get_config
 from utils.metrics import metrics
+from core.health import get_global_health_monitor
 
 logger = get_logger("system_tools")
 
@@ -241,7 +242,11 @@ def sleep_pc(confirm: bool = False) -> str:
 
 def get_health_report() -> str:
     """Returns Dexter's current health report with latency and provider status."""
-    return metrics.get_health_report()
+    report = metrics.get_health_report()
+    health_monitor = get_global_health_monitor()
+    if health_monitor is None:
+        return report
+    return report + "\n\n" + health_monitor.render_report()
 
 
 def _requires_confirm() -> bool:

@@ -3,8 +3,11 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
+from rapidfuzz import fuzz, process
+
 from utils.logger import get_logger
 from utils.open_targets import get_open_target_index
+from tools.pc_controls import APP_MAP
 
 logger = get_logger("transcript_correction")
 
@@ -20,6 +23,7 @@ class CorrectionResult:
 class TranscriptCorrector:
     def __init__(self, score_threshold: float = 86.0, max_span_tokens: int = 4) -> None:
         self._index = get_open_target_index()
+        self._app_names = sorted({name.lower() for name in APP_MAP.keys()})
         self._score_threshold = float(score_threshold)
         self._max_span_tokens = max(1, int(max_span_tokens))
         self._trigger_verbs = {
@@ -109,7 +113,48 @@ class TranscriptCorrector:
                         score=match.score,
                     )
 
+        app_corrected = self._correct_app_name_command(text, matches, lowered)
+        if app_corrected and app_corrected.corrected != text:
+            return app_corrected
+
         return CorrectionResult(original=text, corrected=text)
+
+    def _correct_app_name_command(self, text: str, matches: list[re.Match], lowered: list[str]) -> CorrectionResult | None:
+        if not lowered:
+            return None
+
+        if lowered[0] not in self._trigger_verbs:
+            return None
+
+        # Do not rewrite richer commands like "open YouTube in Google Chrome".
+        # These should be handled by the intent router, not app-name correction.
+        if any(token in {"in", "on", "from", "via"} for token in lowered[2:]):
+            return None
+
+        tail = " ".join(lowered[1:]).strip()
+        if not tail:
+            return None
+
+        match = process.extractOne(tail, self._app_names, scorer=fuzz.WRatio)
+        if not match:
+            return None
+
+        app_name, score, _ = match
+        if score < self._score_threshold:
+            return None
+
+        corrected = self._replace_span(text, matches, 1, len(matches), app_name)
+        if corrected == text:
+            return None
+
+        logger.info(
+            "transcript_corrected_app_name",
+            original=text,
+            corrected=corrected,
+            matched=app_name,
+            score=score,
+        )
+        return CorrectionResult(original=text, corrected=corrected, matched_name=app_name, score=score)
 
     def _replace_span(
         self,

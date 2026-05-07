@@ -1,8 +1,23 @@
-import chromadb
+from __future__ import annotations
+
 import time
+from dataclasses import dataclass
+
+import chromadb
+
+from core.brain.rag import MultiUserRAGManager
+from utils.config import get_config
+import getpass
 from utils.logger import get_logger
 
 logger = get_logger("memory")
+
+
+@dataclass
+class RecallSection:
+    title: str
+    lines: list[str]
+
 
 class DexterMemory:
     def __init__(
@@ -13,15 +28,28 @@ class DexterMemory:
         retention_interval_seconds: int = 300,
     ):
         logger.info("Waking up Dexter's Long-Term Memory (ChromaDB)...")
-        # ChromaDB creates a local folder to store vector embeddings
         self.client = chromadb.PersistentClient(path=persist_directory)
-        
-        # Collection is like a table in a database
         self.collection = self.client.get_or_create_collection(name="dexter_memory")
         self._max_items = max_items
         self._max_age_seconds = max_age_days * 86400 if max_age_days else None
         self._retention_interval_seconds = retention_interval_seconds
         self._last_retention_check = 0.0
+
+        cfg = get_config()
+        # Multi-user RAG manager — create or return a per-user index.
+        manager = MultiUserRAGManager(
+            persist_directory=cfg.rag.persist_directory or persist_directory,
+            default_roots=cfg.rag.personal_roots,
+            cfg={
+                "chunk_size": cfg.rag.chunk_size,
+                "chunk_overlap": cfg.rag.chunk_overlap,
+                "refresh_seconds": cfg.rag.refresh_seconds,
+                "exclude_patterns": cfg.rag.exclude_patterns,
+                "roots": cfg.rag.personal_roots,
+            },
+        )
+        current_user = (getpass.getuser() or "default").lower()
+        self.personal_rag = manager.get_index_for_user(current_user)
         logger.info(
             "memory_initialized",
             document_count=self.collection.count(),
@@ -35,8 +63,8 @@ class DexterMemory:
             doc_id = f"msg_{int(time.time() * 1000)}"
             self.collection.add(
                 documents=[text],
-                metadatas=[{"role": role, "timestamp": time.time()}],
-                ids=[doc_id]
+                metadatas=[{"role": role, "timestamp": time.time(), "kind": "conversation"}],
+                ids=[doc_id],
             )
             logger.debug("memory_document_saved", doc_id=doc_id, preview=text[:60])
             self._maybe_enforce_retention()
@@ -44,33 +72,39 @@ class DexterMemory:
             logger.error("memory_save_failed", error=str(e), exc_info=True)
 
     def recall_context(self, query: str, n_results: int = 3) -> str:
-        """
-        Searches the vector database for relevant past memories.
-        Injects them into the LLM prompt for context. Costs 0 API tokens.
-        """
+        """Return both conversational memory and personal file context."""
+        sections: list[RecallSection] = []
         try:
-            if self.collection.count() == 0:
-                return ""
-                
-            results = self.collection.query(
-                query_texts=[query],
-                n_results=min(n_results, self.collection.count())
-            )
-            
-            memories = results['documents'][0]
-            if not memories:
-                return ""
-                
-            context = "PAST RELEVANT MEMORIES (Use these to understand the user's context):\n" 
-            context += "\n".join([f"- {m}" for m in memories])
-            return context
-            
+            if self.collection.count() > 0:
+                results = self.collection.query(query_texts=[query], n_results=min(n_results, self.collection.count()))
+                memories = results.get("documents", [[]])[0]
+                if memories:
+                    sections.append(
+                        RecallSection(
+                            title="PAST RELEVANT MEMORIES",
+                            lines=[f"- {m}" for m in memories],
+                        )
+                    )
         except Exception as e:
             logger.error("memory_recall_failed", error=str(e), exc_info=True)
+
+        try:
+            rag_context = self.personal_rag.build_context(query, limit=max(2, n_results))
+            if rag_context:
+                sections.append(RecallSection(title="PERSONAL RAG", lines=rag_context.splitlines()))
+        except Exception as e:
+            logger.warning("memory_personal_rag_failed", error=str(e), exc_info=True)
+
+        if not sections:
             return ""
 
+        context_lines = []
+        for section in sections:
+            context_lines.append(f"{section.title} (Use these to understand the user's context):")
+            context_lines.extend(section.lines)
+        return "\n".join(context_lines)
+
     def get_memory_count(self) -> int:
-        """Returns the total number of stored memories."""
         return self.collection.count()
 
     def _maybe_enforce_retention(self) -> None:

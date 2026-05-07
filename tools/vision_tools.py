@@ -73,16 +73,36 @@ _IDE_TITLE_KEYWORDS = [
     "python", "cmd.exe", "dexter",
 ]
 
+# Extended IDE process names for more comprehensive detection
+_IDE_PROCESSES = {
+    "code.exe", "code - insiders.exe",
+    "cursor.exe",
+    "windowsterminal.exe", "windowsapp.exe",
+    "cmd.exe", "powershell.exe", "pwsh.exe",
+    "python.exe", "pythonw.exe",
+    "pycharm64.exe", "pycharmapp.exe",
+    "idea64.exe", "ideaapp.exe",
+    "studio64.exe",
+    "notepad++.exe",
+    "sublime_text.exe",
+    "atom.exe",
+    "vim.exe",
+    "nvim.exe",
+    "conhost.exe",
+}
+
 def _is_ide_window(hwnd) -> bool:
     """Check if a window handle belongs to an IDE or terminal, using both process name and title."""
+    if not hwnd:
+        return False
+
     # Strategy 1: Check process name (most reliable)
     try:
         import win32process
         import psutil
         _, pid = win32process.GetWindowThreadProcessId(hwnd)
         process_name = psutil.Process(pid).name().lower()
-        ide_processes = {"code.exe", "windowsterminal.exe", "cmd.exe", "powershell.exe", "python.exe", "pythonw.exe", "cursor.exe", "pycharm64.exe", "idea64.exe"}
-        if process_name in ide_processes:
+        if process_name in _IDE_PROCESSES:
             logger.debug("ide_detected_by_process", process=process_name)
             return True
     except Exception as e:
@@ -95,14 +115,14 @@ def _is_ide_window(hwnd) -> bool:
             if keyword in title:
                 logger.debug("ide_detected_by_title", title=title, keyword=keyword)
                 return True
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug("ide_title_check_failed", error=str(e))
 
     return False
 
 
 def hide_ide_if_foreground() -> Optional[int]:
-    """Minimizes the IDE/terminal if it is the foreground window. Returns hwnd to restore later."""
+    """Hides the IDE/terminal if it is the foreground window. Returns hwnd to restore later."""
     try:
         if win32gui is None:
             logger.warning("hide_ide_skipped_no_win32gui")
@@ -110,15 +130,44 @@ def hide_ide_if_foreground() -> Optional[int]:
 
         hwnd = win32gui.GetForegroundWindow()
         if not hwnd:
+            logger.debug("hide_ide_no_foreground_window")
             return None
 
-        if _is_ide_window(hwnd):
-            logger.info("minimizing_ide_for_capture", title=win32gui.GetWindowText(hwnd))
-            # Use ctypes as a robust fallback for ShowWindow
+        if not _is_ide_window(hwnd):
+            logger.debug("hide_ide_not_ide_window")
+            return None
+
+        window_title = win32gui.GetWindowText(hwnd)
+        logger.info("hiding_ide_for_capture", title=window_title, hwnd=hwnd)
+
+        # Method 1: Use SetWindowPos with SWP_HIDEWINDOW for true invisibility
+        try:
+            SWP_HIDEWINDOW = 0x0080
+            user32 = ctypes.windll.user32
+            result = user32.SetWindowPos(hwnd, None, 0, 0, 0, 0, SWP_HIDEWINDOW)
+            if result:
+                time.sleep(0.3)  # Wait for hide to complete
+                logger.info("ide_hidden_with_setwindowpos", hwnd=hwnd)
+                return hwnd
+            else:
+                logger.warning("setwindowpos_failed", hwnd=hwnd)
+        except Exception as e:
+            logger.debug("setwindowpos_failed_exception", error=str(e))
+
+        # Method 2: Fallback to minimize
+        try:
             SW_MINIMIZE = 6
-            ctypes.windll.user32.ShowWindow(hwnd, SW_MINIMIZE)
-            time.sleep(0.5)  # Wait for minimize animation to fully complete
-            return hwnd
+            result = ctypes.windll.user32.ShowWindow(hwnd, SW_MINIMIZE)
+            if result:
+                time.sleep(0.5)  # Wait for minimize animation
+                logger.info("ide_minimized_as_fallback", hwnd=hwnd)
+                return hwnd
+            else:
+                logger.warning("minimize_failed", hwnd=hwnd)
+        except Exception as e:
+            logger.debug("minimize_failed_exception", error=str(e))
+
+        return None
 
     except Exception as e:
         logger.error("hide_ide_failed", error=str(e), exc_info=True)
@@ -126,23 +175,48 @@ def hide_ide_if_foreground() -> Optional[int]:
 
 
 def restore_ide(hwnd: Optional[int]):
-    """Restores a previously minimized IDE window."""
+    """Restores a previously hidden IDE window."""
     if not hwnd:
         return
     try:
+        user32 = ctypes.windll.user32
+        
+        # Try to restore from hidden state first
+        try:
+            SWP_SHOWWINDOW = 0x0040
+            SWP_NOZORDER = 0x0004
+            result = user32.SetWindowPos(hwnd, None, 0, 0, 0, 0, SWP_SHOWWINDOW | SWP_NOZORDER)
+            if result:
+                logger.debug("ide_restored_with_setwindowpos", hwnd=hwnd)
+                time.sleep(0.2)
+                user32.SetForegroundWindow(hwnd)
+                return
+        except Exception as e:
+            logger.debug("restore_setwindowpos_failed", error=str(e))
+
+        # Fallback to restore from minimized state
         SW_RESTORE = 9
-        ctypes.windll.user32.ShowWindow(hwnd, SW_RESTORE)
-        ctypes.windll.user32.SetForegroundWindow(hwnd)
+        result = user32.ShowWindow(hwnd, SW_RESTORE)
+        if result:
+            logger.debug("ide_restored_with_showwindow", hwnd=hwnd)
+            time.sleep(0.2)
+            user32.SetForegroundWindow(hwnd)
+        else:
+            logger.warning("restore_failed", hwnd=hwnd)
     except Exception as e:
         logger.debug("restore_ide_failed", error=str(e))
 
 
 def capture_screen_for_vision(max_dimension: int = 1280) -> ScreenCaptureResult:
-    """Capture the user's actual viewport: minimizes IDE if needed, captures full screen."""
+    """Capture the user's actual viewport: hides IDE if needed, captures full screen."""
     hidden_hwnd = hide_ide_if_foreground()
     try:
-        # After minimizing the IDE, always capture the FULL SCREEN.
-        # This shows exactly what the user sees on their monitor.
+        # Add extra sleep if IDE was hidden to ensure it's fully gone from frame buffer
+        if hidden_hwnd:
+            time.sleep(0.5)
+        
+        # After hiding the IDE, always capture the FULL SCREEN.
+        # This shows exactly what the user sees on their monitor (without the IDE).
         image = ImageGrab.grab(all_screens=True)
         capture_mode = "full_screen"
 

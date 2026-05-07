@@ -56,6 +56,17 @@ _TOOL_MODULES: dict[str, list[str]] = {
         "sleep_pc",
         "get_health_report",
     ],
+    "tools.document_tools": [
+        "read_document",
+        "summarize_document",
+        "answer_document_question",
+    ],
+    "tools.routine_tools": [
+        "save_automation_routine",
+        "list_automation_routines",
+        "run_automation_routine",
+        "delete_automation_routine",
+    ],
     "tools.vision_tools": [
         "read_workspace_file",
         "capture_screen",

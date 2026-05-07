@@ -1,15 +1,25 @@
+import os
 from faster_whisper import WhisperModel
 from utils.logger import get_logger
 
 logger = get_logger("transcriber")
-import os
+
+
+DEFAULT_INITIAL_PROMPT = (
+    "Common Windows assistant commands and app names: open, close, start, launch, "
+    "play, watch, search, find, what is, what's, weather, forecast, time, date, "
+    "take screenshot, screen capture, read clipboard, copy to clipboard, "
+    "Chrome, Google Chrome, Edge, Microsoft Edge, Firefox, Brave, VS Code, Visual Studio Code, "
+    "Spotify, Discord, Notepad, Calculator, Settings, File Explorer, PowerShell, Command Prompt, "
+    "Windows Terminal, Explorer, Outlook, Word, Excel, PowerPoint."
+)
 
 
 class DexterTranscriber:
     def __init__(
         self,
         model_size: str = "small.en",
-        beam_size: int = 3,
+        beam_size: int = 5,
         best_of: int = 5,
         temperature: float = 0.0,
         patience: float = 1.0,
@@ -33,7 +43,7 @@ class DexterTranscriber:
         self.log_prob_threshold = float(log_prob_threshold)
         self.no_speech_threshold = float(no_speech_threshold)
         self.condition_on_previous_text = bool(condition_on_previous_text)
-        self.initial_prompt = (initial_prompt or "").strip()
+        self.initial_prompt = (initial_prompt or DEFAULT_INITIAL_PROMPT).strip()
         logger.info(
             "transcriber_loading",
             model_size=model_size,

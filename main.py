@@ -15,6 +15,7 @@ import site
 import ctypes
 from utils.logger import get_logger
 from utils.config import get_config, config_validation_warnings
+from core.health import HealthMonitor, set_global_health_monitor
 
 logger = get_logger("main")
 
@@ -53,6 +54,7 @@ from core.brain.llm_router import Brain
 from core.brain.memory import DexterMemory
 from core.event_bus import EventBus
 from core.pipeline import AsyncPipeline
+from core.proactive import ProactiveAssistant
 
 
 class _DisabledVADListener:
@@ -79,6 +81,9 @@ async def main():
     try:
         # 2. Boot up all components
         logger.info("initializing_stage", stage="audio_pipeline")
+        health_monitor = HealthMonitor(service_name="Dexter")
+        set_global_health_monitor(health_monitor)
+        health_monitor.healthy("startup", "configuration loaded")
 
         # Load Whisper on GPU for speech-to-text
         transcriber = DexterTranscriber(
@@ -102,21 +107,35 @@ async def main():
                 sample_rate=runtime_config.audio_settings.sample_rate,
                 chunk_size=runtime_config.audio_settings.chunk_size,
             )
+            health_monitor.healthy("vad", "listening component ready")
         except Exception as e:
             logger.warning("vad_import_failed", error=str(e), exc_info=True)
             ear = _DisabledVADListener()
+            health_monitor.degraded("vad", f"disabled: {e}")
 
         # TTS manager with cancellation support
         tts_manager = TTSManager(voice=runtime_config.models.tts_voice)
+        health_monitor.healthy("tts", "speaker ready")
 
         logger.info("initializing_stage", stage="memory_system")
         # Load ChromaDB long-term memory
         memory_vault = DexterMemory()
+        health_monitor.healthy("memory", "long-term memory ready")
 
         logger.info("initializing_stage", stage="neural_network")
         # Connect to LLM backends (Gemini → Groq → Ollama)
         event_bus = EventBus()
         brain = Brain(event_bus=event_bus)
+        health_monitor.healthy("brain", "llm router ready")
+
+        proactive = None
+        if runtime_config.proactive.enabled:
+            proactive = ProactiveAssistant(
+                event_bus=event_bus,
+                check_interval_seconds=runtime_config.proactive.reminder_check_seconds,
+                system_status_interval_seconds=runtime_config.proactive.system_status_interval_seconds,
+            )
+            health_monitor.healthy("proactive", "background assistant ready")
 
         # 3. Greet the user
         await tts_manager.speak(
@@ -137,8 +156,17 @@ async def main():
             memory_vault=memory_vault,
             brain=brain,
             event_bus=event_bus,
+            health_monitor=health_monitor,
         )
-        await pipeline.run()
+        proactive_task = None
+        if proactive is not None:
+            proactive_task = asyncio.create_task(proactive.run())
+
+        try:
+            await pipeline.run()
+        finally:
+            if proactive_task is not None:
+                proactive_task.cancel()
 
     except Exception as e:
         logger.error("critical_system_error", error=str(e), exc_info=True)

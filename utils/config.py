@@ -2,6 +2,10 @@ import os
 import yaml
 from typing import Any
 
+# Disable optional Pydantic plugin discovery to avoid intermittent startup failures
+# caused by corrupted/invalid third-party entry point metadata in some environments.
+os.environ.setdefault("PYDANTIC_DISABLE_PLUGINS", "__all__")
+
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from utils.logger import get_logger
@@ -34,6 +38,7 @@ class SecurityConfig(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     require_confirm_power_actions: bool = True
+    confirm_risky_tools: bool = True
     allowed_apps: list[str] = Field(default_factory=list)
     allowed_file_roots: list[str] = Field(default_factory=list)
     tool_timeout_sec: float = 10.0
@@ -45,6 +50,19 @@ class RagConfig(BaseModel):
     intent_catalog_path: str = "intent_catalog.md"
     intent_top_k: int = 3
     intent_min_score: float = 0.72
+    personal_roots: list[str] = Field(
+        default_factory=lambda: [
+            "%USERPROFILE%/Documents",
+            "%USERPROFILE%/Desktop",
+            "%USERPROFILE%/Projects",
+        ]
+    )
+    chunk_size: int = 1200
+    chunk_overlap: int = 180
+    refresh_seconds: int = 1800
+    persist_directory: str = "./memory_db"
+    multi_user_enabled: bool = True
+    exclude_patterns: list[str] = Field(default_factory=list)
 
 
 class WakeBehaviorConfig(BaseModel):
@@ -84,7 +102,7 @@ class SpeedConfig(BaseModel):
 class SttConfig(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
-    beam_size: int = 3
+    beam_size: int = 5
     best_of: int = 5
     temperature: float = 0.0
     patience: float = 1.0
@@ -93,9 +111,10 @@ class SttConfig(BaseModel):
     condition_on_previous_text: bool = False
     initial_prompt: str = (
         "Common Windows assistant commands and app names: open, close, start, launch, "
-        "take screenshot, screen capture, set volume, clipboard, Chrome, Google Chrome, "
-        "Edge, Microsoft Edge, Firefox, Spotify, Discord, Notepad, Calculator, Settings, "
-        "File Explorer, Visual Studio Code, VS Code."
+        "play, watch, search, find, what is, what's, weather, forecast, time, date, "
+        "take screenshot, screen capture, read clipboard, copy to clipboard, Chrome, Google Chrome, "
+        "Edge, Microsoft Edge, Firefox, Brave, Spotify, Discord, Notepad, Calculator, Settings, "
+        "File Explorer, Visual Studio Code, VS Code, PowerShell, Command Prompt, Windows Terminal, Outlook, Word, Excel, PowerPoint."
     )
 
 
@@ -109,6 +128,14 @@ class McpConfig(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     enabled: bool = False
+
+
+class ProactiveConfig(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    enabled: bool = True
+    reminder_check_seconds: int = 60
+    system_status_interval_seconds: int = 900
 
 
 class DexterConfig(BaseModel):
@@ -131,6 +158,7 @@ class DexterConfig(BaseModel):
     stt: SttConfig = Field(default_factory=SttConfig)
     history: HistoryConfig = Field(default_factory=HistoryConfig)
     mcp: McpConfig = Field(default_factory=McpConfig)
+    proactive: ProactiveConfig = Field(default_factory=ProactiveConfig)
 
     gemini_api_key: str = ""
     groq_api_key: str = ""
@@ -175,7 +203,9 @@ def _ensure_config_shape(config: dict) -> dict:
     config.setdefault("speed", {})
     config.setdefault("stt", {})
     config.setdefault("activation", {})
+    config.setdefault("rag", {})
     config.setdefault("mcp", {})
+    config.setdefault("proactive", {})
     return config
 
 

@@ -448,13 +448,36 @@ class IntentRouter:
 
     def _extract_city(self, text: str) -> str:
         cleaned = re.sub(r"[?.!,]+$", "", text.strip())
-        match = re.search(
-            r"\b(?:in|for|of)\s+([A-Za-z][A-Za-z\s\-']*?)(?:\s+(?:today|now|please|sir))?$",
+        cleaned = re.sub(r"\s+", " ", cleaned)
+
+        # Prefer explicit prepositional cities at the end of the utterance.
+        tail_match = re.search(
+            r"\b(?:weather|forecast|temperature|temp|time)\b.*\b(?:in|for|of)\s+([A-Za-z][A-Za-z\s\-']{1,60})$",
             cleaned,
             re.IGNORECASE,
         )
-        if match:
-            city = match.group(1).strip()
-            city = re.sub(r"\b(?:today|now|please|sir)\b$", "", city, flags=re.IGNORECASE).strip()
-            return city
+        if tail_match:
+            city = tail_match.group(1).strip()
+            city = re.sub(r"\b(?:today|now|please|sir)\b", "", city, flags=re.IGNORECASE).strip()
+            if city:
+                return city
+
+        # Accept shorter forms like "weather in Kathmandu" or "forecast for Mumbai".
+        short_match = re.search(
+            r"\b(?:in|for|of)\s+([A-Za-z][A-Za-z\s\-']{1,60})$",
+            cleaned,
+            re.IGNORECASE,
+        )
+        if short_match:
+            city = short_match.group(1).strip()
+            city = re.sub(r"\b(?:today|now|please|sir)\b", "", city, flags=re.IGNORECASE).strip()
+            if city:
+                return city
+
+        # If the city appears alone or is highly likely to be the final token, return it.
+        city_only = cleaned.split(" ")[-1].strip() if cleaned else ""
+        if city_only and city_only not in {"weather", "forecast", "temperature", "temp"}:
+            if re.fullmatch(r"[A-Za-z][A-Za-z\-']+", city_only):
+                return city_only
+
         return ""

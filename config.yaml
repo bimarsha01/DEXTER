@@ -46,23 +46,35 @@ rag:
   intent_catalog_path: "intent_catalog.md"
   intent_top_k: 3
   intent_min_score: 0.72
+  personal_roots:
+    - "%USERPROFILE%/Documents"
+    - "%USERPROFILE%/Desktop"
+    - "%USERPROFILE%/Projects"
+  chunk_size: 1200
+  chunk_overlap: 180
+  refresh_seconds: 1800
 
 audio_settings:
   sample_rate: 16000
   chunk_size: 512
 
 stt:
-  beam_size: 3
+  beam_size: 5
   best_of: 5
   temperature: 0.0
   patience: 1.0
   log_prob_threshold: -1.0
   no_speech_threshold: 0.6
   condition_on_previous_text: false
-  initial_prompt: "Common Windows assistant commands and app names: open, close, start, launch, take screenshot, screen capture, set volume, clipboard, Chrome, Google Chrome, Edge, Microsoft Edge, Firefox, Spotify, Discord, Notepad, Calculator, Settings, File Explorer, Visual Studio Code, VS Code."
+  initial_prompt: "Common Windows assistant commands and app names: open, close, start, launch, play, watch, search, find, what is, what's, weather, forecast, time, date, take screenshot, screen capture, read clipboard, copy to clipboard, Chrome, Google Chrome, Edge, Microsoft Edge, Firefox, Brave, Spotify, Discord, Notepad, Calculator, Settings, File Explorer, Visual Studio Code, VS Code, PowerShell, Command Prompt, Windows Terminal, Outlook, Word, Excel, PowerPoint."
 
 history:
   max_tokens: 1800
 
 mcp:
   enabled: false
+
+proactive:
+  enabled: true
+  reminder_check_seconds: 60
+  system_status_interval_seconds: 900

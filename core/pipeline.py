@@ -5,6 +5,7 @@ from uuid import uuid4
 from typing import Optional
 
 from core.event_bus import EventBus
+from core.health import HealthMonitor
 from core.state_machine import AssistantState
 from core.wake_word.detector import WakeWordDetector
 from utils.transcript_correction import TranscriptCorrector
@@ -25,6 +26,7 @@ class AsyncPipeline:
         memory_vault,
         brain,
         event_bus: Optional[EventBus] = None,
+        health_monitor: Optional[HealthMonitor] = None,
     ) -> None:
         self.config = config
         self.transcriber = transcriber
@@ -33,6 +35,7 @@ class AsyncPipeline:
         self.memory = memory_vault
         self.brain = brain
         self.event_bus = event_bus or EventBus()
+        self.health_monitor = health_monitor
 
         self.state = AssistantState.IDLE
         self._state_changed_at = time.time()
@@ -72,6 +75,8 @@ class AsyncPipeline:
                 to_state=state.name,
             )
             self.event_bus.emit("state_changed", {"state": state.name})
+            if self.health_monitor is not None:
+                self.health_monitor.healthy("pipeline", f"state={state.name}")
 
     def _is_awake(self) -> bool:
         return time.time() < self.awake_until
@@ -216,6 +221,8 @@ class AsyncPipeline:
 
     async def run(self) -> None:
         logger.info("pipeline_online")
+        if self.health_monitor is not None:
+            self.health_monitor.healthy("pipeline", "online")
         self._loop = asyncio.get_running_loop()
         if self.start_active:
             self._open_wake_window()
@@ -227,6 +234,8 @@ class AsyncPipeline:
                     await self._handle_once()
                 except Exception as e:
                     logger.error("pipeline_loop_error", error=str(e), exc_info=True)
+                    if self.health_monitor is not None:
+                        self.health_monitor.degraded("pipeline", f"loop error: {e}")
                     try:
                         # Ensure we return to IDLE to avoid stuck states
                         self._set_state(AssistantState.IDLE)
@@ -240,22 +249,32 @@ class AsyncPipeline:
     async def _handle_once(self) -> None:
         cid = bind_correlation_id(uuid4().hex)
         self._set_state(AssistantState.LISTENING)
+        logger.debug("pipeline_listening_started", cid=cid)
+        
         try:
             vad_start = time.perf_counter()
+            
+            # Define a safe wrapper for the interrupt callback
+            def _interrupt_handler():
+                """Called when user starts speaking during TTS playback."""
+                logger.debug("interrupt_detected_stopping_tts", cid=cid)
+                self.tts.stop()
+            
             if self.activation_mode == "clap":
                 audio_path = await asyncio.to_thread(
                     self.vad.listen,
-                    on_speech_start=self.tts.stop,
+                    on_speech_start=_interrupt_handler,
                     on_clap=self._on_clap_detected,
                     clap_sensitivity=self.clap_sensitivity,
                 )
             else:
                 audio_path = await asyncio.to_thread(
-                    self.vad.listen, on_speech_start=self.tts.stop
+                    self.vad.listen, on_speech_start=_interrupt_handler
                 )
             metrics.record_latency("vad_ms", (time.perf_counter() - vad_start) * 1000)
 
             if not audio_path:
+                logger.debug("vad_no_audio_captured", cid=cid)
                 self._set_state(AssistantState.IDLE)
                 return
 
@@ -270,6 +289,7 @@ class AsyncPipeline:
             metrics.record_latency("stt_ms", (time.perf_counter() - stt_start) * 1000)
 
             if not identified_text:
+                logger.debug("transcription_empty", cid=cid)
                 self._set_state(AssistantState.IDLE)
                 return
 

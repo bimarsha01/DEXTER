@@ -2,6 +2,7 @@ import asyncio
 import os
 import re
 import time
+from enum import StrEnum
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Callable, Dict, List, Optional
@@ -20,6 +21,12 @@ PATH_ARG_NAMES = {"path", "file_path", "filepath", "root", "directory", "folder"
 RELATIVE_PATH_NAMES = {"relative_path"}
 
 
+class RiskLevel(StrEnum):
+    LOW = "low"
+    MEDIUM = "medium"
+    HIGH = "high"
+
+
 @dataclass
 class ToolResult:
     success: bool
@@ -28,6 +35,9 @@ class ToolResult:
     tool_name: str
     duration_ms: float
     timestamp: datetime
+    risk_level: str = RiskLevel.LOW.value
+    confirmation_required: bool = False
+    policy_decision: str = "allowed"
 
 
 class ToolExecutor:
@@ -109,6 +119,24 @@ class ToolExecutor:
         if properties:
             validate(instance=args, schema=schema)
 
+    def _assess_risk(self, tool_name: str, args: dict) -> tuple[str, bool, str]:
+        high_risk_tools = {"shutdown_pc", "restart_pc", "sleep_pc"}
+        medium_risk_tools = {
+            "open_application",
+            "open_url",
+            "open_url_in_browser",
+            "type_text",
+            "press_shortcut",
+            "copy_to_clipboard",
+        }
+        if tool_name in high_risk_tools:
+            return RiskLevel.HIGH.value, True, "high_risk_power_action"
+        if tool_name in medium_risk_tools:
+            return RiskLevel.MEDIUM.value, False, "medium_risk_automation"
+        if any(key in args for key in ("path", "file_path", "filepath", "root", "directory", "folder")):
+            return RiskLevel.MEDIUM.value, False, "filesystem_access"
+        return RiskLevel.LOW.value, False, "allowed"
+
     async def execute(self, tool_name: str, args: dict, event_bus: Any = None) -> ToolResult:
         func = self._tools.get(tool_name)
         if not func:
@@ -139,6 +167,32 @@ class ToolExecutor:
             self._validate_args(clean_args, schema)
             self._validate_paths(clean_args, config)
 
+            risk_level, confirmation_required, policy_decision = self._assess_risk(tool_name, clean_args)
+            if confirmation_required and not clean_args.get("confirm", False):
+                duration_ms = (time.perf_counter() - start) * 1000
+                metrics.record_latency("tool_ms", duration_ms)
+                err_msg = f"Tool '{tool_name}' requires explicit confirmation."
+                logger.info(
+                    "tool_executed",
+                    tool_name=tool_name,
+                    success=False,
+                    duration_ms=duration_ms,
+                    error=err_msg,
+                    risk_level=risk_level,
+                    policy_decision=policy_decision,
+                )
+                return ToolResult(
+                    success=False,
+                    data=None,
+                    error=err_msg,
+                    tool_name=tool_name,
+                    duration_ms=duration_ms,
+                    timestamp=datetime.utcnow(),
+                    risk_level=risk_level,
+                    confirmation_required=True,
+                    policy_decision=policy_decision,
+                )
+
             result = await asyncio.wait_for(
                 asyncio.to_thread(func, **clean_args),
                 timeout=timeout_sec,
@@ -161,6 +215,9 @@ class ToolExecutor:
                 tool_name=tool_name,
                 duration_ms=duration_ms,
                 timestamp=datetime.utcnow(),
+                risk_level=risk_level,
+                confirmation_required=confirmation_required,
+                policy_decision=policy_decision,
             )
         except ValidationError as e:
             duration_ms = (time.perf_counter() - start) * 1000
@@ -180,6 +237,7 @@ class ToolExecutor:
                 tool_name=tool_name,
                 duration_ms=duration_ms,
                 timestamp=datetime.utcnow(),
+                risk_level=RiskLevel.LOW.value,
             )
         except ValueError as e:
             duration_ms = (time.perf_counter() - start) * 1000
@@ -199,6 +257,7 @@ class ToolExecutor:
                 tool_name=tool_name,
                 duration_ms=duration_ms,
                 timestamp=datetime.utcnow(),
+                risk_level=RiskLevel.LOW.value,
             )
         except asyncio.TimeoutError:
             duration_ms = (time.perf_counter() - start) * 1000
@@ -218,6 +277,7 @@ class ToolExecutor:
                 tool_name=tool_name,
                 duration_ms=duration_ms,
                 timestamp=datetime.utcnow(),
+                risk_level=RiskLevel.MEDIUM.value,
             )
         except Exception as e:
             duration_ms = (time.perf_counter() - start) * 1000
@@ -243,4 +303,5 @@ class ToolExecutor:
                 tool_name=tool_name,
                 duration_ms=duration_ms,
                 timestamp=datetime.utcnow(),
+                risk_level=RiskLevel.MEDIUM.value,
             )

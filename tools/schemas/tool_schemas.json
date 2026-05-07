@@ -336,5 +336,103 @@
     },
     "required": [],
     "additionalProperties": false
+  },
+  "read_document": {
+    "type": "object",
+    "properties": {
+      "path": {
+        "type": "string",
+        "description": "Path to the document to read."
+      },
+      "max_chars": {
+        "type": "integer",
+        "description": "Maximum characters to return.",
+        "minimum": 256,
+        "maximum": 50000
+      }
+    },
+    "required": ["path"],
+    "additionalProperties": false
+  },
+  "summarize_document": {
+    "type": "object",
+    "properties": {
+      "path": {
+        "type": "string",
+        "description": "Path to the document to summarize."
+      },
+      "max_bullets": {
+        "type": "integer",
+        "description": "Maximum number of summary bullets.",
+        "minimum": 3,
+        "maximum": 12
+      }
+    },
+    "required": ["path"],
+    "additionalProperties": false
+  },
+  "answer_document_question": {
+    "type": "object",
+    "properties": {
+      "path": {
+        "type": "string",
+        "description": "Path to the document to query."
+      },
+      "question": {
+        "type": "string",
+        "description": "Question to answer from the document."
+      }
+    },
+    "required": ["path", "question"],
+    "additionalProperties": false
+  },
+  "save_automation_routine": {
+    "type": "object",
+    "properties": {
+      "name": {
+        "type": "string",
+        "description": "Routine name."
+      },
+      "steps": {
+        "type": "array",
+        "items": {
+          "type": "object"
+        },
+        "description": "Ordered list of tool call steps to save."
+      },
+      "description": {
+        "type": "string",
+        "description": "Optional routine description."
+      }
+    },
+    "required": ["name", "steps"],
+    "additionalProperties": false
+  },
+  "list_automation_routines": {
+    "type": "object",
+    "properties": {},
+    "additionalProperties": false
+  },
+  "run_automation_routine": {
+    "type": "object",
+    "properties": {
+      "name": {
+        "type": "string",
+        "description": "Routine name to run."
+      }
+    },
+    "required": ["name"],
+    "additionalProperties": false
+  },
+  "delete_automation_routine": {
+    "type": "object",
+    "properties": {
+      "name": {
+        "type": "string",
+        "description": "Routine name to delete."
+      }
+    },
+    "required": ["name"],
+    "additionalProperties": false
   }
 }

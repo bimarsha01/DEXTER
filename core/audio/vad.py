@@ -64,11 +64,15 @@ class VADListener:
         Listens to the microphone continuously. 
         Only records when VAD detects a human voice.
         Stops recording after `silence_threshold` seconds of silence.
+        
+        When interrupted (on_speech_start called while TTS is playing):
+        - Uses shorter silence_threshold (0.8s) to respond quickly
         """
         recording = []
         is_speaking = False
         silence_start_time = None
         output_file = self._resolve_output_path(output_file)
+        was_interrupted = False
         
         logger.info("vad_listening_started")
 
@@ -110,6 +114,7 @@ class VADListener:
                         if not is_speaking:
                             logger.debug("vad_speech_started")
                             is_speaking = True
+                            was_interrupted = True  # Mark that we detected speech during listening
                             if on_speech_start:
                                 try:
                                     on_speech_start()
@@ -127,9 +132,13 @@ class VADListener:
                             if silence_start_time is None:
                                 silence_start_time = time.time()
                             
+                            # If interrupted (speech detected during playback): shorter timeout
+                            # Otherwise: normal timeout
+                            effective_threshold = 0.8 if was_interrupted else silence_threshold
+                            
                             # If they have been silent for X seconds, stop recording
-                            if time.time() - silence_start_time > silence_threshold:
-                                logger.debug("vad_speech_ended")
+                            if time.time() - silence_start_time > effective_threshold:
+                                logger.debug("vad_speech_ended", was_interrupted=was_interrupted, silence_duration=(time.time() - silence_start_time))
                                 break
         except Exception as e:
             logger.error("vad_microphone_error", error=str(e), exc_info=True)

@@ -9,9 +9,9 @@ import math
 import os
 import struct
 import time
-import uuid
 import threading
 import wave
+import tempfile
 from utils.logger import get_logger
 from utils.metrics import metrics
 
@@ -28,15 +28,27 @@ class TTSManager:
         self._global_cancel = threading.Event()
         self._channel = None
         self._lock = asyncio.Lock()
+        self._interrupt_cooldown = 0.0  # Prevent rapid re-interrupts
 
     def stop(self) -> None:
+        """Immediately stops TTS playback. Thread-safe."""
+        current_time = time.time()
+        if current_time < self._interrupt_cooldown:
+            return  # Skip if called too soon after last interrupt
+        
+        self._interrupt_cooldown = current_time + 0.1  # 100ms cooldown
         self._global_cancel.set()
         self._cancel_event.set()
+        
         if self._channel is not None:
             try:
+                # Forcefully stop the channel
                 self._channel.stop()
+                logger.info("tts_interrupted_channel_stopped")
             except Exception as e:
                 logger.debug("tts_channel_stop_failed", error=str(e))
+        
+        logger.debug("tts_stop_requested")
 
     async def speak(self, text: str, interrupt: bool = True) -> None:
         if not text or not text.strip():
@@ -53,19 +65,14 @@ class TTSManager:
 
         preview = text[:80] + "..." if len(text) > 80 else text
         logger.info("tts_speak_started", text_preview=preview, text_length=len(text))
-        audio_file = os.path.join(os.path.dirname(__file__), "..", "..", f"temp_response_{uuid.uuid4().hex}.mp3")
-        audio_file = os.path.abspath(audio_file)
+        audio_file = None
 
         try:
             synth_start = time.perf_counter()
-            communicate = edge_tts.Communicate(text, self.voice)
-            await communicate.save(audio_file)
+            audio_bytes = await _synthesize_edge_tts_bytes(text, self.voice)
             metrics.record_latency("tts_synth_ms", (time.perf_counter() - synth_start) * 1000)
 
-            with open(audio_file, "rb") as audio_handle:
-                audio_bytes = audio_handle.read()
             logger.debug("tts_audio_loaded_to_memory", bytes=len(audio_bytes))
-            _safe_delete(audio_file)
 
             play_start = time.perf_counter()
             await _play_audio_bytes(audio_bytes, cancel_event, self, track_channel=True)
@@ -74,7 +81,8 @@ class TTSManager:
         except Exception as e:
             logger.error("tts_synthesis_failed", error=str(e), exc_info=True)
         finally:
-            _safe_delete(audio_file)
+            if audio_file:
+                _safe_delete(audio_file)
             self._channel = None
 
     async def play_chime(self) -> None:
@@ -114,7 +122,10 @@ async def _play_audio_bytes(
     _ensure_pygame_ready()
     import pygame
 
-    sound = pygame.mixer.Sound(io.BytesIO(audio_bytes))
+    try:
+        sound = pygame.mixer.Sound(buffer=audio_bytes)
+    except Exception:
+        sound = pygame.mixer.Sound(io.BytesIO(audio_bytes))
     logger.debug("tts_playback_started", duration_estimate_ms=int(sound.get_length() * 1000))
     channel = sound.play()
     if channel is None:
@@ -132,6 +143,34 @@ async def _play_audio_bytes(
     finally:
         if track_channel and manager._channel is channel:
             manager._channel = None
+
+
+async def _synthesize_edge_tts_bytes(text: str, voice: str) -> bytes:
+    """Prefer in-memory synthesis. Fall back to a temp file only if streaming fails."""
+    communicate = edge_tts.Communicate(text, voice)
+    audio_chunks: list[bytes] = []
+
+    try:
+        async for chunk in communicate.stream():
+            if not isinstance(chunk, dict):
+                continue
+            if chunk.get("type") == "audio":
+                data = chunk.get("data")
+                if data:
+                    audio_chunks.append(data)
+        if audio_chunks:
+            return b"".join(audio_chunks)
+    except Exception as e:
+        logger.debug("tts_stream_synthesis_failed", error=str(e), exc_info=True)
+
+    temp_handle = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3")
+    temp_handle.close()
+    try:
+        await communicate.save(temp_handle.name)
+        with open(temp_handle.name, "rb") as audio_handle:
+            return audio_handle.read()
+    finally:
+        _safe_delete(temp_handle.name)
 
 
 def _load_chime_bytes() -> bytes:
