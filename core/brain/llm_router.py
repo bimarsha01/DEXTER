@@ -315,7 +315,7 @@ class Brain:
                 if self.pending_action.kind == "confirm":
                     args["confirm"] = True
                 self.pending_action = None
-                tool_result = await execute_tool(decision.tool_name, args)
+                tool_result = await execute_tool(decision.tool_name, args, event_bus=self._event_bus)
                 response_text = self._handle_tool_response(decision.tool_name, tool_result)
                 self._add_history("user", user_command)
                 self._add_history("assistant", response_text)
@@ -349,7 +349,7 @@ class Brain:
                 self._add_history("assistant", self.pending_action.prompt)
                 return self.pending_action.prompt
 
-            tool_result = await execute_tool(decision.tool_name, decision.args)
+            tool_result = await execute_tool(decision.tool_name, decision.args, event_bus=self._event_bus)
             response_text = self._handle_tool_response(decision.tool_name, tool_result)
             self._add_history("user", user_command)
             self._add_history("assistant", response_text)
@@ -549,7 +549,7 @@ class Brain:
         if decision.vision_mode == "file":
             if not decision.file_path:
                 return "Which file should I inspect, sir?"
-            file_text = await execute_tool("read_workspace_file", {"relative_path": decision.file_path})
+            file_text = await execute_tool("read_workspace_file", {"relative_path": decision.file_path}, event_bus=self._event_bus)
             file_prompt = f"{prompt}\n\nFile: {decision.file_path}\n\n{file_text}"
             return await self._process_text_fallback(file_prompt)
 
@@ -919,7 +919,7 @@ class Brain:
                     args = {}
                 logger.info("groq_tool_call", tool_name=func_name)
 
-                tool_result = await execute_tool(func_name, args)
+                tool_result = await execute_tool(func_name, args, event_bus=self._event_bus)
                 tool_summaries.append(f"[tool:{func_name}] {tool_result}")
 
                 tool_messages.append(
@@ -1027,7 +1027,7 @@ class Brain:
                     args = {}
 
                 logger.info("groq_tool_call", tool_name=func_name)
-                tool_result = await execute_tool(func_name, args)
+                tool_result = await execute_tool(func_name, args, event_bus=self._event_bus)
                 tool_messages.append(
                     {
                         "tool_call_id": tool_call.get("id"),

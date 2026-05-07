@@ -193,10 +193,16 @@ class ToolExecutor:
                     policy_decision=policy_decision,
                 )
 
-            result = await asyncio.wait_for(
-                asyncio.to_thread(func, **clean_args),
-                timeout=timeout_sec,
-            )
+            if asyncio.iscoroutinefunction(func):
+                result = await asyncio.wait_for(
+                    func(**clean_args),
+                    timeout=timeout_sec,
+                )
+            else:
+                result = await asyncio.wait_for(
+                    asyncio.to_thread(func, **clean_args),
+                    timeout=timeout_sec,
+                )
             duration_ms = (time.perf_counter() - start) * 1000
             metrics.record_latency("tool_ms", duration_ms)
             logger.info(

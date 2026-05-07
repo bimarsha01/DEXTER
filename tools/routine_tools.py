@@ -78,7 +78,21 @@ def run_automation_routine(name: str) -> str:
                     break
             return results
 
-        results = asyncio.run(_execute_steps())
+        # Avoid crashing if called from inside an existing event loop
+        # (the Dexter voice pipeline IS an event loop).
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+
+        if loop and loop.is_running():
+            import concurrent.futures
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                future = pool.submit(asyncio.run, _execute_steps())
+                results = future.result(timeout=60)
+        else:
+            results = asyncio.run(_execute_steps())
+
         logger.info("routine_run_completed", name=name, steps=len(steps))
         return "\n".join(results)
     except Exception as e:

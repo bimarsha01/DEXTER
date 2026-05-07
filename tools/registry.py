@@ -125,14 +125,14 @@ def load_tools():
     return AVAILABLE_TOOLS
 
 
-async def execute_tool(func_name: str, arguments: dict):
+async def execute_tool(func_name: str, arguments: dict, event_bus=None):
     """
     Dynamically finds and executes a tool by name with the given arguments.
     Called by the LLM router when the AI decides to use a tool.
     """
     if not _TOOLS_LOADED:
         load_tools()
-    result = await EXECUTOR.execute(func_name, arguments)
+    result = await EXECUTOR.execute(func_name, arguments, event_bus=event_bus)
     if result.success:
         data = result.data
         if isinstance(data, (dict, list)):

@@ -50,9 +50,39 @@ rag:
     - "%USERPROFILE%/Documents"
     - "%USERPROFILE%/Desktop"
     - "%USERPROFILE%/Projects"
-  chunk_size: 1200
-  chunk_overlap: 180
+  chunk_size: 600            # Aggressive: reduced from 800 for faster indexing (~25% fewer chunks)
+  chunk_overlap: 100         # Reduced from 120 for speed (still sufficient overlap)
   refresh_seconds: 1800
+  embedding_model: "BAAI/bge-base-en-v1.5"   # High-quality BGE embeddings (keep for quality)
+  index_schema_version: 2    # Bump when collection layout or metadata changes
+  max_context_chars: 3000    # Cap context injected into LLM prompts
+  batch_size: 256            # Larger batches to reduce embedding round-trips
+  max_embedding_threads: 4   # Concurrent batch embedding (0 = serial, >1 = parallel)
+  exclude_patterns:
+    - ".venv"
+    - "__pycache__"
+    - ".git"
+    - ".pytest_cache"
+    - "ipynb_checkpoints"
+    - ".DS_Store"
+    - ".mypy_cache"
+    - "node_modules"
+    - "site-packages"
+    - "memory_db"
+    - "AppData"
+    - "Downloads"
+    - "Pictures"
+    - "Music"
+    - "Videos"
+    - "Temp"
+    - "logs"
+    - ".egg-info"
+    - "dist"
+    - "build"
+    - ".tox"
+    - "*.pyc"
+    - "*.sqlite"
+    - "__pycache__"
 
 audio_settings:
   sample_rate: 16000

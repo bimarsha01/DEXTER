@@ -6,6 +6,7 @@ from dataclasses import dataclass
 import chromadb
 
 from core.brain.rag import MultiUserRAGManager
+from core.health import get_global_health_monitor
 from utils.config import get_config
 import getpass
 from utils.logger import get_logger
@@ -36,7 +37,8 @@ class DexterMemory:
         self._last_retention_check = 0.0
 
         cfg = get_config()
-        # Multi-user RAG manager — create or return a per-user index.
+        health_monitor = get_global_health_monitor()
+        # Multi-user RAG manager — passes all config fields including BGE model.
         manager = MultiUserRAGManager(
             persist_directory=cfg.rag.persist_directory or persist_directory,
             default_roots=cfg.rag.personal_roots,
@@ -46,7 +48,12 @@ class DexterMemory:
                 "refresh_seconds": cfg.rag.refresh_seconds,
                 "exclude_patterns": cfg.rag.exclude_patterns,
                 "roots": cfg.rag.personal_roots,
+                "embedding_model": cfg.rag.embedding_model,
+                "index_schema_version": cfg.rag.index_schema_version,
+                "max_context_chars": cfg.rag.max_context_chars,
+                "batch_size": cfg.rag.batch_size,
             },
+            health_monitor=health_monitor,
         )
         current_user = (getpass.getuser() or "default").lower()
         self.personal_rag = manager.get_index_for_user(current_user)

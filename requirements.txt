@@ -40,3 +40,8 @@ jsonschema
 # ─── Fuzzy Matching ───
 rapidfuzz
 yt-dlp
+
+# ─── Document Parsing (Optional) ───
+python-docx
+pypdf
+openpyxl

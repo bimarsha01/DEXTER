@@ -57,12 +57,26 @@ class RagConfig(BaseModel):
             "%USERPROFILE%/Projects",
         ]
     )
-    chunk_size: int = 1200
-    chunk_overlap: int = 180
+    chunk_size: int = 600
+    chunk_overlap: int = 100
     refresh_seconds: int = 1800
     persist_directory: str = "./memory_db"
     multi_user_enabled: bool = True
-    exclude_patterns: list[str] = Field(default_factory=list)
+    embedding_model: str = "BAAI/bge-base-en-v1.5"
+    index_schema_version: int = 2
+    max_context_chars: int = 3000
+    batch_size: int = 256
+    max_embedding_threads: int = 4
+    exclude_patterns: list[str] = Field(
+        default_factory=lambda: [
+            ".venv", "__pycache__", ".git", ".pytest_cache",
+            "ipynb_checkpoints", ".DS_Store", ".mypy_cache",
+            "node_modules", "site-packages", "memory_db", "AppData",
+            "Downloads", "Pictures", "Music", "Videos", "Temp",
+            "logs", ".egg-info", "dist", "build", ".tox", "*.pyc",
+            "*.sqlite",
+        ]
+    )
 
 
 class WakeBehaviorConfig(BaseModel):

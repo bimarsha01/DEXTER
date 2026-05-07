@@ -9,6 +9,9 @@ from utils.logger import get_logger
 
 logger = get_logger("health")
 
+# Checks not updated within this window are auto-degraded to "stale".
+STALENESS_THRESHOLD_SECONDS: float = 300.0  # 5 minutes
+
 
 @dataclass
 class HealthCheck:
@@ -56,13 +59,33 @@ class HealthMonitor:
 
     def snapshot(self) -> dict[str, Any]:
         with self._lock:
-            checks = {name: self._serialize(check) for name, check in self._checks.items()}
-            healthy = all(check["status"] == "healthy" for check in checks.values()) if checks else True
+            now = time.time()
+            checks: dict[str, dict[str, Any]] = {}
+            for name, check in self._checks.items():
+                entry = self._serialize(check)
+                # Auto-degrade stale checks that haven't reported recently
+                age = now - check.updated_at
+                if age > STALENESS_THRESHOLD_SECONDS and check.status == "healthy":
+                    entry["status"] = "stale"
+                    entry["details"] = (
+                        f"no update for {age:.0f}s (threshold {STALENESS_THRESHOLD_SECONDS:.0f}s)"
+                    )
+                    logger.debug(
+                        "health_check_stale",
+                        component=name,
+                        age_seconds=f"{age:.0f}",
+                    )
+                checks[name] = entry
+            healthy = (
+                all(c["status"] == "healthy" for c in checks.values())
+                if checks
+                else True
+            )
             return {
                 "service_name": self.service_name,
                 "healthy": healthy,
                 "checks": checks,
-                "updated_at": time.time(),
+                "updated_at": now,
             }
 
     def render_report(self) -> str:
