@@ -21,3 +21,7 @@ temp_*.wav
 temp_*.mp3
 test_output.txt
 test_results.txt
+# Logs
+logs/
+*.log
+*.log.*
