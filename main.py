@@ -80,6 +80,10 @@ async def main():
 
     try:
         # 2. Boot up all components
+        # Safe mode: disable audio input/output for diagnostics or CI
+        safe_mode = os.environ.get("DEXTER_SAFE_MODE", "0").strip() == "1"
+        if safe_mode:
+            logger.info("safe_mode_enabled", reason="DEXTER_SAFE_MODE=1")
         logger.info("initializing_stage", stage="audio_pipeline")
         health_monitor = HealthMonitor(service_name="Dexter")
         set_global_health_monitor(health_monitor)
@@ -101,25 +105,44 @@ async def main():
         # Load Silero VAD for voice activity detection.
         # If torch/VAD is unavailable, keep the assistant alive with listening disabled.
         try:
-            from core.audio.vad import VADListener
+            if not safe_mode:
+                from core.audio.vad import VADListener
 
-            ear = VADListener(
-                sample_rate=runtime_config.audio_settings.sample_rate,
-                chunk_size=runtime_config.audio_settings.chunk_size,
-            )
+                ear = VADListener(
+                    sample_rate=runtime_config.audio_settings.sample_rate,
+                    chunk_size=runtime_config.audio_settings.chunk_size,
+                )
+            else:
+                ear = _DisabledVADListener()
             health_monitor.healthy("vad", "listening component ready")
         except Exception as e:
             logger.warning("vad_import_failed", error=str(e), exc_info=True)
             ear = _DisabledVADListener()
             health_monitor.degraded("vad", f"disabled: {e}")
 
-        # TTS manager with cancellation support
-        tts_manager = TTSManager(voice=runtime_config.models.tts_voice)
-        health_monitor.healthy("tts", "speaker ready")
+        # TTS manager with cancellation support. In safe mode, use a dummy TTS
+        if not safe_mode:
+            tts_manager = TTSManager(voice=runtime_config.models.tts_voice)
+            health_monitor.healthy("tts", "speaker ready")
+        else:
+            class _DummyTTS:
+                async def speak(self, text: str, interrupt: bool = True):
+                    logger.info("tts_speak_skipped_safe_mode", text_preview=(text or "")[:80])
+
+                async def play_chime(self):
+                    logger.info("tts_chime_skipped_safe_mode")
+
+                def stop(self):
+                    pass
+
+            tts_manager = _DummyTTS()
+            health_monitor.degraded("tts", "safe_mode: audio disabled")
 
         logger.info("initializing_stage", stage="memory_system")
         # Load ChromaDB long-term memory
-        memory_vault = DexterMemory()
+        memory_vault = DexterMemory(
+            disable_rag_warming=runtime_config.runtime.disable_rag_warming
+        )
         health_monitor.healthy("memory", "long-term memory ready")
 
         logger.info("initializing_stage", stage="neural_network")
@@ -129,18 +152,21 @@ async def main():
         health_monitor.healthy("brain", "llm router ready")
 
         proactive = None
-        if runtime_config.proactive.enabled:
+        if runtime_config.proactive.enabled and not runtime_config.runtime.disable_proactive_mode:
             proactive = ProactiveAssistant(
                 event_bus=event_bus,
                 check_interval_seconds=runtime_config.proactive.reminder_check_seconds,
                 system_status_interval_seconds=runtime_config.proactive.system_status_interval_seconds,
             )
             health_monitor.healthy("proactive", "background assistant ready")
+        elif runtime_config.runtime.disable_proactive_mode:
+            logger.info("proactive_mode_disabled", reason="low_power_mode")
 
-        # 3. Greet the user
-        await tts_manager.speak(
-            "All systems online, sir. Dexter is ready for your command."
-        )
+        # 3. Greet the user (skip in safe mode to avoid audio)
+        if not safe_mode:
+            await tts_manager.speak(
+                "All systems online sir. Dexter is ready for your command."
+            )
         logger.info("boot_spacer")
         logger.info("boot_banner_top", char="═", repeat=60)
         activation_mode = (runtime_config.activation.mode or "wake_word").strip().lower()

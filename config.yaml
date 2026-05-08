@@ -39,7 +39,6 @@ security:
   allowed_file_roots:
     - "%USERPROFILE%/Documents"
     - "%USERPROFILE%/Desktop"
-    - "."
   tool_timeout_sec: 10
 
 rag:
@@ -83,6 +82,10 @@ rag:
     - "*.pyc"
     - "*.sqlite"
     - "__pycache__"
+  minimum_relevance_score: 45.0
+  max_results: 5
+  excerpt_max_chars: 450
+  boost_cap: 30.0
 
 audio_settings:
   sample_rate: 16000
@@ -108,3 +111,8 @@ proactive:
   enabled: true
   reminder_check_seconds: 60
   system_status_interval_seconds: 900
+
+privacy:
+  # When true, Dexter logs full spoken transcripts to logs/dexter.log.
+  # Keep false by default to avoid persisting sensitive voice content.
+  debug_log_transcripts: false

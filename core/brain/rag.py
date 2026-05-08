@@ -18,6 +18,7 @@ from chromadb.utils.embedding_functions import SentenceTransformerEmbeddingFunct
 from rapidfuzz import fuzz
 
 from utils.logger import get_logger
+from utils.config import get_config
 
 logger = get_logger("personal_rag")
 
@@ -272,13 +273,28 @@ class PersonalRAGIndex:
             data = {
                 "files": self._last_snapshot,
                 "last_refresh": self._last_refresh,
-                "indexed_at": time.time()
+                "indexed_at": time.time(),
             }
-            with open(self._snapshot_path, "w", encoding="utf-8") as f:
+            # Write atomically: write to temp file then replace
+            tmp_path = f"{self._snapshot_path}.tmp"
+            with open(tmp_path, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2)
-            logger.debug("rag_snapshot_saved", path=self._snapshot_path)
+                f.flush()
+                try:
+                    os.fsync(f.fileno())
+                except Exception:
+                    # fsync may not be available on all platforms/filesystems
+                    pass
+            try:
+                os.replace(tmp_path, self._snapshot_path)
+            except Exception:
+                # Fallback to non-atomic replace
+                with open(self._snapshot_path, "w", encoding="utf-8") as f2:
+                    json.dump(data, f2, indent=2)
+
+            logger.info("rag_snapshot_saved", path=self._snapshot_path, files=len(self._last_snapshot))
         except Exception as e:
-            logger.warning("rag_snapshot_save_failed", error=str(e))
+            logger.warning("rag_snapshot_save_failed", error=str(e), exc_info=True)
 
     # ── Indexing ────────────────────────────────────────────────────
     def refresh_incremental(self) -> None:
@@ -350,14 +366,24 @@ class PersonalRAGIndex:
                             rate = file_num / elapsed_sec if elapsed_sec > 0 else 0
                             remaining_files = len(to_add_or_update) - file_num
                             eta_sec = remaining_files / rate if rate > 0 else 0
-                            print(f"✓ Scanned {file_num}/{len(to_add_or_update)} files ({progress_pct:.0f}%) | "
-                                  f"Elapsed: {elapsed_sec/60:.1f}m | ETA: {eta_sec/60:.1f}m")
+                            logger.info(
+                                "rag_index_progress",
+                                scanned=file_num,
+                                total=len(to_add_or_update),
+                                pct=int(progress_pct),
+                                elapsed_min=elapsed_sec / 60.0,
+                                eta_min=eta_sec / 60.0,
+                            )
 
                     except Exception as e:
                         logger.debug("rag_index_file_failed", path=p, error=str(e))
 
                 if chunks:
-                    print(f"⧗ Indexing {len(chunks)} chunks in {(len(chunks) + self._batch_size - 1) // self._batch_size} batches...")
+                    logger.info(
+                        "rag_indexing_start",
+                        chunks=len(chunks),
+                        batches=(len(chunks) + self._batch_size - 1) // self._batch_size,
+                    )
                     self._upsert_chunks(chunks)
 
             self._last_snapshot = current_map
@@ -636,52 +662,234 @@ class PersonalRAGIndex:
                     "file_extension": meta.get("file_extension", ""),
                     "parent_folder": meta.get("parent_folder", ""),
                 })
+            # Log raw results
+            logger.debug('[RAG] query="%s" raw=%d', query, len(payload))
 
+            # Capture pre-boost top5 for debug
+            pre_boost_top5 = sorted(payload, key=lambda p: p.get("score", 0.0), reverse=True)[:5]
+            logger.debug('[RAG] pre_boost top5: %s', [{p.get('title') or p.get('path'): p.get('score')} for p in pre_boost_top5])
+
+            # Apply filename/parent boosting (safe: skip if metadata missing)
+            payload = self._boost_filename_matches(payload, query)
             payload.sort(key=lambda p: p.get("score", 0.0), reverse=True)
-            
-            # Filter by minimum relevance score
-            filtered_payload = [p for p in payload if p.get("score", 0.0) >= MINIMUM_RELEVANCE_SCORE]
-            
-            payload = filtered_payload[:int(limit)]
+
+            post_boost_top5 = payload[:5]
+            logger.debug('[RAG] post_boost top5: %s', [{p.get('title') or p.get('path'): p.get('score')} for p in post_boost_top5])
+
+            # Apply configurable minimum relevance filter
+            cfg = get_config()
+            min_score = float(getattr(cfg.rag, 'minimum_relevance_score', MINIMUM_RELEVANCE_SCORE))
+            filtered_payload = [p for p in payload if p.get("score", 0.0) >= min_score]
+            logger.debug('[RAG] accepted (%d, threshold=%s): %s', len(filtered_payload), min_score, [{p.get('title') or p.get('path'): p.get('score')} for p in filtered_payload[:5]])
+
+            max_results = int(getattr(get_config().rag, 'max_results', limit))
+            payload = filtered_payload[:max_results]
             self._cache.put(query_key, (now, payload))
-            logger.info("rag_search", user=self.user_id, query=query, results=len(payload), threshold=MINIMUM_RELEVANCE_SCORE)
+            logger.info("rag_search", user=self.user_id, query=query, results=len(payload), threshold=min_score)
             return payload
         except Exception as e:
             logger.warning("personal_rag_search_failed", user=self.user_id, error=str(e), exc_info=True)
             return []
+
+    def _boost_filename_matches(self, results: List[Dict[str, Any]], query: str) -> List[Dict[str, Any]]:
+        """Apply filename/parent-folder boosting safely using metadata fields.
+
+        Returns a new results list with scores boosted according to configured
+        rules. If expected metadata keys are missing, the boost for that item is
+        skipped and a warning is logged.
+        """
+        cfg = get_config()
+        boost_cap = float(getattr(cfg.rag, 'boost_cap', 30.0))
+
+        def split_filename_words(text: str) -> list[str]:
+            """
+            Split a filename/key into words from:
+            - separator tokens (hyphens/underscores/etc.)
+            - CamelCase capitals
+            """
+            raw = (text or "").strip()
+            sep_parts = [p for p in re.split(r"[\W_]+", raw) if p]
+            camel_parts = re.findall(r"[A-Z]+(?=[A-Z][a-z]|[0-9]|$)|[A-Z]?[a-z]+|[0-9]+", raw)
+
+            # Prefer CamelCase tokens when the input looks like a compound identifier.
+            if len(camel_parts) > 1 and len(sep_parts) <= 1:
+                return [p.lower() for p in camel_parts if p]
+
+            # Otherwise combine separator tokens with CamelCase tokens.
+            words: list[str] = []
+            for p in sep_parts + camel_parts:
+                w = (p or "").strip().lower()
+                if not w:
+                    continue
+                if w not in words:
+                    words.append(w)
+            return words
+
+        def abbrev_of(text: str) -> str:
+            words = split_filename_words(text)
+            return "".join(w[0] for w in words if w)
+
+        boosted: List[Dict[str, Any]] = []
+        for r in results:
+            meta_path = r.get('path')
+            title = r.get('title') or (meta_path and os.path.basename(meta_path)) or ''
+            if not title and not meta_path:
+                logger.warning('rag_boost_skip_missing_meta', query=query, result=str(r))
+                boosted.append(r)
+                continue
+
+            filename_no_ext_raw = os.path.splitext(os.path.basename(title or meta_path))[0]
+            filename_no_ext = (filename_no_ext_raw or "").lower()
+            q = (query or '').lower()
+            parent = (r.get('parent_folder') or '').lower()
+            meta_path = (r.get("path") or "").lower()
+            path_components = [c for c in re.split(r"[\\/]+", meta_path) if c]
+            total_bonus = 0.0
+
+            # Filename partial match
+            try:
+                pr = fuzz.partial_ratio(q, filename_no_ext)
+            except Exception:
+                pr = 0
+            if pr >= 70:
+                total_bonus += 15
+
+            # Abbreviation of filename (e.g., ORS -> office-reporting-system)
+            try:
+                if filename_no_ext:
+                    abbrev = abbrev_of(filename_no_ext_raw)
+                    # Query may contain arbitrary spacing; compare on a compacted string.
+                    q_compact = re.sub(r"[^a-z0-9]+", "", q)
+                    if abbrev and abbrev in q_compact:
+                        total_bonus += 12
+            except Exception:
+                pass
+
+            # Parent directory match
+            try:
+                if path_components:
+                    best = 0
+                    for comp in path_components:
+                        best = max(best, fuzz.partial_ratio(q, comp))
+                    if best >= 65:
+                        total_bonus += 10
+                else:
+                    parent_score = fuzz.partial_ratio(q, parent) if parent else 0
+                    if parent_score >= 65:
+                        total_bonus += 10
+            except Exception:
+                pass
+
+            # Directory name heuristic
+            try:
+                keywords = ('projects', 'documents', 'source', 'src', 'code')
+                if path_components and any(any(k in comp for k in keywords) for comp in path_components):
+                    total_bonus += 5
+                elif parent and any(k in parent for k in keywords):
+                    total_bonus += 5
+            except Exception:
+                pass
+
+            # camelCase / PascalCase detection: check if filename tokens appear concatenated
+            try:
+                # Use the original-cased filename for CamelCase splitting.
+                tokens = split_filename_words(filename_no_ext_raw)
+                q_words = set(re.findall(r"[a-z0-9]+", q))
+                if tokens and all(tok in q_words for tok in tokens):
+                    total_bonus += 10
+            except Exception:
+                pass
+
+            # Cap bonus
+            if total_bonus > boost_cap:
+                total_bonus = boost_cap
+
+            if total_bonus > 0:
+                r['score'] = float(r.get('score', 0.0)) + float(total_bonus)
+            boosted.append(r)
+
+        boosted.sort(key=lambda x: x.get('score', 0.0), reverse=True)
+        return boosted
 
     def build_context(self, query: str, limit: int = 4, summary: bool = False) -> str:
         """Build compressed context from RAG results — no file re-reads."""
         matches = self.search(query, limit=limit)
         if not matches:
             return ""
-
-        lines = ["RELEVANT PERSONAL FILE CONTEXT:"]
+        cfg = get_config()
+        excerpt_max = int(getattr(cfg.rag, 'excerpt_max_chars', 450))
+        lines = [
+            "PERSONAL FILE CONTEXT (answer naturally as if you read these files yourself; cite by number when relevant):",
+            "",
+        ]
         seen_paths: set[str] = set()
-        total_chars = 0
+        idx = 0
 
         for match in matches:
             path = match.get("path") or "unknown"
-            # Deduplicate: skip if we already have a chunk from this file
             if path in seen_paths:
                 continue
             seen_paths.add(path)
-
-            score = match.get("score", 0.0)
+            idx += 1
             title = match.get("title") or os.path.basename(path)
-            kind = match.get("kind", "document")
-            lines.append(f"- [{kind}] {title}: {path} (score {score:.1f})")
+            parent = match.get("parent_folder") or os.path.basename(os.path.dirname(path))
 
             excerpt = (match.get("text") or "").strip()
-            if len(excerpt) > 400:
-                excerpt = excerpt[:400].rstrip() + "..."
-            lines.append(f"  {excerpt}")
-            total_chars += len(excerpt)
+            # Skip import/package/require/include/using-only excerpts entirely.
+            if self._is_import_only(excerpt):
+                continue
 
-            if total_chars >= self._max_context_chars:
-                break
+            if not excerpt:
+                continue
 
-        return "\n".join(lines)
+            excerpt = " ".join(excerpt.split())
+            if len(excerpt) > excerpt_max:
+                # Keep total excerpt line length within `excerpt_max_chars`.
+                if excerpt_max <= 3:
+                    excerpt = excerpt[:excerpt_max].rstrip()
+                else:
+                    excerpt = excerpt[: excerpt_max - 3].rstrip() + "..."
+
+            lines.append(f"[{idx}] {title}  ({parent})")
+            lines.append(excerpt)
+            lines.append("")
+
+        return "\n".join(lines).strip()
+
+    def get_all_indexed_filenames(self) -> list[str]:
+        """
+        Return all indexed document paths from Chroma metadata only.
+        No embedding / vector comparison is performed.
+        """
+        try:
+            payload = self._collection.get(include=["metadatas"]) or {}
+            metadatas = payload.get("metadatas") or []
+            paths: list[str] = []
+            for meta in metadatas:
+                if isinstance(meta, dict):
+                    p = meta.get("path") or ""
+                    if p:
+                        paths.append(str(p))
+            return paths
+        except Exception as e:
+            logger.warning("personal_rag_all_filenames_failed", error=str(e), exc_info=True)
+            return []
+
+    @staticmethod
+    def _is_import_only(text: str) -> bool:
+        """
+        True if the snippet contains only import/package/include/using directives.
+        Used to avoid injecting "structural noise" into LLM prompts.
+        """
+        lines = [ln.strip() for ln in (text or "").splitlines() if ln.strip()]
+        if not lines:
+            return True
+
+        import_prefix_re = re.compile(
+            r"^(import\s+|package\s+|using\s+|#include\s+|require\s+)",
+            re.IGNORECASE,
+        )
+        return all(import_prefix_re.match(ln) for ln in lines)
 
     # ── File Walking ───────────────────────────────────────────────
     def _walk_files(self, root: str) -> Iterable[str]:
@@ -858,9 +1066,3 @@ class MultiUserRAGManager:
         idx.start_polling()
         self._indexes[uid] = idx
         return idx
-
-    def remove_user(self, user_id: str) -> None:
-        uid = user_id.lower()
-        idx = self._indexes.pop(uid, None)
-        if idx is not None:
-            idx.stop_polling()

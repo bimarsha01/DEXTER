@@ -376,7 +376,7 @@
     "properties": {
       "path": {
         "type": "string",
-        "description": "Path to the document to query."
+        "description": "Answer a question about a file or project. Accepts a full path OR a project name or partial description. If no exact path is given the tool finds the most relevant file using semantic search."
       },
       "question": {
         "type": "string",

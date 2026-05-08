@@ -1,4 +1,5 @@
 import os
+import threading
 from faster_whisper import WhisperModel
 from utils.logger import get_logger
 
@@ -44,6 +45,9 @@ class DexterTranscriber:
         self.no_speech_threshold = float(no_speech_threshold)
         self.condition_on_previous_text = bool(condition_on_previous_text)
         self.initial_prompt = (initial_prompt or DEFAULT_INITIAL_PROMPT).strip()
+        self.model_size = model_size
+        self._model: WhisperModel | None = None
+        self._model_lock = threading.Lock()
         logger.info(
             "transcriber_loading",
             model_size=model_size,
@@ -51,15 +55,25 @@ class DexterTranscriber:
             best_of=self.best_of,
             temperature=self.temperature,
         )
-        
-        try:
-            # Use float16 for RTX GPUs to maximize speed and save VRAM
-            self.model = WhisperModel(model_size, device="cuda", compute_type="float16")
-            logger.info("transcriber_device_ready", device="cuda", compute_type="float16")
-        except Exception as e:
-            logger.warning("transcriber_gpu_fallback", error=str(e), exc_info=True)
-            self.model = WhisperModel(model_size, device="cpu", compute_type="int8")
-            logger.info("transcriber_device_ready", device="cpu", compute_type="int8")
+
+    def _ensure_model(self) -> WhisperModel:
+        if self._model is not None:
+            return self._model
+
+        with self._model_lock:
+            if self._model is not None:
+                return self._model
+
+            try:
+                # Use float16 for RTX GPUs to maximize speed and save VRAM
+                self._model = WhisperModel(self.model_size, device="cuda", compute_type="float16")
+                logger.info("transcriber_device_ready", device="cuda", compute_type="float16")
+            except Exception as e:
+                logger.warning("transcriber_gpu_fallback", error=str(e), exc_info=True)
+                self._model = WhisperModel(self.model_size, device="cpu", compute_type="int8")
+                logger.info("transcriber_device_ready", device="cpu", compute_type="int8")
+
+        return self._model
 
     def transcribe(self, audio_file: str, on_partial=None) -> str:
         """
@@ -71,7 +85,8 @@ class DexterTranscriber:
             return ""
 
         logger.debug("transcriber_run_started", path=audio_file, beam_size=self.beam_size)
-        segments, info = self.model.transcribe(
+        model = self._ensure_model()
+        segments, info = model.transcribe(
             audio_file,
             beam_size=self.beam_size,
             best_of=self.best_of,

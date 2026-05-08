@@ -31,6 +31,14 @@ class PendingAction:
 
 
 class IntentRouter:
+    _CITY_ASR_ALIASES = {
+        "cut mondo": "Kathmandu",
+        "cut mondo right": "Kathmandu",
+        "kat mondo": "Kathmandu",
+        "kath mandoo": "Kathmandu",
+        "kathmandhu": "Kathmandu",
+    }
+
     def __init__(self, config: DexterConfig):
         self.default_city = (config.defaults.city or "Kathmandu").strip()
         logger.info("intent_router_initialized", has_default_city=bool(self.default_city))
@@ -450,6 +458,21 @@ class IntentRouter:
         cleaned = re.sub(r"[?.!,]+$", "", text.strip())
         cleaned = re.sub(r"\s+", " ", cleaned)
 
+        def _sanitize_city(value: str) -> str:
+            city = (value or "").strip()
+            if not city:
+                return ""
+            city = re.sub(
+                r"\b(?:today|now|right now|right|please|sir|currently|current)\b",
+                "",
+                city,
+                flags=re.IGNORECASE,
+            )
+            city = re.sub(r"\s+", " ", city).strip(" -,'")
+            if city.lower() in self._CITY_ASR_ALIASES:
+                return self._CITY_ASR_ALIASES[city.lower()]
+            return city
+
         # Prefer explicit prepositional cities at the end of the utterance.
         tail_match = re.search(
             r"\b(?:weather|forecast|temperature|temp|time)\b.*\b(?:in|for|of)\s+([A-Za-z][A-Za-z\s\-']{1,60})$",
@@ -457,8 +480,7 @@ class IntentRouter:
             re.IGNORECASE,
         )
         if tail_match:
-            city = tail_match.group(1).strip()
-            city = re.sub(r"\b(?:today|now|please|sir)\b", "", city, flags=re.IGNORECASE).strip()
+            city = _sanitize_city(tail_match.group(1))
             if city:
                 return city
 
@@ -469,8 +491,7 @@ class IntentRouter:
             re.IGNORECASE,
         )
         if short_match:
-            city = short_match.group(1).strip()
-            city = re.sub(r"\b(?:today|now|please|sir)\b", "", city, flags=re.IGNORECASE).strip()
+            city = _sanitize_city(short_match.group(1))
             if city:
                 return city
 
@@ -478,6 +499,8 @@ class IntentRouter:
         city_only = cleaned.split(" ")[-1].strip() if cleaned else ""
         if city_only and city_only not in {"weather", "forecast", "temperature", "temp"}:
             if re.fullmatch(r"[A-Za-z][A-Za-z\-']+", city_only):
-                return city_only
+                city = _sanitize_city(city_only)
+                if city:
+                    return city
 
         return ""

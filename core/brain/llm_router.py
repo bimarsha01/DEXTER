@@ -53,28 +53,43 @@ class Brain:
             "ollama": {"failures": 0, "score": 1.0, "cooldown_until": 0.0, "last_error": ""},
         }
 
-        self.system_instruction = (
-            "You are Dexter, a highly capable, professional, and sophisticated AI assistant "
-            "running locally on a Windows PC. You act like a digital butler similar to Jarvis from Iron Man. "
-            "Your tone is polite, calm, slightly formal, and extremely concise. "
-            "You can control the user's PC, search the web, take screenshots, manage notes, "
-            "check weather, system status, clipboard, and more using your tools. "
-            "When the user asks about weather, extract the city from the request and use get_weather with that city. "
-            "If no city is mentioned, use the configured default city before asking a follow-up. "
-            "When the user asks for the current time in a city, use get_current_time with that city. "
-            "When the user says open X in Y where X is a website and Y is a browser, always use the open_url_in_browser tool with both parameters. "
-            "When the user asks to open an application by name (e.g., 'open Spotify', 'open Discord', 'open Word'), ALWAYS use the open_application tool first. Never use a web browser to open a desktop application. "
-            "When the user asks to play, watch, find, search, or open content on a platform such as Spotify, YouTube Music, Netflix, ESPN, SoundCloud, Apple Music, Prime Video, or another site, use search_content_platform with both the content query and platform. "
-            "If no platform is mentioned, infer a sensible default from the content type, such as music, video, podcast, sports, or movie. "
-            "Use search_google only for general web searches, and use open_url or open_url_in_browser only when the user provides a direct URL. "
-            "Never confuse this with opening an application. "
-            "If you do not have a tool to perform an action, tell the user politely. "
-            "Speech transcription may contain minor errors; infer likely intended app names or commands "
-            "from context and ask for confirmation if ambiguous. "
-            "Never use emojis. Start confirmations with 'Yes sir', 'Right away sir', or 'Understood'. "
-            "If a request is ambiguous, politely ask for clarification. "
-            "Keep responses short — 1 to 3 sentences maximum unless the user asks for detail."
-        )
+        self.system_instruction = """You are Dexter, a personal AI assistant running on this Windows PC. Think of yourself as a brilliant, calm, slightly formal butler who genuinely understands what is going on — not a robot reciting outputs, but someone who has actually read everything and formed real opinions.
+
+    Your personality:
+    - Composed and assured. You do not hedge unnecessarily or fill responses with caveats.
+    - Direct. When you know something you say it clearly. When you do not, you say that briefly.
+    - Dry understated warmth. Not jokes or enthusiasm, just the quiet confidence of someone very good at what they do.
+    - Natural sentence variety. Sometimes short. Sometimes longer when the topic deserves it. Never stiff or formulaic.
+    - You do not repeat the user's question back.
+    - You do not start every sentence the same way.
+    - You never use filler like Certainly, Of course, Sure thing, or Great question.
+    - You begin confirmations with Right away sir, Yes sir, or Understood — but only occasionally, not on every single response.
+    - No emojis ever.
+    - Keep responses to 1 to 3 sentences spoken aloud unless the user asks for more detail.
+
+    When you receive RELEVANT CONTEXT FROM YOUR INDEXED FILES at the start of a message this is real content from the user's actual files on their computer. Treat it like you read those files yourself. Answer from them naturally.
+
+    Examples of natural vs robotic:
+
+    Robotic: Based on the indexed content from PROJECT_SUMMARY.md, Dexter is described as a modular voice-first personal AI assistant.
+
+    Natural: Dexter is a voice-controlled AI assistant for Windows — modular, locally run, with a multi-LLM fallback chain. Basically a Jarvis-style butler that controls your PC through voice.
+
+    Robotic: The retrieved content indicates this is a Java Spring Boot application for office purposes.
+
+    Natural: That is a Spring Boot project — office reporting and project tracking, Java-based, the usual enterprise stack.
+
+    Read the context, understand it, then explain it like a smart person would. Conversational, specific, to the point.
+
+    When controlling the PC keep confirmations brief and natural. When you do not have enough information say so briefly and move on without excessive apology.
+
+    Speech recognition may mishear words occasionally. Use context to figure out what was actually meant rather than asking for repetition unless genuinely unclear.
+
+    When the user asks about weather always extract the city from their words and call get_weather immediately. Never ask which city if they already said one.
+
+    When the user asks to open an application always use open_application first. Never open a browser to launch a desktop app.
+
+    When the user asks to play or watch content on any platform use search_content_platform with the content and platform name. If no platform is mentioned infer from content type."""
 
         # Initialize all three LLM backends
         self._init_gemini()
@@ -216,6 +231,113 @@ class Brain:
         self.shared_history.append({"role": role, "content": content})
         self._prune_history_by_tokens()
 
+    @staticmethod
+    def _truncate_rag_for_provider(rag_context: str, provider: str) -> str:
+        if not rag_context:
+            return ""
+        if provider != "groq":
+            return rag_context
+        # For Groq, cap individual excerpts to avoid token blowup.
+        # Supports both:
+        # 1) Old format: Source/Path/Content
+        # 2) Numbered format: [1] ... <excerpt line>
+        lines = rag_context.splitlines()
+        truncated: list[str] = []
+        per_excerpt_cap = 800
+
+        # Old Source/Path/Content format
+        if any(l.startswith("Source: ") for l in lines) and any(l.startswith("Content: ") for l in lines):
+            source_seen = 0
+            in_first_source = False
+            for line in lines:
+                if line.startswith("Source: "):
+                    source_seen += 1
+                    if source_seen > 1:
+                        break
+                    in_first_source = True
+                    truncated.append(line)
+                    continue
+                if not in_first_source:
+                    truncated.append(line)
+                    continue
+                if line.startswith("Path: "):
+                    truncated.append(line)
+                    continue
+                if line.startswith("Content: "):
+                    content = line[len("Content: ") :]
+                    if len(content) > per_excerpt_cap:
+                        if per_excerpt_cap <= 3:
+                            content = content[:per_excerpt_cap].rstrip()
+                        else:
+                            content = content[: per_excerpt_cap - 3].rstrip() + "..."
+                    truncated.append(f"Content: {content}")
+                    continue
+                if line.startswith("("):
+                    truncated.append(line)
+
+            return "\n".join(truncated).strip()
+
+        # Numbered [n] format
+        source_seen = 0
+        in_first_source = False
+        for line in lines:
+            stripped = line.strip()
+            # Reconstruct header lines to ensure they begin with plain ASCII `[n]`
+            # even if they contain odd leading whitespace/zero-width characters.
+            header_match = re.search(r"\[(\d+)\]", stripped)
+            # The numbered context format should have headers near the beginning
+            # of the line; keep this permissive so hidden/unprintable prefix
+            # characters do not prevent the header from being detected.
+            if header_match and header_match.start() <= 20:
+                num = header_match.group(1)
+                source_seen += 1
+                if source_seen > 1:
+                    break
+                in_first_source = True
+                rest = stripped[header_match.end() :].lstrip()
+                truncated.append(f"[{num}]{(' ' + rest) if rest else ''}")
+                continue
+
+            if not in_first_source:
+                truncated.append(line)
+                continue
+
+            # Within the first excerpt block, cap the excerpt line(s).
+            if stripped:
+                if len(stripped) > per_excerpt_cap:
+                    if per_excerpt_cap <= 3:
+                        truncated.append(stripped[:per_excerpt_cap].rstrip())
+                    else:
+                        truncated.append(stripped[: per_excerpt_cap - 3].rstrip() + "...")
+                else:
+                    truncated.append(stripped)
+            else:
+                truncated.append(line)
+
+        return "\n".join(truncated).strip()
+
+    def _compose_prompt(self, user_command: str, long_term_memory: str = "", indexed_context: str = "", provider: str = "gemini") -> str:
+        sections: list[str] = []
+        if long_term_memory:
+            sections.append(long_term_memory.strip())
+
+        rag_context = self._truncate_rag_for_provider(indexed_context.strip(), provider)
+        if rag_context:
+            sections.append(rag_context)
+
+        # If indexed_context appears to contain at least one substantial excerpt,
+        # instruct the model to answer assertively and specifically.
+        try:
+            if indexed_context and any(len(line.strip()) >= 100 for line in indexed_context.splitlines() if line.strip()):
+                sections.append(
+                    "You have strong file context. Answer specifically and confidently from it. Do not hedge unless the files are genuinely ambiguous."
+                )
+        except Exception:
+            pass
+
+        sections.append(f"User question: {user_command}")
+        return "\n\n".join(section for section in sections if section)
+
     def _build_shared_messages(self):
         return [
             {"role": msg["role"], "content": msg["content"]}
@@ -265,26 +387,33 @@ class Brain:
         metrics.update_provider_health(name, True, state["score"], state.get("cooldown_until", 0.0), str(error))
 
     def _is_rate_limit_error(self, error: Exception) -> bool:
+        # Be defensive: provider SDKs use different exception classes / messages.
         msg = str(error).lower()
+        try:
+            from google.api_core import exceptions as google_exceptions  # type: ignore
+
+            if isinstance(error, getattr(google_exceptions, "ResourceExhausted", ())):
+                return True
+            if hasattr(error, "status_code") and getattr(error, "status_code", None) == 429:
+                return True
+        except Exception:
+            pass
+
         if "rate limit" in msg or "resource_exhausted" in msg or "quota" in msg:
             return True
         if "429" in msg:
             return True
         status = getattr(error, "status_code", None)
-        if status == 429:
-            return True
-        return False
+        return status == 429
 
     # ─── Main Command Processing ─────────────────────────────────────────────
 
-    async def process_command(self, user_command: str, long_term_memory: str = "") -> str:
+    async def process_command(self, user_command: str, long_term_memory: str = "", indexed_context: str = "") -> str:
         """
         Routes a user command through the LLM fallback chain:
         Gemini → Groq → Ollama
         """
-        prompt = user_command
-        if long_term_memory:
-            prompt = f"{long_term_memory}\n\nCurrent User Command: {user_command}"
+        prompt = self._compose_prompt(user_command, long_term_memory, indexed_context, provider="gemini")
 
         logger.info("command_processing_started")
 
@@ -306,6 +435,7 @@ class Brain:
                 return decision.prompt
             if decision.action == "vision":
                 self.pending_action = None
+                prompt = self._compose_prompt(user_command, long_term_memory, indexed_context, provider="gemini")
                 response_text = await self._handle_vision(decision, prompt)
                 self._add_history("user", user_command)
                 self._add_history("assistant", response_text)
@@ -356,15 +486,18 @@ class Brain:
             return response_text
 
         if decision.action == "vision":
+            prompt = self._compose_prompt(user_command, long_term_memory, indexed_context, provider="gemini")
             response_text = await self._handle_vision(decision, prompt)
             self._add_history("user", user_command)
             self._add_history("assistant", response_text)
             return response_text
 
+        fallback_note = ""
         # ── Try Gemini (Primary) ──
         if self._can_use_provider("gemini", self.gemini_available):
             try:
                 _t0 = time.perf_counter()
+                prompt = self._compose_prompt(user_command, long_term_memory, indexed_context, provider="gemini")
                 response_text = await self._process_gemini(prompt)
                 _ms = (time.perf_counter() - _t0) * 1000
                 logger.info("llm_call_completed", provider="gemini", duration_ms=_ms)
@@ -375,13 +508,25 @@ class Brain:
             except Exception as e:
                 rate_limited = self._is_rate_limit_error(e)
                 self._record_provider_failure("gemini", e, rate_limited)
-                logger.warning("gemini_request_failed", error=str(e), exc_info=True)
+                rate_msg = str(e)
+                logger.warning("gemini_request_failed", error=rate_msg, exc_info=True)
                 logger.info("llm_fallback", from_provider="gemini", to_provider="groq")
+                # On quota/rate-limit, wait briefly and annotate the next prompt to encourage brevity
+                if rate_limited:
+                    try:
+                        await asyncio.sleep(1.5)
+                    except Exception:
+                        pass
+                    logger.warning("gemini_rate_limited", error=rate_msg)
+                    fallback_note = "[Note: fallback provider — keep response concise]\n"
 
         # ── Try Groq (Fallback) ──
         if self._can_use_provider("groq", self.groq_available):
             try:
                 _t0 = time.perf_counter()
+                prompt = self._compose_prompt(user_command, long_term_memory, indexed_context, provider="groq")
+                if fallback_note:
+                    prompt = fallback_note + prompt
                 response_text = await self._process_groq(prompt)
                 _ms = (time.perf_counter() - _t0) * 1000
                 logger.info("llm_call_completed", provider="groq", duration_ms=_ms)
@@ -399,6 +544,7 @@ class Brain:
         if self._can_use_provider("ollama", self.ollama_available):
             try:
                 _t0 = time.perf_counter()
+                prompt = self._compose_prompt(user_command, long_term_memory, indexed_context, provider="ollama")
                 response_text = await self._process_ollama(prompt)
                 _ms = (time.perf_counter() - _t0) * 1000
                 logger.info("llm_call_completed", provider="ollama", duration_ms=_ms)
@@ -415,26 +561,24 @@ class Brain:
             "Please verify your API keys in config.yaml and check your internet connection."
         )
 
-    async def process_command_stream(self, user_command: str, long_term_memory: str = ""):
+    async def process_command_stream(self, user_command: str, long_term_memory: str = "", indexed_context: str = ""):
         if self.pending_action:
-            response_text = await self.process_command(user_command, long_term_memory)
+            response_text = await self.process_command(user_command, long_term_memory, indexed_context)
             yield response_text
             return
 
         decision = self.intent_router.detect_intent(user_command)
         if decision.action != "none":
-            response_text = await self.process_command(user_command, long_term_memory)
+            response_text = await self.process_command(user_command, long_term_memory, indexed_context)
             yield response_text
             return
 
-        prompt = user_command
-        if long_term_memory:
-            prompt = f"{long_term_memory}\n\nCurrent User Command: {user_command}"
-
         if self._can_use_provider("gemini", self.gemini_available):
+            fallback_note = ""
             try:
                 response_text = ""
                 _t0 = time.perf_counter()
+                prompt = self._compose_prompt(user_command, long_term_memory, indexed_context, provider="gemini")
                 async for chunk in self._stream_gemini(prompt):
                     response_text += chunk
                     yield chunk
@@ -449,11 +593,22 @@ class Brain:
                 rate_limited = self._is_rate_limit_error(e)
                 self._record_provider_failure("gemini", e, rate_limited)
                 logger.warning("gemini_stream_failed", error=str(e), exc_info=True)
+                if rate_limited:
+                    rate_msg = str(e)
+                    try:
+                        await asyncio.sleep(1.5)
+                    except Exception:
+                        pass
+                    logger.warning("gemini_rate_limited", error=rate_msg)
+                    fallback_note = "[Note: fallback provider — keep response concise]\n"
 
         if self._can_use_provider("groq", self.groq_available):
             try:
                 response_text = ""
                 _t0 = time.perf_counter()
+                prompt = self._compose_prompt(user_command, long_term_memory, indexed_context, provider="groq")
+                if "fallback_note" in locals() and fallback_note:
+                    prompt = fallback_note + prompt
                 async for chunk in self._stream_groq_with_tools(prompt, allow_tools=True):
                     response_text += chunk
                     yield chunk
@@ -472,6 +627,7 @@ class Brain:
         if self._can_use_provider("ollama", self.ollama_available):
             try:
                 _t0 = time.perf_counter()
+                prompt = self._compose_prompt(user_command, long_term_memory, indexed_context, provider="ollama")
                 response_text = await self._process_ollama(prompt)
                 if response_text:
                     _ms = (time.perf_counter() - _t0) * 1000
@@ -485,7 +641,7 @@ class Brain:
                 self._record_provider_failure("ollama", e, False)
                 logger.warning("ollama_stream_failed", error=str(e), exc_info=True)
 
-        response_text = await self.process_command(user_command, long_term_memory)
+        response_text = await self.process_command(user_command, long_term_memory, indexed_context)
         yield response_text
 
     def _requires_confirmation(self, tool_name: str) -> bool:
@@ -493,7 +649,7 @@ class Brain:
 
     def _handle_tool_response(self, tool_name: str, tool_result: Any) -> str:
         if tool_name != "resolve_open_target":
-            return str(tool_result)
+            return self._summarize_tool_output(tool_name, tool_result)
 
         payload = self._parse_tool_payload(tool_result)
         if not isinstance(payload, dict):
@@ -526,6 +682,52 @@ class Brain:
                 logger.debug("tool_payload_parse_failed", error=str(e), exc_info=True)
                 return tool_result
         return tool_result
+
+    def _summarize_tool_output(self, tool_name: str, data: Any, max_preview: int = 400) -> str:
+        """Create a short, human-friendly summary of a tool's output.
+
+        Keeps the preview concise to avoid long TTS or LLM dumps.
+        """
+        try:
+            if data is None:
+                return f"[{tool_name}] No result."
+
+            # Dictionaries: show key summary
+            if isinstance(data, dict):
+                keys = list(data.keys())
+                if not keys:
+                    return f"[{tool_name}] Empty object."
+                preview_keys = keys[:8]
+                return f"[{tool_name}] Object with keys: {', '.join(map(str, preview_keys))}{'...' if len(keys) > len(preview_keys) else ''}."
+
+            # Lists: show length and small preview
+            if isinstance(data, list):
+                length = len(data)
+                preview = json.dumps(data[:3], default=str)
+                if len(preview) > max_preview:
+                    preview = preview[: max_preview - 3] + "..."
+                return f"[{tool_name}] List with {length} items. Preview: {preview}"
+
+            # Bytes / binary
+            if isinstance(data, (bytes, bytearray)):
+                return f"[{tool_name}] Binary output ({len(data)} bytes)."
+
+            # Strings: truncate long text
+            if isinstance(data, str):
+                text = data.strip()
+                if len(text) <= max_preview:
+                    return text
+                preview = text[: max_preview].rsplit("\n", 1)[0]
+                return f"[{tool_name}] Long text ({len(text)} chars). Preview: {preview}..."
+
+            # Fallback to string repr
+            s = str(data)
+            if len(s) > max_preview:
+                return f"[{tool_name}] {s[: max_preview]}..."
+            return s
+        except Exception as e:
+            logger.debug("tool_summary_failed", tool=tool_name, error=str(e), exc_info=True)
+            return f"[{tool_name}] (unavailable)"
 
     async def _handle_vision(self, decision, prompt: str) -> str:
         if decision.vision_mode == "screen":
@@ -792,10 +994,8 @@ class Brain:
                 tr = await EXECUTOR.execute(tool_name, args, event_bus=self._event_bus)
                 if tr.success:
                     data = tr.data
-                    if isinstance(data, (dict, list)):
-                        body = {"result": json.dumps(data)}
-                    else:
-                        body = {"result": str(data)}
+                    # Send a concise preview back to the LLM instead of full dumps
+                    body = {"result": self._summarize_tool_output(tool_name, data)}
                 else:
                     body = {"error": str(tr.error or "execution failed")}
                 response_parts.append(
@@ -920,14 +1120,15 @@ class Brain:
                 logger.info("groq_tool_call", tool_name=func_name)
 
                 tool_result = await execute_tool(func_name, args, event_bus=self._event_bus)
-                tool_summaries.append(f"[tool:{func_name}] {tool_result}")
+                summary = self._summarize_tool_output(func_name, tool_result)
+                tool_summaries.append(f"[tool:{func_name}] {summary}")
 
                 tool_messages.append(
                     {
                         "tool_call_id": tc.id,
                         "role": "tool",
                         "name": func_name,
-                        "content": str(tool_result),
+                        "content": summary,
                     }
                 )
 
@@ -950,10 +1151,6 @@ class Brain:
             return msg.content
 
         return "Command executed, sir."
-
-    async def _stream_groq(self, prompt: str):
-        async for chunk in self._stream_groq_with_tools(prompt, allow_tools=False):
-            yield chunk
 
     async def _stream_groq_with_tools(self, prompt: str, allow_tools: bool = True):
         base_messages = [{"role": "system", "content": self.system_instruction}]
@@ -1033,7 +1230,7 @@ class Brain:
                         "tool_call_id": tool_call.get("id"),
                         "role": "tool",
                         "name": func_name,
-                        "content": str(tool_result),
+                        "content": self._summarize_tool_output(func_name, tool_result),
                     }
                 )
 

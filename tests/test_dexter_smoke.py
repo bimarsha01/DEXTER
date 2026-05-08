@@ -1,8 +1,12 @@
 import os
+import tempfile
+import time
+import asyncio
 import unittest
 from unittest import mock
 
 import utils.config as dexter_config
+from core.brain.memory import DexterMemory
 from core.brain.intent_router import IntentRouter
 from core.pipeline import AsyncPipeline
 from core.wake_word.detector import WakeWordDetector
@@ -51,6 +55,11 @@ class DexterSmokeTests(unittest.TestCase):
         self.assertEqual(decision.tool_name, "get_weather")
         self.assertEqual(decision.args["city"], "Kathmandu")
 
+        noisy_decision = router.detect_intent("what is the weather of Cut Mondo right now?")
+        self.assertEqual(noisy_decision.action, "tool")
+        self.assertEqual(noisy_decision.tool_name, "get_weather")
+        self.assertEqual(noisy_decision.args["city"], "Kathmandu")
+
         temperature_decision = router.detect_intent("what is the current temperature of Mumbai?")
         self.assertEqual(temperature_decision.action, "tool")
         self.assertEqual(temperature_decision.tool_name, "get_weather")
@@ -70,6 +79,107 @@ class DexterSmokeTests(unittest.TestCase):
         result = get_current_time("Mumbai")
         self.assertIn("Mumbai", result)
         self.assertIn("The current time in Mumbai is", result)
+
+    @mock.patch.dict(os.environ, {"GEMINI_API_KEY": "smoke-test-placeholder"}, clear=False)
+    @mock.patch("core.brain.memory.chromadb.PersistentClient", autospec=True)
+    def test_dexter_memory_chroma_startup_failure_handled(self, persistent_client_mock):
+        persistent_client_mock.side_effect = OSError("unwritable persist_directory")
+
+        tmp = tempfile.NamedTemporaryFile(delete=False)
+        try:
+            mem = DexterMemory(persist_directory=tmp.name, disable_rag_warming=True)
+            ctx = mem.recall_context("hello", n_results=1, include_personal_rag=True)
+            self.assertEqual(ctx, "")
+        finally:
+            try:
+                os.unlink(tmp.name)
+            except Exception:
+                pass
+
+
+class AsyncPipelineBlockingTests(unittest.IsolatedAsyncioTestCase):
+    async def test_transcription_does_not_block_event_loop(self):
+        # Avoid any real transcript correction / wake-word logic by stubbing them out.
+        with mock.patch("core.pipeline.TranscriptCorrector") as tc_mock:
+            tc_instance = tc_mock.return_value
+
+            def _correct(text):
+                obj = mock.MagicMock()
+                obj.corrected = text
+                return obj
+
+            tc_instance.correct.side_effect = _correct
+
+            config = dexter_config.DexterConfig()
+
+            class SlowTranscriber:
+                def transcribe(self, audio_file, on_partial=None):
+                    time.sleep(0.5)
+                    if on_partial:
+                        on_partial("Open Chrome")
+                    return "Open Chrome"
+
+            class FakeVAD:
+                def listen(self, output_file=None, on_speech_start=None, on_clap=None, clap_sensitivity=None):
+                    return "audio.wav"
+
+            class FakeTTS:
+                async def speak(self, sentence: str, interrupt: bool = True):
+                    return None
+
+                def stop(self):
+                    return None
+
+            class FakeMemory:
+                personal_rag = None
+
+                def recall_context(self, query, n_results=3, include_personal_rag=True):
+                    return ""
+
+                def remember(self, text, role="user"):
+                    return None
+
+            class FakeBrain:
+                pending_action = None
+
+                async def process_command_stream(self, command, long_term_memory="", indexed_context=""):
+                    yield "Done."
+
+            class FakeEventBus:
+                def emit(self, *_a, **_kw):
+                    return None
+
+            pipeline = AsyncPipeline(
+                config=config,
+                transcriber=SlowTranscriber(),
+                vad_listener=FakeVAD(),
+                tts_manager=FakeTTS(),
+                memory_vault=FakeMemory(),
+                brain=FakeBrain(),
+                event_bus=FakeEventBus(),
+                health_monitor=None,
+            )
+            pipeline.wake_detector = None
+            pipeline.corrector = tc_instance
+            pipeline.awake_until = time.time() + 100.0
+            pipeline._loop = asyncio.get_running_loop()
+
+            start = pipeline._loop.time()
+            fired = asyncio.Event()
+
+            async def ticker():
+                await asyncio.sleep(0.05)
+                fired.set()
+
+            pipeline_task = asyncio.create_task(pipeline._handle_once())
+            ticker_task = asyncio.create_task(ticker())
+
+            await asyncio.wait_for(fired.wait(), timeout=1.0)
+            elapsed = pipeline._loop.time() - start
+            self.assertLess(elapsed, 0.3, "Transcription blocked the asyncio event loop")
+
+            await asyncio.wait_for(pipeline_task, timeout=3.0)
+            ticker_task.cancel()
 
     def test_media_intents_route_to_content_platform_search(self):
         router = IntentRouter(DexterConfig(defaults=DefaultsConfig(city="Kathmandu")))

@@ -17,6 +17,8 @@ class VADListener:
         self.chunk_size = chunk_size
         self.q = queue.Queue()
         self._ambient_rms = 0.0
+        # Timestamp until which VAD should ignore input (seconds since epoch)
+        self._ignore_until = 0.0
         self._clap_active = False
         self._clap_start = 0.0
         self._last_clap_time = 0.0
@@ -90,6 +92,10 @@ class VADListener:
                                 blocksize=self.chunk_size):
                 while True:
                     chunk = self.q.get()
+                    # If suppression is active (e.g., TTS playback), ignore incoming chunks
+                    if time.time() < getattr(self, "_ignore_until", 0.0):
+                        # Drain/skip while suppressed
+                        continue
                     if on_clap is not None:
                         rms = float(np.sqrt(np.mean(chunk**2))) if chunk.size else 0.0
                         self._detect_clap(
@@ -187,3 +193,13 @@ class VADListener:
                     self._last_clap_time = now
 
         self._ambient_rms = (self._ambient_rms * 0.9) + (rms * 0.1)
+
+    def suppress_for(self, seconds: float) -> None:
+        """Temporarily ignore VAD input for `seconds` seconds.
+
+        Useful to avoid picking up TTS playback or other known audio sources.
+        """
+        try:
+            self._ignore_until = time.time() + max(0.0, float(seconds))
+        except Exception:
+            self._ignore_until = time.time()

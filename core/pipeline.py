@@ -1,4 +1,5 @@
 import asyncio
+import os
 import re
 import time
 from uuid import uuid4
@@ -12,6 +13,7 @@ from utils.transcript_correction import TranscriptCorrector
 from utils.logger import get_logger, bind_correlation_id, clear_correlation_id
 from utils.metrics import metrics
 from utils.config import DexterConfig
+from core.brain import session_state
 
 logger = get_logger("pipeline")
 
@@ -63,6 +65,7 @@ class AsyncPipeline:
         self.awake_until = 0.0
         self.corrector = TranscriptCorrector()
         self._loop: asyncio.AbstractEventLoop | None = None
+        self._turn_count = 0
 
     def _set_state(self, state: AssistantState) -> None:
         if self.state != state:
@@ -163,13 +166,41 @@ class AsyncPipeline:
 
         return False
 
-    async def _stream_response(self, command: str, memory_context: str) -> str:
+    async def _get_rag_context(self, query: str) -> str:
+        rag_index = getattr(self.memory, "personal_rag", None)
+        if rag_index is None:
+            return ""
+
+        try:
+            if hasattr(rag_index, "is_ready") and not rag_index.is_ready:
+                logger.debug("[RAG] index still warming up, context will be empty this turn")
+                return ""
+        except Exception:
+            # If readiness probing fails, fall back to best-effort context building.
+            pass
+
+        try:
+            loop = asyncio.get_running_loop()
+            context = await asyncio.wait_for(
+                loop.run_in_executor(None, rag_index.build_context, query),
+                timeout=2.0,
+            )
+            return context or ""
+
+        except asyncio.TimeoutError:
+            logger.warning("rag_context_timeout", query=query)
+            return ""
+        except Exception as e:
+            logger.error("rag_context_failed", error=str(e), exc_info=True)
+            return ""
+
+    async def _stream_response(self, command: str, memory_context: str, indexed_context: str = "") -> str:
         response_text = ""
         sentence_buffer = ""
         sentences_queue: list[tuple[str, bool]] = []
         speaking_started = False
 
-        async for chunk in self.brain.process_command_stream(command, long_term_memory=memory_context):
+        async for chunk in self.brain.process_command_stream(command, long_term_memory=memory_context, indexed_context=indexed_context):
             if not chunk:
                 continue
             response_text += chunk
@@ -198,6 +229,20 @@ class AsyncPipeline:
         # Play sentences sequentially to avoid overlapping audio
         for sentence, interrupt in sentences_queue:
             try:
+                # Estimate playback duration (approx words / 2.5 words-per-second) and suppress VAD
+                try:
+                    words = len(sentence.split())
+                    est_seconds = max(0.5, (words / 2.5) + 0.5)
+                except Exception:
+                    est_seconds = 2.0
+
+                # If the VAD supports suppression, request it for the estimated duration
+                try:
+                    if hasattr(self.vad, "suppress_for"):
+                        await asyncio.to_thread(self.vad.suppress_for, est_seconds + 1.5)
+                except Exception:
+                    pass
+
                 await self.tts.speak(sentence, interrupt=interrupt)
             except Exception as e:
                 logger.error("tts_speak_failed", error=str(e), exc_info=True)
@@ -276,28 +321,56 @@ class AsyncPipeline:
             if not audio_path:
                 logger.debug("vad_no_audio_captured", cid=cid)
                 self._set_state(AssistantState.IDLE)
+                await asyncio.sleep(1)
                 return
 
             self._set_state(AssistantState.TRANSCRIBING)
             stt_start = time.perf_counter()
 
             def _on_partial(text: str) -> None:
-                if text:
-                    self.event_bus.emit("transcript_partial", {"text": text})
+                if not text:
+                    return
+                payload = {"text": text}
+                # Callback is invoked from a worker thread (transcription runs in to_thread).
+                # Marshal back to the asyncio event loop for thread safety.
+                if self._loop is not None:
+                    self._loop.call_soon_threadsafe(self.event_bus.emit, "transcript_partial", payload)
+                else:
+                    self.event_bus.emit("transcript_partial", payload)
 
-            identified_text = self.transcriber.transcribe(audio_path, on_partial=_on_partial)
-            metrics.record_latency("stt_ms", (time.perf_counter() - stt_start) * 1000)
+            try:
+                identified_text = await asyncio.wait_for(
+                    asyncio.to_thread(self.transcriber.transcribe, audio_path, on_partial=_on_partial),
+                    timeout=10.0,
+                )
+                metrics.record_latency("stt_ms", (time.perf_counter() - stt_start) * 1000)
+            except asyncio.TimeoutError:
+                logger.warning("transcription_timeout", cid=cid)
+                self._set_state(AssistantState.IDLE)
+                return
+            except Exception as e:
+                logger.error("transcription_failed", error=str(e), exc_info=True)
+                self._set_state(AssistantState.IDLE)
+                return
 
             if not identified_text:
                 logger.debug("transcription_empty", cid=cid)
                 self._set_state(AssistantState.IDLE)
                 return
 
-            logger.info(
-                "utterance_started",
-                cid=cid,
-                transcript=identified_text,
-            )
+            privacy_cfg = getattr(self.config, "privacy", None)
+            if privacy_cfg is not None and bool(getattr(privacy_cfg, "debug_log_transcripts", False)):
+                logger.info(
+                    "utterance_started",
+                    cid=cid,
+                    transcript=identified_text,
+                )
+            else:
+                logger.debug(
+                    "utterance_started",
+                    cid=cid,
+                    transcript_length=len(identified_text),
+                )
             self.event_bus.emit("transcript_received", {"text": identified_text, "correlation_id": cid})
             logger.debug("transcript_final", text=identified_text)
 
@@ -351,13 +424,85 @@ class AsyncPipeline:
                     return
 
             logger.info("command_accepted", command=clean_command)
+            # Advance turn counter for this accepted command
+            self._turn_count += 1
+
+            # Clear stale project slot if needed
+            try:
+                session_state.clear_if_stale(self._turn_count)
+            except Exception:
+                pass
             if self.activation_mode == "clap":
                 self._open_wake_window()
                 logger.info("activation_window_extended", seconds=self.command_window_seconds)
             self._set_state(AssistantState.PROCESSING)
+            memory_context = await asyncio.to_thread(self.memory.recall_context, clean_command, 3, False)
 
-            memory_context = await asyncio.to_thread(self.memory.recall_context, clean_command)
-            response_text = await self._stream_response(clean_command, memory_context)
+            # Skip RAG retrieval for non-document intents to avoid polluting prompts
+            # when the minimum relevance threshold is permissive.
+            skip_rag = False
+            try:
+                decision = self.brain.intent_router.detect_intent(clean_command)
+                non_document_tools = {
+                    "get_weather",
+                    "get_current_time",
+                    "get_current_datetime",
+                    "get_system_status",
+                    "read_clipboard",
+                    "take_screenshot",
+                    "get_health_report",
+                }
+                if decision.action == "vision":
+                    skip_rag = True
+                elif decision.action == "tool" and decision.tool_name in non_document_tools:
+                    skip_rag = True
+                elif decision.action == "ask" and decision.tool_name in non_document_tools:
+                    skip_rag = True
+            except Exception:
+                pass
+
+            # If a current_project session slot exists, prepend its name to the RAG query
+            try:
+                proj = session_state.get_current_project()
+            except Exception:
+                proj = None
+
+            if proj:
+                # Tools may set a sentinel (None) for "just set"; record the real turn now.
+                set_at_turn = proj.get("set_at_turn")
+                if set_at_turn is None or int(set_at_turn or 0) == 0:
+                    try:
+                        session_state.set_current_project(proj.get("name"), proj.get("resolved_path"), proj.get("confidence", 0.0), self._turn_count)
+                    except Exception:
+                        pass
+                rag_query = f"{proj.get('name')} {clean_command}"
+
+                # If this is the earliest project context and the RAG index is still warming,
+                # optionally wait briefly so we don't miss the first project turn.
+                rag_index = getattr(self.memory, "personal_rag", None)
+                warm_evt = getattr(rag_index, "warm_up_complete", None) if rag_index is not None else None
+                try:
+                    if (
+                        rag_index is not None
+                        and warm_evt is not None
+                        and hasattr(rag_index, "is_ready")
+                        and not rag_index.is_ready
+                        and self._turn_count == 1
+                    ):
+                        await asyncio.wait_for(warm_evt.wait(), timeout=1.5)
+                except asyncio.TimeoutError:
+                    pass
+
+                rag_context = "" if skip_rag else await self._get_rag_context(rag_query)
+                if rag_context:
+                    rag_context = f"[Context: user is currently asking about {proj.get('name')}]\n" + rag_context
+            else:
+                rag_context = "" if skip_rag else await self._get_rag_context(clean_command)
+            augmented_command = clean_command
+            if rag_context:
+                augmented_command = f"{rag_context}\nUser question: {clean_command}"
+
+            response_text = await self._stream_response(augmented_command, memory_context, rag_context)
 
             if self.activation_mode == "clap" and self.brain.pending_action:
                 self._open_wake_window()

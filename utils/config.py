@@ -77,6 +77,11 @@ class RagConfig(BaseModel):
             "*.sqlite",
         ]
     )
+    # New user-tunable RAG settings
+    minimum_relevance_score: float = 45.0
+    max_results: int = 5
+    excerpt_max_chars: int = 450
+    boost_cap: float = 30.0
 
 
 class WakeBehaviorConfig(BaseModel):
@@ -152,6 +157,25 @@ class ProactiveConfig(BaseModel):
     system_status_interval_seconds: int = 900
 
 
+class RuntimeConfig(BaseModel):
+    """Runtime flags set by low-power mode detection."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    disable_rag_warming: bool = False
+    disable_proactive_mode: bool = False
+
+
+class PrivacyConfig(BaseModel):
+    """Privacy-related runtime flags."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    # If enabled, log full user transcripts to disk (logs/dexter.log).
+    # This can contain sensitive personal voice content.
+    debug_log_transcripts: bool = False
+
+
 class DexterConfig(BaseModel):
     """
     Runtime configuration loaded from config.yaml plus .env (API keys).
@@ -173,6 +197,8 @@ class DexterConfig(BaseModel):
     history: HistoryConfig = Field(default_factory=HistoryConfig)
     mcp: McpConfig = Field(default_factory=McpConfig)
     proactive: ProactiveConfig = Field(default_factory=ProactiveConfig)
+    runtime: RuntimeConfig = Field(default_factory=RuntimeConfig)
+    privacy: PrivacyConfig = Field(default_factory=PrivacyConfig)
 
     gemini_api_key: str = ""
     groq_api_key: str = ""
@@ -220,6 +246,8 @@ def _ensure_config_shape(config: dict) -> dict:
     config.setdefault("rag", {})
     config.setdefault("mcp", {})
     config.setdefault("proactive", {})
+    config.setdefault("runtime", {})
+    config.setdefault("privacy", {})
     return config
 
 
@@ -259,6 +287,14 @@ def _load_raw_config() -> dict:
 
     config = _ensure_config_shape(config)
     _inject_api_keys(config)
+    
+    # Apply low-power mode overrides if hardware is weak
+    try:
+        from utils.hardware_detect import apply_low_power_overrides
+        config = apply_low_power_overrides(config)
+    except Exception as e:
+        logger.warning(f"Failed to apply hardware detection: {e}")
+    
     api = config.pop("api_keys", {})
     config["gemini_api_key"] = os.getenv("GEMINI_API_KEY") or (api.get("gemini") or "")
     config["groq_api_key"] = os.getenv("GROQ_API_KEY") or (api.get("groq") or "")

@@ -71,6 +71,8 @@ class ToolExecutor:
 
     def _get_allowed_roots(self, config: DexterConfig) -> List[str]:
         roots = config.security.allowed_file_roots or []
+        if any(str(r).strip() in {".", "./"} for r in roots):
+            logger.warning("unsafe_allowed_root_dot_present", allowed_roots=roots)
         workspace_root = get_workspace_root()
         if not roots:
             home = os.path.expanduser("~")

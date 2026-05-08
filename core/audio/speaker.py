@@ -26,11 +26,11 @@ class TTSManager:
         self.voice = voice
         self._cancel_event = threading.Event()
         self._global_cancel = threading.Event()
-        self._channel = None
+        self._current_channel = None
         self._lock = asyncio.Lock()
         self._interrupt_cooldown = 0.0  # Prevent rapid re-interrupts
 
-    def stop(self) -> None:
+    def cancel(self) -> None:
         """Immediately stops TTS playback. Thread-safe."""
         current_time = time.time()
         if current_time < self._interrupt_cooldown:
@@ -40,15 +40,19 @@ class TTSManager:
         self._global_cancel.set()
         self._cancel_event.set()
         
-        if self._channel is not None:
+        if self._current_channel is not None:
             try:
                 # Forcefully stop the channel
-                self._channel.stop()
+                self._current_channel.stop()
                 logger.info("tts_interrupted_channel_stopped")
             except Exception as e:
                 logger.debug("tts_channel_stop_failed", error=str(e))
         
-        logger.debug("tts_stop_requested")
+        self._current_channel = None
+        logger.info("tts_cancelled")
+
+    def stop(self) -> None:
+        self.cancel()
 
     async def speak(self, text: str, interrupt: bool = True) -> None:
         if not text or not text.strip():
@@ -64,8 +68,7 @@ class TTSManager:
             cancel_event = self._cancel_event
 
         preview = text[:80] + "..." if len(text) > 80 else text
-        logger.info("tts_speak_started", text_preview=preview, text_length=len(text))
-        audio_file = None
+        logger.info("tts_speak_started", text_preview=text[:50])
 
         try:
             synth_start = time.perf_counter()
@@ -81,9 +84,7 @@ class TTSManager:
         except Exception as e:
             logger.error("tts_synthesis_failed", error=str(e), exc_info=True)
         finally:
-            if audio_file:
-                _safe_delete(audio_file)
-            self._channel = None
+            self._current_channel = None
 
     async def play_chime(self) -> None:
         try:
@@ -91,12 +92,6 @@ class TTSManager:
             await _play_audio_bytes(audio_bytes, threading.Event(), self, track_channel=False)
         except Exception as e:
             logger.debug("tts_chime_failed", error=str(e))
-
-
-async def speak(text: str, voice: str = "en-GB-RyanNeural"):
-    """Backward-compatible helper for simple speech output."""
-    manager = TTSManager(voice=voice)
-    await manager.speak(text)
 
 
 def _ensure_pygame_ready() -> None:
@@ -123,26 +118,32 @@ async def _play_audio_bytes(
     import pygame
 
     try:
-        sound = pygame.mixer.Sound(buffer=audio_bytes)
+        # Load the audio from memory so pygame never touches a temp file.
+        sound_buffer = io.BytesIO(audio_bytes)
+        try:
+            sound = pygame.mixer.Sound(sound_buffer)
+        finally:
+            # Explicitly close the in-memory buffer to avoid allocation pressure.
+            sound_buffer.close()
     except Exception:
-        sound = pygame.mixer.Sound(io.BytesIO(audio_bytes))
+        raise
     logger.debug("tts_playback_started", duration_estimate_ms=int(sound.get_length() * 1000))
     channel = sound.play()
     if channel is None:
         raise RuntimeError("pygame_failed_to_start_playback")
 
     if track_channel:
-        manager._channel = channel
+        manager._current_channel = channel
     try:
-        while channel.get_busy():
+        while manager._current_channel and manager._current_channel.get_busy():
             if cancel_event.is_set() or manager._global_cancel.is_set():
-                channel.stop()
+                manager._current_channel.stop()
                 break
             await asyncio.sleep(0.05)
         logger.info("tts_playback_complete")
     finally:
-        if track_channel and manager._channel is channel:
-            manager._channel = None
+        if track_channel and manager._current_channel is channel:
+            manager._current_channel = None
 
 
 async def _synthesize_edge_tts_bytes(text: str, voice: str) -> bytes:
@@ -168,7 +169,8 @@ async def _synthesize_edge_tts_bytes(text: str, voice: str) -> bytes:
     try:
         await communicate.save(temp_handle.name)
         with open(temp_handle.name, "rb") as audio_handle:
-            return audio_handle.read()
+            audio_bytes = audio_handle.read()
+        return audio_bytes
     finally:
         _safe_delete(temp_handle.name)
 

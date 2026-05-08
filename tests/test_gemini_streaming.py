@@ -1,13 +1,16 @@
 """Tests for Gemini async streaming with buffered tool calls (llm_router._stream_gemini)."""
 from __future__ import annotations
 
+import re
 import unittest
 from datetime import UTC, datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from google.genai import types
+from google.api_core.exceptions import ResourceExhausted
 
 from core.brain.llm_router import Brain
+from core.brain.intent_router import IntentDecision
 from tools.executor import ToolResult
 from tools.registry import EXECUTOR
 
@@ -181,6 +184,60 @@ class GeminiStreamingToolCallTests(unittest.IsolatedAsyncioTestCase):
 
         exec_mock.assert_awaited_once()
         self.assertEqual(exec_mock.await_args.args[1], {"city": "NYC"})
+
+    async def test_gemini_resource_exhausted_falls_back_to_groq_with_fallback_note_and_excerpt_cap(self) -> None:
+        indexed_context = (
+            "PERSONAL FILE CONTEXT (answer naturally as if you read these files yourself; cite by number when relevant):\n\n"
+            "[1] office-reporting-system.md  (src)\n"
+            + ("X" * 2000)
+            + "\n\n"
+            "[2] other.md  (src)\n"
+            + ("Y" * 2000)
+        )
+
+        captured: dict[str, str] = {}
+
+        async def fake_stream_groq_with_tools(self, prompt: str, allow_tools: bool = True):
+            captured["prompt"] = prompt
+            yield "OK"
+
+        async def raise_gemini_stream(*_a, **_kw):
+            raise ResourceExhausted("Quota exceeded")
+
+        def custom_gemini_init(self) -> None:
+            self.gemini_available = True
+            self.gemini_client = MagicMock()
+            self.gemini_client.aio.models.generate_content_stream = raise_gemini_stream
+            self._genai_types = types
+            self.gemini_model_name = "gemini-2.0-flash"
+
+        def custom_groq_init(self) -> None:
+            self.groq_available = True
+            self.groq_client = MagicMock()
+            self.groq_tools = []
+
+        def custom_ollama_init(self) -> None:
+            self.ollama_available = False
+
+        with patch.object(Brain, "_init_gemini", custom_gemini_init):
+            with patch.object(Brain, "_init_groq", custom_groq_init):
+                with patch.object(Brain, "_init_ollama", custom_ollama_init):
+                    with patch.object(Brain, "_stream_groq_with_tools", fake_stream_groq_with_tools):
+                        brain = Brain()
+                        brain.intent_router.detect_intent = lambda _t: IntentDecision(action="none")
+
+                        _chunks = [c async for c in brain.process_command_stream("hello", indexed_context=indexed_context)]
+
+        self.assertTrue(captured, "Expected groq fallback to be invoked and prompt captured")
+        prompt = captured["prompt"]
+
+        self.assertIn("[Note: fallback provider — keep response concise]\n", prompt)
+
+        # Ensure excerpts are capped <= 800 chars (specifically the X-filled excerpt).
+        lines = prompt.splitlines()
+        x_lines = [l for l in lines if "X" in l]
+        self.assertTrue(x_lines, "Expected the truncated indexed-context excerpt to include X characters")
+        self.assertTrue(all(len(l) <= 800 for l in x_lines))
 
 
 if __name__ == "__main__":
