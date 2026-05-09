@@ -23,7 +23,7 @@ from utils.logger import get_logger
 logger = get_logger("pre_mcp_audit")
 
 
-CORE_IMPORTS = [
+CORE_IMPORTS = [ 
     "core.audio.vad",
     "core.audio.transcriber",
     "core.audio.speaker",

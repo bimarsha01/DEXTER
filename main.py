@@ -151,6 +151,15 @@ async def main():
         brain = Brain(event_bus=event_bus)
         health_monitor.healthy("brain", "llm router ready")
 
+        provider_status, primary_provider = await brain.check_provider_status()
+        logger.info(
+            "startup_provider_status",
+            Gemini=provider_status.get("Gemini", "UNKNOWN"),
+            Groq=provider_status.get("Groq", "UNKNOWN"),
+            Ollama=provider_status.get("Ollama", "UNKNOWN"),
+        )
+        logger.info("startup_primary_provider", provider=primary_provider)
+
         proactive = None
         if runtime_config.proactive.enabled and not runtime_config.runtime.disable_proactive_mode:
             proactive = ProactiveAssistant(

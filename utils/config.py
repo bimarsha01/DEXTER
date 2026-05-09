@@ -82,6 +82,8 @@ class RagConfig(BaseModel):
     max_results: int = 5
     excerpt_max_chars: int = 450
     boost_cap: float = 30.0
+    refresh_only_when_idle: bool = True
+    refresh_idle_threshold_seconds: float = 30.0
 
 
 class WakeBehaviorConfig(BaseModel):
@@ -97,11 +99,22 @@ class ActivationConfig(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     mode: str = "wake_word"
+    wake_word: str = "dexter"
     clap_sensitivity: float = 3.0
     active_window_seconds: int = 30
     start_active: bool = False
     min_command_words: int = 2
+    fallback_to_always_on_after_failures: int = 3
     wake_words: list[str] = Field(default_factory=lambda: ["hey", "hey dexter"])
+
+
+class ProvidersConfig(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    gemini_daily_quota_cooldown_hours: float = 24.0
+    groq_max_tools: int = 10
+    ollama_timeout_seconds: float = 25.0
+    overall_turn_timeout_seconds: float = 30.0
 
 
 class AudioSettingsConfig(BaseModel):
@@ -191,6 +204,7 @@ class DexterConfig(BaseModel):
     models: ModelsConfig = Field(default_factory=ModelsConfig)
     defaults: DefaultsConfig = Field(default_factory=DefaultsConfig)
     security: SecurityConfig = Field(default_factory=SecurityConfig)
+    providers: ProvidersConfig = Field(default_factory=ProvidersConfig)
     rag: RagConfig = Field(default_factory=RagConfig)
     audio_settings: AudioSettingsConfig = Field(default_factory=AudioSettingsConfig)
     stt: SttConfig = Field(default_factory=SttConfig)
@@ -239,6 +253,7 @@ def _ensure_config_shape(config: dict) -> dict:
     config.setdefault("api_keys", {})
     config.setdefault("models", {})
     config.setdefault("security", {})
+    config.setdefault("providers", {})
     config.setdefault("audio_settings", {})
     config.setdefault("speed", {})
     config.setdefault("stt", {})

@@ -9,7 +9,8 @@ from core.event_bus import EventBus
 from core.health import HealthMonitor
 from core.state_machine import AssistantState
 from core.wake_word.detector import WakeWordDetector
-from utils.transcript_correction import TranscriptCorrector
+from core.session_activity import session_activity
+from utils.transcript_correction import TranscriptCorrector, apply_wake_word_aliases
 from utils.logger import get_logger, bind_correlation_id, clear_correlation_id
 from utils.metrics import metrics
 from utils.config import DexterConfig
@@ -54,6 +55,9 @@ class AsyncPipeline:
         self.start_active = bool(activation.start_active)
         self.min_command_words = max(1, int(activation.min_command_words or 1))
         self.wake_words = list(activation.wake_words or config.wake_words)
+        configured_primary_wake_word = (activation.wake_word or "").strip().lower()
+        if configured_primary_wake_word and configured_primary_wake_word not in [w.lower() for w in self.wake_words]:
+            self.wake_words.insert(0, configured_primary_wake_word)
         self.wake_detector = None
         if self.activation_mode == "wake_word":
             self.wake_detector = WakeWordDetector(
@@ -66,6 +70,30 @@ class AsyncPipeline:
         self.corrector = TranscriptCorrector()
         self._loop: asyncio.AbstractEventLoop | None = None
         self._turn_count = 0
+        self._consecutive_activation_drops = 0
+        self._always_on_until = 0.0
+
+    def _effective_activation_mode(self) -> str:
+        if self._always_on_until > time.time():
+            return "always_on"
+        return self.activation_mode
+
+    def _record_activation_drop(self, transcript_text: str, reason: str) -> None:
+        self._consecutive_activation_drops += 1
+        logger.info(
+            "activation_failed",
+            transcript=transcript_text,
+            wake_word_found=False,
+            reason=reason,
+        )
+        threshold = max(1, int(self.config.activation.fallback_to_always_on_after_failures or 3))
+        if self._consecutive_activation_drops >= threshold:
+            self._always_on_until = time.time() + 60.0
+            self._consecutive_activation_drops = 0
+            logger.warning("[ACTIVATION] 3 consecutive wake word failures - switching to always_on for 60s")
+
+    def _reset_activation_drop_counter(self) -> None:
+        self._consecutive_activation_drops = 0
 
     def _set_state(self, state: AssistantState) -> None:
         if self.state != state:
@@ -78,6 +106,10 @@ class AsyncPipeline:
                 to_state=state.name,
             )
             self.event_bus.emit("state_changed", {"state": state.name})
+            if state == AssistantState.PROCESSING:
+                session_activity.mark_active()
+            elif state == AssistantState.IDLE:
+                session_activity.mark_idle()
             if self.health_monitor is not None:
                 self.health_monitor.healthy("pipeline", f"state={state.name}")
 
@@ -374,8 +406,11 @@ class AsyncPipeline:
             self.event_bus.emit("transcript_received", {"text": identified_text, "correlation_id": cid})
             logger.debug("transcript_final", text=identified_text)
 
-            if self.activation_mode == "wake_word":
-                detection = self.wake_detector.detect(identified_text) if self.wake_detector else None
+            effective_mode = self._effective_activation_mode()
+            preprocessed_text = apply_wake_word_aliases(identified_text)
+
+            if effective_mode == "wake_word":
+                detection = self.wake_detector.detect(preprocessed_text) if self.wake_detector else None
                 bypass_activation = False
 
                 if detection and detection.triggered:
@@ -389,14 +424,15 @@ class AsyncPipeline:
                         self._set_state(AssistantState.IDLE)
                         return
                 elif self._is_awake():
-                    clean_command = identified_text
+                    clean_command = preprocessed_text
                 else:
-                    if self._looks_actionable_utterance(identified_text):
-                        clean_command = identified_text
+                    if self._looks_actionable_utterance(preprocessed_text):
+                        clean_command = preprocessed_text
                         bypass_activation = True
                         self._open_wake_window()
                         logger.info("activation_bypassed", mode="wake_word", reason="actionable_utterance")
                     else:
+                        self._record_activation_drop(preprocessed_text, "wake_word_not_detected")
                         self._set_state(AssistantState.IDLE)
                         return
 
@@ -405,15 +441,15 @@ class AsyncPipeline:
             else:
                 bypass_activation = False
                 if not self._is_awake() and not self.brain.pending_action:
-                    if self._looks_actionable_utterance(identified_text):
+                    if effective_mode == "always_on" or self._looks_actionable_utterance(preprocessed_text):
                         bypass_activation = True
                         self._open_wake_window()
-                        logger.info("activation_bypassed", mode="clap", reason="actionable_utterance")
+                        logger.info("activation_bypassed", mode=effective_mode, reason="actionable_utterance")
                     else:
                         self._set_state(AssistantState.IDLE)
                         return
 
-                correction = self.corrector.correct(identified_text)
+                correction = self.corrector.correct(preprocessed_text)
                 clean_command = correction.corrected
                 if (
                     not bypass_activation
@@ -423,6 +459,7 @@ class AsyncPipeline:
                     self._set_state(AssistantState.IDLE)
                     return
 
+            self._reset_activation_drop_counter()
             logger.info("command_accepted", command=clean_command)
             # Advance turn counter for this accepted command
             self._turn_count += 1
@@ -502,7 +539,17 @@ class AsyncPipeline:
             if rag_context:
                 augmented_command = f"{rag_context}\nUser question: {clean_command}"
 
-            response_text = await self._stream_response(augmented_command, memory_context, rag_context)
+            turn_timeout_seconds = float(getattr(self.config.providers, "overall_turn_timeout_seconds", 30.0))
+            try:
+                response_text = await asyncio.wait_for(
+                    self._stream_response(augmented_command, memory_context, rag_context),
+                    timeout=turn_timeout_seconds,
+                )
+            except asyncio.TimeoutError:
+                logger.error("pipeline_llm_timeout", turn_id=cid)
+                await self.tts.speak("I didn't get a response in time. Please try again.")
+                self._set_state(AssistantState.IDLE)
+                return
 
             if self.activation_mode == "clap" and self.brain.pending_action:
                 self._open_wake_window()

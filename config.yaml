@@ -11,6 +11,8 @@ wake_behavior:
 
 activation:
   mode: "wake_word"  # options: "wake_word" or "clap"
+  wake_word: "dexter"
+  fallback_to_always_on_after_failures: 3
   clap_sensitivity: 3.0
   active_window_seconds: 30
   start_active: true
@@ -40,6 +42,12 @@ security:
     - "%USERPROFILE%/Documents"
     - "%USERPROFILE%/Desktop"
   tool_timeout_sec: 10
+
+providers:
+  gemini_daily_quota_cooldown_hours: 24
+  groq_max_tools: 10
+  ollama_timeout_seconds: 25
+  overall_turn_timeout_seconds: 30
 
 rag:
   intent_catalog_path: "intent_catalog.md"
@@ -86,6 +94,8 @@ rag:
   max_results: 5
   excerpt_max_chars: 450
   boost_cap: 30.0
+  refresh_only_when_idle: true
+  refresh_idle_threshold_seconds: 30
 
 audio_settings:
   sample_rate: 16000

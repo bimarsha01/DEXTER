@@ -86,6 +86,12 @@ class DexterTranscriber:
 
         logger.debug("transcriber_run_started", path=audio_file, beam_size=self.beam_size)
         model = self._ensure_model()
+        prompt = (self.initial_prompt or "").strip()
+        if prompt:
+            if not prompt.lower().startswith("dexter"):
+                prompt = f"Dexter, {prompt}"
+        else:
+            prompt = "Dexter,"
         segments, info = model.transcribe(
             audio_file,
             beam_size=self.beam_size,
@@ -95,7 +101,7 @@ class DexterTranscriber:
             log_prob_threshold=self.log_prob_threshold,
             no_speech_threshold=self.no_speech_threshold,
             condition_on_previous_text=self.condition_on_previous_text,
-            initial_prompt=self.initial_prompt or None,
+            initial_prompt=prompt,
             vad_filter=True,  # Skip silence segments for speed
         )
 

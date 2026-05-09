@@ -13,6 +13,7 @@ import asyncio
 import time
 import random
 from typing import Any, Optional
+from rapidfuzz import fuzz
 
 from utils.logger import get_logger, get_correlation_id
 from utils.metrics import metrics
@@ -28,6 +29,46 @@ from core.event_bus import EventBus
 
 class _StreamingFallback(Exception):
     pass
+
+
+TOOL_GROUPS = {
+    "time": ["get_current_time", "get_current_datetime"],
+    "weather": ["get_weather"],
+    "app": ["open_application", "close_application"],
+    "volume": ["set_system_volume"],
+    "search": ["search_google", "search_youtube", "search_content_platform"],
+    "document": ["read_document", "summarize_document", "answer_document_question"],
+    "system": ["get_system_status", "lock_workstation", "shutdown_pc", "restart_pc", "sleep_pc", "cancel_shutdown"],
+    "clipboard": ["read_clipboard", "copy_to_clipboard"],
+    "screen": ["take_screenshot", "capture_screen"],
+    "note": ["create_note", "read_note", "list_notes"],
+    "browser": ["open_url", "open_url_in_browser"],
+    "youtube": ["play_youtube"],
+    "routine": ["save_automation_routine", "list_automation_routines", "run_automation_routine", "delete_automation_routine"],
+    "keyboard": ["type_text", "press_shortcut", "enter_key", "minimize_all_windows"],
+    "health": ["get_health_report"],
+}
+
+ALWAYS_INCLUDE = ["get_current_datetime", "get_weather", "open_application"]
+
+
+class ProviderHealth:
+    """Persisted in-memory provider cooldown and failure state."""
+
+    def __init__(self):
+        self.gemini_disabled_until: float = 0.0
+        self.groq_failure_count: int = 0
+        self.groq_last_failure: float = 0.0
+
+    def disable_gemini(self, seconds: float) -> None:
+        self.gemini_disabled_until = time.time() + max(0.0, float(seconds))
+
+    def is_gemini_available(self) -> bool:
+        return time.time() > self.gemini_disabled_until
+
+    def record_groq_failure(self) -> None:
+        self.groq_failure_count += 1
+        self.groq_last_failure = time.time()
 
 
 class Brain:
@@ -47,6 +88,7 @@ class Brain:
         self.shared_history = []
         self.pending_action = None
         self.max_history_tokens = int(self._cfg.history.max_tokens)
+        self._provider_health = ProviderHealth()
         self.provider_state = {
             "gemini": {"failures": 0, "score": 1.0, "cooldown_until": 0.0, "last_error": ""},
             "groq": {"failures": 0, "score": 1.0, "cooldown_until": 0.0, "last_error": ""},
@@ -113,6 +155,55 @@ class Brain:
         metrics.update_provider_health("gemini", self.gemini_available, 1.0 if self.gemini_available else 0.0)
         metrics.update_provider_health("groq", self.groq_available, 1.0 if self.groq_available else 0.0)
         metrics.update_provider_health("ollama", self.ollama_available, 1.0 if self.ollama_available else 0.0)
+
+    def _gemini_cooldown_seconds(self, error: Exception) -> float:
+        msg = str(error)
+        lower = msg.lower()
+        if "perday" in lower or "limit: 0" in lower:
+            return max(1.0, float(self._cfg.providers.gemini_daily_quota_cooldown_hours) * 3600.0)
+        if "perminute" in lower:
+            return 65.0
+        if self._is_rate_limit_error(error):
+            return 65.0
+        return 0.0
+
+    def _select_tools_for_provider(self, query: str, provider: str) -> list[dict]:
+        if provider != "groq":
+            return list(self.groq_tools)
+
+        query_text = (query or "").lower()
+        available = {t.get("function", {}).get("name"): t for t in (self.groq_tools or [])}
+        if not available:
+            return []
+
+        group_scores: list[tuple[float, str]] = []
+        for group_name in TOOL_GROUPS:
+            score = float(fuzz.partial_ratio(group_name, query_text))
+            group_scores.append((score, group_name))
+
+        selected_names: set[str] = set()
+        for _, group_name in sorted(group_scores, key=lambda item: item[0], reverse=True)[:2]:
+            for tool_name in TOOL_GROUPS.get(group_name, []):
+                if tool_name in available:
+                    selected_names.add(tool_name)
+
+        for tool_name in ALWAYS_INCLUDE:
+            if tool_name in available:
+                selected_names.add(tool_name)
+
+        max_tools = max(1, int(self._cfg.providers.groq_max_tools))
+        ordered_names = sorted(selected_names)
+        trimmed = ordered_names[:max_tools]
+        selected = [available[name] for name in trimmed if name in available]
+
+        logger.debug(
+            "groq_tools_selected",
+            query=query,
+            selected_count=len(selected),
+            max_tools=max_tools,
+            selected=[tool.get("function", {}).get("name") for tool in selected],
+        )
+        return selected
 
     # ─── LLM Initialization ──────────────────────────────────────────────────
 
@@ -494,7 +585,13 @@ class Brain:
 
         fallback_note = ""
         # ── Try Gemini (Primary) ──
-        if self._can_use_provider("gemini", self.gemini_available):
+        if self.gemini_available and not self._provider_health.is_gemini_available():
+            logger.info(
+                "router_gemini_unavailable",
+                disabled_until=self._provider_health.gemini_disabled_until,
+                target_provider="groq",
+            )
+        elif self._can_use_provider("gemini", self.gemini_available):
             try:
                 _t0 = time.perf_counter()
                 prompt = self._compose_prompt(user_command, long_term_memory, indexed_context, provider="gemini")
@@ -509,6 +606,9 @@ class Brain:
                 rate_limited = self._is_rate_limit_error(e)
                 self._record_provider_failure("gemini", e, rate_limited)
                 rate_msg = str(e)
+                cooldown = self._gemini_cooldown_seconds(e)
+                if cooldown > 0:
+                    self._provider_health.disable_gemini(cooldown)
                 logger.warning("gemini_request_failed", error=rate_msg, exc_info=True)
                 logger.info("llm_fallback", from_provider="gemini", to_provider="groq")
                 # On quota/rate-limit, wait briefly and annotate the next prompt to encourage brevity
@@ -527,7 +627,7 @@ class Brain:
                 prompt = self._compose_prompt(user_command, long_term_memory, indexed_context, provider="groq")
                 if fallback_note:
                     prompt = fallback_note + prompt
-                response_text = await self._process_groq(prompt)
+                response_text = await self._process_groq(prompt, query_hint=user_command)
                 _ms = (time.perf_counter() - _t0) * 1000
                 logger.info("llm_call_completed", provider="groq", duration_ms=_ms)
                 self._record_provider_success("groq")
@@ -537,6 +637,7 @@ class Brain:
             except Exception as e:
                 rate_limited = self._is_rate_limit_error(e)
                 self._record_provider_failure("groq", e, rate_limited)
+                self._provider_health.record_groq_failure()
                 logger.warning("groq_request_failed", error=str(e), exc_info=True)
                 logger.info("llm_fallback", from_provider="groq", to_provider="ollama")
 
@@ -573,7 +674,13 @@ class Brain:
             yield response_text
             return
 
-        if self._can_use_provider("gemini", self.gemini_available):
+        if self.gemini_available and not self._provider_health.is_gemini_available():
+            logger.info(
+                "router_gemini_unavailable",
+                disabled_until=self._provider_health.gemini_disabled_until,
+                target_provider="groq",
+            )
+        elif self._can_use_provider("gemini", self.gemini_available):
             fallback_note = ""
             try:
                 response_text = ""
@@ -592,6 +699,9 @@ class Brain:
             except Exception as e:
                 rate_limited = self._is_rate_limit_error(e)
                 self._record_provider_failure("gemini", e, rate_limited)
+                cooldown = self._gemini_cooldown_seconds(e)
+                if cooldown > 0:
+                    self._provider_health.disable_gemini(cooldown)
                 logger.warning("gemini_stream_failed", error=str(e), exc_info=True)
                 if rate_limited:
                     rate_msg = str(e)
@@ -609,7 +719,7 @@ class Brain:
                 prompt = self._compose_prompt(user_command, long_term_memory, indexed_context, provider="groq")
                 if "fallback_note" in locals() and fallback_note:
                     prompt = fallback_note + prompt
-                async for chunk in self._stream_groq_with_tools(prompt, allow_tools=True):
+                async for chunk in self._stream_groq_with_tools(prompt, query_hint=user_command, allow_tools=True):
                     response_text += chunk
                     yield chunk
                 if response_text:
@@ -622,6 +732,7 @@ class Brain:
             except Exception as e:
                 rate_limited = self._is_rate_limit_error(e)
                 self._record_provider_failure("groq", e, rate_limited)
+                self._provider_health.record_groq_failure()
                 logger.warning("groq_stream_failed", error=str(e), exc_info=True)
 
         if self._can_use_provider("ollama", self.ollama_available):
@@ -758,7 +869,13 @@ class Brain:
         return "I need either a screen capture or a file path to proceed."
 
     async def _process_text_fallback(self, prompt: str) -> str:
-        if self._can_use_provider("gemini", self.gemini_available):
+        if self.gemini_available and not self._provider_health.is_gemini_available():
+            logger.info(
+                "router_gemini_unavailable",
+                disabled_until=self._provider_health.gemini_disabled_until,
+                target_provider="groq",
+            )
+        elif self._can_use_provider("gemini", self.gemini_available):
             try:
                 response_text = await self._process_gemini(prompt)
                 self._record_provider_success("gemini")
@@ -766,6 +883,9 @@ class Brain:
             except Exception as e:
                 rate_limited = self._is_rate_limit_error(e)
                 self._record_provider_failure("gemini", e, rate_limited)
+                cooldown = self._gemini_cooldown_seconds(e)
+                if cooldown > 0:
+                    self._provider_health.disable_gemini(cooldown)
                 logger.warning("text_fallback_gemini_failed", error=str(e), exc_info=True)
 
         if self._can_use_provider("groq", self.groq_available):
@@ -788,6 +908,75 @@ class Brain:
                 logger.warning("text_fallback_ollama_failed", error=str(e), exc_info=True)
 
         return "I cannot access any LLM providers at the moment, sir."
+
+    async def check_provider_status(self) -> tuple[dict[str, str], str]:
+        """Ping providers at startup and return status map and primary provider."""
+        status = {
+            "Gemini": "UNAVAILABLE",
+            "Groq": "UNAVAILABLE",
+            "Ollama": "UNAVAILABLE",
+        }
+
+        if self.gemini_available:
+            try:
+                types = self._genai_types
+                await asyncio.to_thread(
+                    self.gemini_client.models.generate_content,
+                    model=self.gemini_model_name,
+                    contents="ping",
+                    config=types.GenerateContentConfig(max_output_tokens=1),
+                )
+                status["Gemini"] = "OK"
+            except Exception as e:
+                msg = str(e).lower()
+                if "perday" in msg or "limit: 0" in msg:
+                    status["Gemini"] = "QUOTA_EXHAUSTED"
+                    self._provider_health.disable_gemini(
+                        float(self._cfg.providers.gemini_daily_quota_cooldown_hours) * 3600.0
+                    )
+                elif "perminute" in msg or "429" in msg:
+                    status["Gemini"] = "RATE_LIMITED"
+                    self._provider_health.disable_gemini(65.0)
+                else:
+                    status["Gemini"] = "ERROR"
+        elif self._cfg.gemini_api_key:
+            status["Gemini"] = "INIT_FAILED"
+        else:
+            status["Gemini"] = "NO_KEY"
+
+        if self.groq_available:
+            try:
+                await self.groq_client.chat.completions.create(
+                    model=self._cfg.models.fallback_llm,
+                    messages=[{"role": "user", "content": "ping"}],
+                    max_tokens=1,
+                )
+                status["Groq"] = "OK"
+            except Exception:
+                status["Groq"] = "ERROR"
+        elif self._cfg.groq_api_key:
+            status["Groq"] = "INIT_FAILED"
+        else:
+            status["Groq"] = "NO_KEY"
+
+        if self.ollama_available:
+            try:
+                await asyncio.wait_for(asyncio.to_thread(self.ollama.list), timeout=3.0)
+                status["Ollama"] = "REACHABLE"
+            except Exception:
+                status["Ollama"] = "UNREACHABLE"
+        else:
+            status["Ollama"] = "UNAVAILABLE"
+
+        primary = "None"
+        if status["Gemini"] == "OK" and self._provider_health.is_gemini_available():
+            primary = "Gemini"
+        elif status["Groq"] == "OK":
+            primary = "Groq"
+        elif status["Ollama"] == "REACHABLE":
+            primary = "Ollama"
+
+        return status, primary
 
     # ─── Gemini Processing (NEW google-genai SDK) ────────────────────────────
 
@@ -1067,7 +1256,7 @@ class Brain:
 
     # ─── Groq Processing ─────────────────────────────────────────────────────
 
-    async def _process_groq(self, prompt: str) -> str:
+    async def _process_groq(self, prompt: str, query_hint: str = "", allow_tools: bool = True) -> str:
         """
         Process via Groq with manual function calling.
         If the LLM wants to call a tool, we execute it and send the result back.
@@ -1077,20 +1266,27 @@ class Brain:
         base_messages.append({"role": "user", "content": prompt})
 
         llm_start = time.perf_counter()
-        response = await self.groq_client.chat.completions.create(
-            model=self._cfg.models.fallback_llm,
-            messages=base_messages,
-            tools=self.groq_tools if self.groq_tools else None,
-            tool_choice="auto",
-            max_tokens=1024,
-        )
+        selected_tools = self._select_tools_for_provider(query_hint or prompt, "groq") if allow_tools else []
+        try:
+            response = await self.groq_client.chat.completions.create(
+                model=self._cfg.models.fallback_llm,
+                messages=base_messages,
+                tools=selected_tools if selected_tools else None,
+                tool_choice="auto" if selected_tools else "none",
+                max_tokens=1024,
+            )
+        except Exception as e:
+            if allow_tools and "Failed to call a function" in str(e):
+                logger.warning("groq_function_call_failed_retrying_without_tools")
+                return await self._process_groq(prompt, query_hint=query_hint, allow_tools=False)
+            raise
         elapsed_ms = (time.perf_counter() - llm_start) * 1000
 
         msg = response.choices[0].message
         tool_calls = msg.tool_calls
 
         # ── Handle Tool Calls ──
-        if tool_calls:
+        if tool_calls and allow_tools:
             tool_messages = list(base_messages)
             tool_messages.append(
                 {
@@ -1133,10 +1329,16 @@ class Brain:
                 )
 
             followup_start = time.perf_counter()
-            followup = await self.groq_client.chat.completions.create(
-                model=self._cfg.models.fallback_llm,
-                messages=tool_messages,
-            )
+            try:
+                followup = await self.groq_client.chat.completions.create(
+                    model=self._cfg.models.fallback_llm,
+                    messages=tool_messages,
+                )
+            except Exception as e:
+                if "Failed to call a function" in str(e):
+                    logger.warning("groq_followup_function_call_failed_retrying_without_tools")
+                    return await self._process_groq(prompt, query_hint=query_hint, allow_tools=False)
+                raise
             elapsed_ms += (time.perf_counter() - followup_start) * 1000
             metrics.record_latency("llm_groq_ms", elapsed_ms)
 
@@ -1152,19 +1354,28 @@ class Brain:
 
         return "Command executed, sir."
 
-    async def _stream_groq_with_tools(self, prompt: str, allow_tools: bool = True):
+    async def _stream_groq_with_tools(self, prompt: str, query_hint: str = "", allow_tools: bool = True):
         base_messages = [{"role": "system", "content": self.system_instruction}]
         base_messages += self._build_shared_messages()
         base_messages.append({"role": "user", "content": prompt})
 
         llm_start = time.perf_counter()
-        stream = await self.groq_client.chat.completions.create(
-            model=self._cfg.models.fallback_llm,
-            messages=base_messages,
-            tools=self.groq_tools if allow_tools and self.groq_tools else None,
-            tool_choice="auto" if allow_tools else "none",
-            stream=True,
-        )
+        selected_tools = self._select_tools_for_provider(query_hint or prompt, "groq") if allow_tools else []
+        try:
+            stream = await self.groq_client.chat.completions.create(
+                model=self._cfg.models.fallback_llm,
+                messages=base_messages,
+                tools=selected_tools if selected_tools else None,
+                tool_choice="auto" if selected_tools else "none",
+                stream=True,
+            )
+        except Exception as e:
+            if allow_tools and "Failed to call a function" in str(e):
+                logger.warning("groq_stream_function_call_failed_retrying_without_tools")
+                async for chunk in self._stream_groq_with_tools(prompt, query_hint=query_hint, allow_tools=False):
+                    yield chunk
+                return
+            raise
 
         assistant_text = ""
         tool_buffers: dict[int, dict] = {}
@@ -1234,11 +1445,19 @@ class Brain:
                     }
                 )
 
-            followup = await self.groq_client.chat.completions.create(
-                model=self._cfg.models.fallback_llm,
-                messages=tool_messages,
-                stream=True,
-            )
+            try:
+                followup = await self.groq_client.chat.completions.create(
+                    model=self._cfg.models.fallback_llm,
+                    messages=tool_messages,
+                    stream=True,
+                )
+            except Exception as e:
+                if "Failed to call a function" in str(e):
+                    logger.warning("groq_stream_followup_failed_retrying_without_tools")
+                    async for chunk in self._stream_groq_with_tools(prompt, query_hint=query_hint, allow_tools=False):
+                        yield chunk
+                    return
+                raise
 
             async for follow_chunk in followup:
                 choice = follow_chunk.choices[0]
@@ -1264,11 +1483,18 @@ class Brain:
         ]
 
         llm_start = time.perf_counter()
-        response = await asyncio.to_thread(
-            self.ollama.chat,
-            model=self._cfg.models.local_llm,
-            messages=messages,
-        )
+        try:
+            response = await asyncio.wait_for(
+                asyncio.to_thread(
+                    self.ollama.chat,
+                    model=self._cfg.models.local_llm,
+                    messages=messages,
+                ),
+                timeout=float(self._cfg.providers.ollama_timeout_seconds),
+            )
+        except asyncio.TimeoutError:
+            logger.warning("ollama_timeout", timeout_seconds=float(self._cfg.providers.ollama_timeout_seconds))
+            return "I'm having trouble reaching my local model right now."
         metrics.record_latency("llm_ollama_ms", (time.perf_counter() - llm_start) * 1000)
 
         return response["message"]["content"]

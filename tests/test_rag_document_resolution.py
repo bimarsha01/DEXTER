@@ -47,6 +47,48 @@ def test_answer_document_question_resolves_partial_project_name(monkeypatch):
             pass
 
 
+def test_answer_document_question_blends_multiple_candidates_for_summary(monkeypatch):
+    first_file = _TMP_BASE / f"UserAuth-Overview-{uuid.uuid4().hex}.md"
+    second_file = _TMP_BASE / f"UserAuth-Sessions-{uuid.uuid4().hex}.md"
+    try:
+        first_file.write_text("UserAuth overview: authentication, roles, and access control.", encoding="utf-8")
+        second_file.write_text("Sessions are managed with JWT tokens and refresh logic.", encoding="utf-8")
+
+        class FakeIndex:
+            def search(self, query, limit=5):
+                assert query == "UserAuth"
+                return [
+                    {
+                        "path": str(first_file),
+                        "title": first_file.name,
+                        "text": first_file.read_text(encoding="utf-8"),
+                        "score": 93.0,
+                    },
+                    {
+                        "path": str(second_file),
+                        "title": second_file.name,
+                        "text": second_file.read_text(encoding="utf-8"),
+                        "score": 91.0,
+                    },
+                ]
+
+        monkeypatch.setattr(document_tools, "_get_rag_index", lambda: FakeIndex())
+
+        result = document_tools.answer_document_question("UserAuth", "Give me a summary of the project")
+
+        assert "Summary from the most relevant files:" in result
+        assert first_file.name in result
+        assert second_file.name in result
+        assert "authentication" in result.lower()
+        assert "JWT" in result
+    finally:
+        for file_path in (first_file, second_file):
+            try:
+                file_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+
 def test_truncate_rag_for_provider_groq_keeps_single_best_result():
     from core.brain.llm_router import Brain
 

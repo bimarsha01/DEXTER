@@ -269,6 +269,47 @@ def _resolve_best_document(query: str) -> tuple[str | None, float]:
     return (None, 0.0)
 
 
+def _looks_like_summary_request(question: str) -> bool:
+    text = (question or "").lower()
+    return any(
+        phrase in text
+        for phrase in (
+            "summary",
+            "summarize",
+            "summarise",
+            "what does it do",
+            "what does this do",
+            "tell me about",
+            "how does it work",
+            "how is it managed",
+            "give me an overview",
+        )
+    )
+
+
+def _build_multi_file_summary(candidates: list[dict], question: str) -> str:
+    parts: list[str] = []
+    for idx, candidate in enumerate(candidates[:3], start=1):
+        path = str(candidate.get("path") or "")
+        title = str(candidate.get("title") or os.path.basename(path) or f"file {idx}")
+        text = str(candidate.get("text") or "").strip()
+        if not text and path:
+            text = _read_file_as_text(path)
+        if not text:
+            continue
+
+        ext = Path(path).suffix.lower() if path else ""
+        excerpt = _extract_relevant_section(text, question, ext)
+        if not excerpt:
+            excerpt = " ".join(text.split())[:1200]
+        parts.append(f"[{idx}] {title}\n{excerpt}")
+
+    if not parts:
+        return ""
+
+    return "Summary from the most relevant files:\n\n" + "\n\n".join(parts)
+
+
 def read_document(path: str, max_chars: int = 12000) -> str:
     """Read a document using the universal file reader and return up to `max_chars`."""
     if not path:
@@ -339,6 +380,17 @@ def answer_document_question(path: str, question: str) -> str:
             return f"I'm not confident which file you mean. Top candidates: {', '.join(names)}. Please confirm which file to read."
         except Exception:
             return "I'm not confident which file you mean. Could you provide the file path or more details?"
+
+    if _looks_like_summary_request(question) and confidence < 0.95:
+        try:
+            rag = _get_rag_index()
+            candidates = rag.search(path, limit=3) if rag is not None else []
+            if len(candidates) > 1:
+                blended = _build_multi_file_summary(candidates, question)
+                if blended:
+                    return blended
+        except Exception:
+            logger.debug("project_summary_blend_failed", path=path, question=question, exc_info=True)
 
     prefix = ""
     if 0.5 <= confidence < 0.7:

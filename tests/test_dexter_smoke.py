@@ -255,6 +255,11 @@ class AsyncPipelineBlockingTests(unittest.IsolatedAsyncioTestCase):
         result = corrector.correct("Open YouTube in Google Chrome.")
         self.assertEqual(result.corrected, "Open YouTube in Google Chrome.")
 
+    def test_transcript_corrector_does_not_rewrite_projects_to_system_process(self):
+        corrector = TranscriptCorrector()
+        result = corrector.correct("Open the office reporting system.")
+        self.assertEqual(result.corrected, "Open the office reporting system.")
+
     @mock.patch("tools.pc_controls._resolve_command", return_value=r"C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe")
     @mock.patch("tools.pc_controls.subprocess.Popen")
     @mock.patch("tools.pc_controls.os.path.exists", return_value=True)

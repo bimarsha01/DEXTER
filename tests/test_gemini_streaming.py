@@ -197,7 +197,7 @@ class GeminiStreamingToolCallTests(unittest.IsolatedAsyncioTestCase):
 
         captured: dict[str, str] = {}
 
-        async def fake_stream_groq_with_tools(self, prompt: str, allow_tools: bool = True):
+        async def fake_stream_groq_with_tools(self, prompt: str, query_hint: str = "", allow_tools: bool = True):
             captured["prompt"] = prompt
             yield "OK"
 

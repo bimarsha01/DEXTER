@@ -12,6 +12,29 @@ from tools.pc_controls import APP_MAP
 logger = get_logger("transcript_correction")
 
 
+WAKE_WORD_ALIASES = {
+    "next up": "dexter",
+    "next star": "dexter",
+    "nectar": "dexter",
+    "decker": "dexter",
+    "next, ": "dexter, ",
+    "next up,": "dexter,",
+    "next star,": "dexter,",
+}
+
+
+def apply_wake_word_aliases(text: str) -> str:
+    """Normalize common wake-word ASR aliases before activation checks."""
+    if not text:
+        return text
+
+    corrected = text
+    for alias, canonical in WAKE_WORD_ALIASES.items():
+        pattern = re.compile(rf"\b{re.escape(alias)}\b", re.IGNORECASE)
+        corrected = pattern.sub(canonical, corrected)
+    return corrected
+
+
 @dataclass
 class CorrectionResult:
     original: str
@@ -96,6 +119,10 @@ class TranscriptCorrector:
                 match = self._index.match_one(phrase, score_cutoff=self._score_threshold)
                 if not match:
                     continue
+                if match.candidate.source == "process":
+                    candidate_name = match.candidate.name.lower().strip()
+                    if candidate_name not in self._app_names and " " not in candidate_name:
+                        continue
 
                 corrected = self._replace_span(text, matches, start, end, match.candidate.name)
                 if corrected != text:

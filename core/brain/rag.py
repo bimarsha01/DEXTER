@@ -19,6 +19,7 @@ from rapidfuzz import fuzz
 
 from utils.logger import get_logger
 from utils.config import get_config
+from core.session_activity import session_activity
 
 logger = get_logger("personal_rag")
 
@@ -202,6 +203,7 @@ class PersonalRAGIndex:
         self._poller: Optional[threading.Thread] = None
         self._stop_poll = threading.Event()
         self._cache = _LRUCache(maxsize=200)
+        self._next_poll_delay_seconds = self._refresh_seconds
 
         logger.info(
             "personal_rag_initialized",
@@ -240,7 +242,7 @@ class PersonalRAGIndex:
             except Exception as e:
                 logger.warning("rag_poller_error", user=self.user_id, error=str(e), exc_info=True)
                 self._report_health("degraded", str(e))
-            self._stop_poll.wait(self._refresh_seconds)
+            self._stop_poll.wait(self._next_poll_delay_seconds)
 
     def _report_health(self, status: str, details: str = "") -> None:
         hm = self._health_monitor
@@ -299,6 +301,20 @@ class PersonalRAGIndex:
     # ── Indexing ────────────────────────────────────────────────────
     def refresh_incremental(self) -> None:
         """Walk roots, detect changed/removed files, update the index with progress tracking."""
+        cfg = get_config()
+        if bool(getattr(cfg.rag, "refresh_only_when_idle", True)):
+            idle_threshold = float(getattr(cfg.rag, "refresh_idle_threshold_seconds", 30.0))
+            if not session_activity.is_session_idle(idle_threshold):
+                self._next_poll_delay_seconds = 60.0
+                logger.info(
+                    "rag_refresh_deferred",
+                    user=self.user_id,
+                    reason="session_active",
+                    retry_seconds=60,
+                )
+                return
+
+        self._next_poll_delay_seconds = self._refresh_seconds
         with self._index_lock:
             t0 = time.perf_counter()
             files = []
@@ -423,6 +439,19 @@ class PersonalRAGIndex:
     def _upsert_chunks(self, chunks: List[RagChunk]) -> None:
         if not chunks:
             return
+        cfg = get_config()
+        if bool(getattr(cfg.rag, "refresh_only_when_idle", True)):
+            idle_threshold = float(getattr(cfg.rag, "refresh_idle_threshold_seconds", 30.0))
+            if not session_activity.is_session_idle(idle_threshold):
+                self._next_poll_delay_seconds = 60.0
+                logger.info(
+                    "rag_embedding_deferred",
+                    user=self.user_id,
+                    reason="session_active",
+                    retry_seconds=60,
+                )
+                return
+
         bs = self._batch_size
         total_batches = (len(chunks) + bs - 1) // bs
         logger.info("rag_upsert_start", user=self.user_id, total_chunks=len(chunks), batches=total_batches)
