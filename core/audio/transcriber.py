@@ -2,6 +2,8 @@ import os
 import threading
 from faster_whisper import WhisperModel
 from utils.logger import get_logger
+from utils.vocabulary import build_whisper_vocabulary
+from utils.config import get_config
 
 logger = get_logger("transcriber")
 
@@ -14,6 +16,8 @@ DEFAULT_INITIAL_PROMPT = (
     "Spotify, Discord, Notepad, Calculator, Settings, File Explorer, PowerShell, Command Prompt, "
     "Windows Terminal, Explorer, Outlook, Word, Excel, PowerPoint."
 )
+
+DEFAULT_WAKE_PROMPT = "Dexter,"
 
 
 class DexterTranscriber:
@@ -44,7 +48,20 @@ class DexterTranscriber:
         self.log_prob_threshold = float(log_prob_threshold)
         self.no_speech_threshold = float(no_speech_threshold)
         self.condition_on_previous_text = bool(condition_on_previous_text)
-        self.initial_prompt = (initial_prompt or DEFAULT_INITIAL_PROMPT).strip()
+        # Build a dynamic initial prompt from the user's workspace where possible.
+        if initial_prompt and initial_prompt.strip():
+            self.initial_prompt = initial_prompt.strip()
+        else:
+            try:
+                cfg = get_config()
+                vocab_prompt = build_whisper_vocabulary(cfg)
+                # Fall back to configured STT initial prompt or default
+                if vocab_prompt and len(vocab_prompt.strip()) > 10:
+                    self.initial_prompt = vocab_prompt.strip()
+                else:
+                    self.initial_prompt = getattr(cfg.stt, "initial_prompt", DEFAULT_INITIAL_PROMPT).strip()
+            except Exception:
+                self.initial_prompt = DEFAULT_INITIAL_PROMPT
         self.model_size = model_size
         self._model: WhisperModel | None = None
         self._model_lock = threading.Lock()
@@ -89,9 +106,9 @@ class DexterTranscriber:
         prompt = (self.initial_prompt or "").strip()
         if prompt:
             if not prompt.lower().startswith("dexter"):
-                prompt = f"Dexter, {prompt}"
+                prompt = f"{DEFAULT_WAKE_PROMPT} {prompt}"
         else:
-            prompt = "Dexter,"
+            prompt = DEFAULT_WAKE_PROMPT
         segments, info = model.transcribe(
             audio_file,
             beam_size=self.beam_size,

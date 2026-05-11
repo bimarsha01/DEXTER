@@ -692,24 +692,38 @@ class PersonalRAGIndex:
                     "parent_folder": meta.get("parent_folder", ""),
                 })
             # Log raw results
-            logger.debug('[RAG] query="%s" raw=%d', query, len(payload))
+            logger.debug("rag_query_raw_results", query=query, raw_count=len(payload))
 
             # Capture pre-boost top5 for debug
             pre_boost_top5 = sorted(payload, key=lambda p: p.get("score", 0.0), reverse=True)[:5]
-            logger.debug('[RAG] pre_boost top5: %s', [{p.get('title') or p.get('path'): p.get('score')} for p in pre_boost_top5])
+            logger.debug(
+                "rag_pre_boost_top5",
+                query=query,
+                top5=[{p.get("title") or p.get("path"): p.get("score")} for p in pre_boost_top5],
+            )
 
             # Apply filename/parent boosting (safe: skip if metadata missing)
             payload = self._boost_filename_matches(payload, query)
             payload.sort(key=lambda p: p.get("score", 0.0), reverse=True)
 
             post_boost_top5 = payload[:5]
-            logger.debug('[RAG] post_boost top5: %s', [{p.get('title') or p.get('path'): p.get('score')} for p in post_boost_top5])
+            logger.debug(
+                "rag_post_boost_top5",
+                query=query,
+                top5=[{p.get("title") or p.get("path"): p.get("score")} for p in post_boost_top5],
+            )
 
             # Apply configurable minimum relevance filter
             cfg = get_config()
             min_score = float(getattr(cfg.rag, 'minimum_relevance_score', MINIMUM_RELEVANCE_SCORE))
             filtered_payload = [p for p in payload if p.get("score", 0.0) >= min_score]
-            logger.debug('[RAG] accepted (%d, threshold=%s): %s', len(filtered_payload), min_score, [{p.get('title') or p.get('path'): p.get('score')} for p in filtered_payload[:5]])
+            logger.debug(
+                "rag_accepted_results",
+                query=query,
+                accepted_count=len(filtered_payload),
+                threshold=min_score,
+                top5=[{p.get("title") or p.get("path"): p.get("score")} for p in filtered_payload[:5]],
+            )
 
             max_results = int(getattr(get_config().rag, 'max_results', limit))
             payload = filtered_payload[:max_results]

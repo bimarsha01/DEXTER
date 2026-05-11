@@ -1,0 +1,18 @@
+COMMAND: Dexter what is the logic in index.php in lab 20 of web practical Bimarsha
+CONTEXT_PRESENT: True
+CONTEXT_PREVIEW: PERSONAL FILE CONTEXT (answer naturally as if you read these files yourself; cite by number when relevant): |  | [1] __init__.py  (core) | # Dexter Core Package |  | [2] __init__.py  (core) | # Dexter Core Package |  | [3] __init__.py  (brain) | # Dexter Brain (LLM Router + Memory) |  | [4] rag_full_request.py  (tools) | , ) parser.add_argume
+LOG_EVENTS:
+  INFO Dexter.pipeline: rag_context_injected | {"query": "Dexter what is the logic in index.php in lab 20 of web practical Bimarsha", "search_query": "Dexter what is the logic in index.php in lab 20 of web practical Bimarsha", "results_count": 5, "top_score": 82.91245525219716, "sources": ["__init__.py", "__init__.py", "__init__.py", "rag_full_request.py", "rag_full_request.py"]}
+---
+COMMAND: Dexter summarize the web practical Bimarsha folder
+CONTEXT_PRESENT: True
+CONTEXT_PREVIEW: PERSONAL FILE CONTEXT (answer naturally as if you read these files yourself; cite by number when relevant): |  | [1] __init__.py  (core) | # Dexter Core Package |  | [2] __init__.py  (tools) | # Dexter Tool Registry |  | [3] __init__.py  (audio) | # Dexter Audio Pipeline |  | [4] __init__.py  (core) | # Dexter Core Package |  | [5] __init__.py  (
+LOG_EVENTS:
+  INFO Dexter.pipeline: rag_context_injected | {"query": "Dexter summarize the web practical Bimarsha folder", "search_query": "Dexter summarize the web practical Bimarsha folder", "results_count": 5, "top_score": 84.1249533565132, "sources": ["__init__.py", "__init__.py", "__init__.py", "__init__.py", "__init__.py"]}
+---
+COMMAND: Dexter what have I done in UserAuth
+CONTEXT_PRESENT: True
+CONTEXT_PREVIEW: [Direct File Read: HELP.md (C:\Users\LOQ\Documents\UserAuth\UserAuth)] | # Getting Started |  | ### Reference Documentation |  | For further reference, please consider the following sections: |  | * [Official Apache Maven documentation](https://maven.apache.org/guides/index.html) | * [Spring Boot Maven Plugin Reference Guide](https://
+LOG_EVENTS:
+  INFO Dexter.pipeline: file_read_injected | {"query": "userauth", "matched_path": "C:\\Users\\LOQ\\Documents\\UserAuth\\UserAuth\\HELP.md", "match_score": 100.0}
+---

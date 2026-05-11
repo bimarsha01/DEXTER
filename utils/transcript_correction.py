@@ -87,6 +87,22 @@ class TranscriptCorrector:
             "via",
             "into",
         }
+        self._protected_terms = {
+            "project",
+            "folder",
+            "system",
+            "application",
+            "directory",
+            "file",
+            "report",
+            "module",
+            "service",
+            "database",
+            "auth",
+            "reporting",
+            "manager",
+            "controller",
+        }
 
     def correct(self, text: str) -> CorrectionResult:
         if not text or not text.strip():
@@ -124,15 +140,12 @@ class TranscriptCorrector:
                     if candidate_name not in self._app_names and " " not in candidate_name:
                         continue
 
+                if not self._should_apply_replacement(phrase, match.candidate.name):
+                    continue
+
                 corrected = self._replace_span(text, matches, start, end, match.candidate.name)
                 if corrected != text:
-                    logger.info(
-                        "transcript_corrected",
-                        original=text,
-                        corrected=corrected,
-                        matched=match.candidate.name,
-                        score=match.score,
-                    )
+                    logger.info("transcript_corrected", original=text, corrected=corrected, score=match.score)
                     return CorrectionResult(
                         original=text,
                         corrected=corrected,
@@ -170,18 +183,53 @@ class TranscriptCorrector:
         if score < self._score_threshold:
             return None
 
+        if not self._should_apply_replacement(tail, app_name):
+            return None
+
         corrected = self._replace_span(text, matches, 1, len(matches), app_name)
         if corrected == text:
             return None
 
-        logger.info(
-            "transcript_corrected_app_name",
-            original=text,
-            corrected=corrected,
-            matched=app_name,
-            score=score,
-        )
+        logger.info("transcript_corrected", original=text, corrected=corrected, score=score)
         return CorrectionResult(original=text, corrected=corrected, matched_name=app_name, score=score)
+
+    def _should_apply_replacement(self, original_phrase: str, replacement: str) -> bool:
+        original = (original_phrase or "").strip()
+        candidate = (replacement or "").strip()
+        if not original or not candidate:
+            return False
+
+        original_words = [token for token in re.findall(r"[A-Za-z0-9']+", original.lower()) if token]
+        if any(token in self._protected_terms for token in original_words):
+            logger.debug(
+                "transcript_correction_rejected",
+                reason="protected_term_present",
+                original=original_phrase,
+                candidate=replacement,
+            )
+            return False
+
+        ratio = len(candidate) / max(1, len(original))
+        if ratio < 0.6:
+            logger.debug(
+                "transcript_correction_rejected",
+                reason="length_ratio_too_low",
+                original=original_phrase,
+                candidate=replacement,
+            )
+            return False
+
+        replacement_words = re.findall(r"[A-Za-z0-9']+", candidate)
+        if len(original_words) >= 3 and len(replacement_words) == 1:
+            logger.debug(
+                "transcript_correction_rejected",
+                reason="multiword_to_single_word",
+                original=original_phrase,
+                candidate=replacement,
+            )
+            return False
+
+        return True
 
     def _replace_span(
         self,

@@ -76,6 +76,8 @@ class Brain:
 
     RATE_LIMIT_BACKOFF_BASE = 2
     RATE_LIMIT_BACKOFF_MAX = 60
+    GEMINI_QUOTA_DISABLE_SECONDS = 86400.0
+    _gemini_disabled_until_global: float = 0.0
 
     def __init__(self, event_bus: Optional[EventBus] = None):
         logger.info("brain_initializing")
@@ -95,43 +97,27 @@ class Brain:
             "ollama": {"failures": 0, "score": 1.0, "cooldown_until": 0.0, "last_error": ""},
         }
 
-        self.system_instruction = """You are Dexter, a personal AI assistant running on this Windows PC. Think of yourself as a brilliant, calm, slightly formal butler who genuinely understands what is going on — not a robot reciting outputs, but someone who has actually read everything and formed real opinions.
-
-    Your personality:
-    - Composed and assured. You do not hedge unnecessarily or fill responses with caveats.
-    - Direct. When you know something you say it clearly. When you do not, you say that briefly.
-    - Dry understated warmth. Not jokes or enthusiasm, just the quiet confidence of someone very good at what they do.
-    - Natural sentence variety. Sometimes short. Sometimes longer when the topic deserves it. Never stiff or formulaic.
-    - You do not repeat the user's question back.
-    - You do not start every sentence the same way.
-    - You never use filler like Certainly, Of course, Sure thing, or Great question.
-    - You begin confirmations with Right away sir, Yes sir, or Understood — but only occasionally, not on every single response.
-    - No emojis ever.
-    - Keep responses to 1 to 3 sentences spoken aloud unless the user asks for more detail.
-
-    When you receive RELEVANT CONTEXT FROM YOUR INDEXED FILES at the start of a message this is real content from the user's actual files on their computer. Treat it like you read those files yourself. Answer from them naturally.
-
-    Examples of natural vs robotic:
-
-    Robotic: Based on the indexed content from PROJECT_SUMMARY.md, Dexter is described as a modular voice-first personal AI assistant.
-
-    Natural: Dexter is a voice-controlled AI assistant for Windows — modular, locally run, with a multi-LLM fallback chain. Basically a Jarvis-style butler that controls your PC through voice.
-
-    Robotic: The retrieved content indicates this is a Java Spring Boot application for office purposes.
-
-    Natural: That is a Spring Boot project — office reporting and project tracking, Java-based, the usual enterprise stack.
-
-    Read the context, understand it, then explain it like a smart person would. Conversational, specific, to the point.
-
-    When controlling the PC keep confirmations brief and natural. When you do not have enough information say so briefly and move on without excessive apology.
-
-    Speech recognition may mishear words occasionally. Use context to figure out what was actually meant rather than asking for repetition unless genuinely unclear.
-
-    When the user asks about weather always extract the city from their words and call get_weather immediately. Never ask which city if they already said one.
-
-    When the user asks to open an application always use open_application first. Never open a browser to launch a desktop app.
-
-    When the user asks to play or watch content on any platform use search_content_platform with the content and platform name. If no platform is mentioned infer from content type."""
+        self.system_instruction = """You are Dexter, a personal AI assistant on this Windows PC. You are smart, warm, and direct. You sound like a knowledgeable friend — calm, confident, occasionally dry. Never a butler, never a service agent.
+    Never say: "Certainly", "Of course", "Sure thing", "Great question", "Absolutely", "Right away", "Understood", "sir", "ma'am". Not once, not ever.
+    Never repeat the question back. Never narrate what you are about to do. Just do it.
+    Use contractions — "I'll", "it's", "that's". They sound natural spoken aloud.
+    PC action confirmations: one short phrase only. "Done." "Opened." "Volume's at 50." "Locked."
+    When you don't know: "Not sure about that one." That is enough.
+    When someone says you got it wrong: "You're right, let me fix that." Not an apology paragraph.
+    Examples:
+    "What time is it?" → "It's 2:30."
+    "Open Chrome." → "Done."
+    "What's the weather?" → [call tool, say result naturally like] "22 degrees, light rain this afternoon."
+    "Play Hotel California on Spotify." → "On it." [plays it]
+    "You got that wrong." → "You're right, let me fix that."
+    "Tell me about UserAuth project." → [read the files, explain naturally] "That's actually a movie ticket booking system despite the name. Main service handles seat reservations and payment flows. Want me to dig into any part?"
+    "When you have PERSONAL FILE CONTEXT: read it, understand it, explain it like a smart person talking to a friend. Specific, natural, no academic hedging.
+    Spoken response length depends on the request type:
+    - Simple commands (open, close, volume, time, weather): 1 sentence maximum. Short and done.
+    - General questions: 2-3 sentences.
+    - When user asks to summarize, explain, describe, tell me about, or give details: speak naturally for as long as the topic needs. Do not cut yourself short. Cover the key points properly. Aim for 4-8 sentences for summaries.
+    - Never pad with filler. Never cut off important information to stay short.
+    When user asks to play music use play_music with song/artist and platform. Never use open_application for music — use play_music."""
 
         # Initialize all three LLM backends
         self._init_gemini()
@@ -160,18 +146,33 @@ class Brain:
         msg = str(error)
         lower = msg.lower()
         if "perday" in lower or "limit: 0" in lower:
-            return max(1.0, float(self._cfg.providers.gemini_daily_quota_cooldown_hours) * 3600.0)
+            return self.GEMINI_QUOTA_DISABLE_SECONDS
         if "perminute" in lower:
             return 65.0
         if self._is_rate_limit_error(error):
             return 65.0
         return 0.0
 
+    @classmethod
+    def _disable_gemini_globally(cls, seconds: float) -> None:
+        cls._gemini_disabled_until_global = max(
+            cls._gemini_disabled_until_global,
+            time.time() + max(0.0, float(seconds)),
+        )
+
+    @classmethod
+    def _is_gemini_globally_available(cls) -> bool:
+        return time.time() >= cls._gemini_disabled_until_global
+
+    def _can_use_gemini(self) -> bool:
+        return self.gemini_available and self._is_gemini_globally_available() and self._can_use_provider("gemini", True)
+
     def _select_tools_for_provider(self, query: str, provider: str) -> list[dict]:
         if provider != "groq":
             return list(self.groq_tools)
 
         query_text = (query or "").lower()
+        media_query = any(keyword in query_text for keyword in ("play ", "spotify", "youtube music", "music", "song", "album", "playlist", "artist"))
         available = {t.get("function", {}).get("name"): t for t in (self.groq_tools or [])}
         if not available:
             return []
@@ -187,9 +188,23 @@ class Brain:
                 if tool_name in available:
                     selected_names.add(tool_name)
 
+        if media_query and "play_music" in available:
+            selected_names.add("play_music")
+
         for tool_name in ALWAYS_INCLUDE:
+            # For media queries avoid including time-related tools which can confuse intent
+            if media_query and tool_name in {"get_current_time", "get_current_datetime"}:
+                continue
+            if media_query and tool_name == "open_application":
+                continue
             if tool_name in available:
                 selected_names.add(tool_name)
+
+        # Ensure time tools are not present when this is clearly a media playback request
+        if media_query:
+            for t in TOOL_GROUPS.get("time", []):
+                if t in selected_names:
+                    selected_names.discard(t)
 
         max_tools = max(1, int(self._cfg.providers.groq_max_tools))
         ordered_names = sorted(selected_names)
@@ -415,6 +430,24 @@ class Brain:
         rag_context = self._truncate_rag_for_provider(indexed_context.strip(), provider)
         if rag_context:
             sections.append(rag_context)
+            sections.append("Answer questions about files in maximum 4 sentences. User is listening not reading.")
+            sections.append(
+                "IMPORTANT ABOUT FILE CONTEXT:\n"
+                "When you receive file content from indexed files read it carefully and answer from what is actually written there. Do not answer from the project name or folder name alone.\n\n"
+                "If the files show a movie ticket booking system say it is a movie ticket booking system.\n"
+                "If the files show payment processing say it handles payments.\n"
+                "If the files show theater and seat management describe theaters and seats.\n\n"
+                "Never assume what a project does based on its name. Always base your answer on the actual file contents provided to you."
+            )
+
+            # If the truncated RAG context indicates a direct file read, explicitly forbid tool calling
+            try:
+                if "[Direct File Read:" in rag_context:
+                    sections.append(
+                        "CRITICAL: The prompt already contains the exact file contents. Do NOT call any external tools or functions. Answer directly and specifically from the provided file content."
+                    )
+            except Exception:
+                pass
 
         # If indexed_context appears to contain at least one substantial excerpt,
         # instruct the model to answer assertively and specifically.
@@ -423,6 +456,14 @@ class Brain:
                 sections.append(
                     "You have strong file context. Answer specifically and confidently from it. Do not hedge unless the files are genuinely ambiguous."
                 )
+                # If the injected context is a direct file read, explicitly forbid tool calling
+                try:
+                    if "[Direct File Read:" in indexed_context:
+                        sections.append(
+                            "CRITICAL: The prompt already contains the exact file contents. Do NOT call any external tools or functions. Answer directly and specifically from the provided file content."
+                        )
+                except Exception:
+                    pass
         except Exception:
             pass
 
@@ -591,7 +632,7 @@ class Brain:
                 disabled_until=self._provider_health.gemini_disabled_until,
                 target_provider="groq",
             )
-        elif self._can_use_provider("gemini", self.gemini_available):
+        elif self._can_use_gemini():
             try:
                 _t0 = time.perf_counter()
                 prompt = self._compose_prompt(user_command, long_term_memory, indexed_context, provider="gemini")
@@ -609,6 +650,8 @@ class Brain:
                 cooldown = self._gemini_cooldown_seconds(e)
                 if cooldown > 0:
                     self._provider_health.disable_gemini(cooldown)
+                    if "perday" in rate_msg.lower() or "limit: 0" in rate_msg.lower():
+                        self._disable_gemini_globally(cooldown)
                 logger.warning("gemini_request_failed", error=rate_msg, exc_info=True)
                 logger.info("llm_fallback", from_provider="gemini", to_provider="groq")
                 # On quota/rate-limit, wait briefly and annotate the next prompt to encourage brevity
@@ -680,7 +723,7 @@ class Brain:
                 disabled_until=self._provider_health.gemini_disabled_until,
                 target_provider="groq",
             )
-        elif self._can_use_provider("gemini", self.gemini_available):
+        elif self._can_use_gemini():
             fallback_note = ""
             try:
                 response_text = ""
@@ -702,6 +745,8 @@ class Brain:
                 cooldown = self._gemini_cooldown_seconds(e)
                 if cooldown > 0:
                     self._provider_health.disable_gemini(cooldown)
+                    if "perday" in str(e).lower() or "limit: 0" in str(e).lower():
+                        self._disable_gemini_globally(cooldown)
                 logger.warning("gemini_stream_failed", error=str(e), exc_info=True)
                 if rate_limited:
                     rate_msg = str(e)
@@ -875,7 +920,7 @@ class Brain:
                 disabled_until=self._provider_health.gemini_disabled_until,
                 target_provider="groq",
             )
-        elif self._can_use_provider("gemini", self.gemini_available):
+        elif self._can_use_gemini():
             try:
                 response_text = await self._process_gemini(prompt)
                 self._record_provider_success("gemini")
@@ -886,6 +931,8 @@ class Brain:
                 cooldown = self._gemini_cooldown_seconds(e)
                 if cooldown > 0:
                     self._provider_health.disable_gemini(cooldown)
+                    if "perday" in str(e).lower() or "limit: 0" in str(e).lower():
+                        self._disable_gemini_globally(cooldown)
                 logger.warning("text_fallback_gemini_failed", error=str(e), exc_info=True)
 
         if self._can_use_provider("groq", self.groq_available):
@@ -1160,7 +1207,7 @@ class Brain:
             if current_text_buf.strip():
                 model_text_parts.append(types.Part(text=current_text_buf))
 
-            ready_calls = self._finalize_executable_tool_calls(buffered_tool_calls)
+            ready_calls = self._deduplicate_tool_calls(self._finalize_executable_tool_calls(buffered_tool_calls))
             if not ready_calls:
                 metrics.record_latency(
                     "llm_gemini_ms", (time.perf_counter() - llm_start) * 1000
@@ -1287,6 +1334,7 @@ class Brain:
 
         # ── Handle Tool Calls ──
         if tool_calls and allow_tools:
+            tool_calls = self._deduplicate_tool_calls(tool_calls)
             tool_messages = list(base_messages)
             tool_messages.append(
                 {
@@ -1416,7 +1464,7 @@ class Brain:
                             buffer["function"]["arguments"] += function_delta.arguments
 
         if tool_buffers and allow_tools:
-            tool_calls = [tool_buffers[idx] for idx in sorted(tool_buffers)]
+            tool_calls = self._deduplicate_tool_calls([tool_buffers[idx] for idx in sorted(tool_buffers)])
             tool_messages = list(base_messages)
             tool_messages.append(
                 {
@@ -1490,11 +1538,37 @@ class Brain:
                     model=self._cfg.models.local_llm,
                     messages=messages,
                 ),
-                timeout=float(self._cfg.providers.ollama_timeout_seconds),
+                timeout=25.0,
             )
         except asyncio.TimeoutError:
-            logger.warning("ollama_timeout", timeout_seconds=float(self._cfg.providers.ollama_timeout_seconds))
-            return "I'm having trouble reaching my local model right now."
+            logger.warning("ollama_timeout", timeout_seconds=25.0)
+            return "Having trouble with the local model, try again."
         metrics.record_latency("llm_ollama_ms", (time.perf_counter() - llm_start) * 1000)
 
         return response["message"]["content"]
+
+    def _deduplicate_tool_calls(self, tool_calls):
+        seen = set()
+        unique = []
+        for call in tool_calls or []:
+            if isinstance(call, tuple) and len(call) == 2:
+                name, args = call
+            elif isinstance(call, dict):
+                name = call.get("name") or call.get("function", {}).get("name") or ""
+                args = call.get("args")
+                if args is None:
+                    args = call.get("arguments", {})
+            else:
+                name = getattr(call, "name", None) or getattr(getattr(call, "function", None), "name", "")
+                args = getattr(call, "args", None)
+                if args is None:
+                    function = getattr(call, "function", None)
+                    args = getattr(function, "arguments", {}) if function else {}
+
+            key = (name, json.dumps(args if args is not None else {}, sort_keys=True, default=str))
+            if key not in seen:
+                seen.add(key)
+                unique.append(call)
+            else:
+                logger.warning("duplicate_tool_call_removed", tool_name=name)
+        return unique

@@ -54,6 +54,28 @@ class TTSManager:
     def stop(self) -> None:
         self.cancel()
 
+    def should_flush_sentence_buffer(self, buffer: str, new_sentence: str) -> bool:
+        """
+        Decide when to generate audio from the accumulated sentence buffer.
+        Flush when we have enough content to sound natural, not after every sentence.
+        """
+        combined = (buffer or "").strip()
+        if combined:
+            combined = combined + " " + (new_sentence or "").strip()
+        else:
+            combined = (new_sentence or "").strip()
+        word_count = len(combined.split())
+
+        # Flush after roughly 25-35 words
+        if word_count >= 25:
+            return True
+
+        # Always flush on paragraph breaks and questions/exclamations when buffer is substantial
+        if (new_sentence or "").endswith(('?', '!')) and word_count > 10:
+            return True
+
+        return False
+
     async def speak(self, text: str, interrupt: bool = True) -> None:
         if not text or not text.strip():
             return

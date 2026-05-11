@@ -2,6 +2,9 @@ import asyncio
 import os
 import re
 import time
+from functools import partial
+from pathlib import Path
+from rapidfuzz import fuzz
 from uuid import uuid4
 from typing import Optional
 
@@ -198,6 +201,177 @@ class AsyncPipeline:
 
         return False
 
+    def _should_use_rag(self, command: str) -> bool:
+        """
+        Determine if this command should get RAG context injected.
+
+        RAG helps for knowledge questions about files and projects. It does not
+        help for simple PC control commands.
+        """
+        words = (command or "").lower().split()
+        if len(words) < 4:
+            return False
+
+        skip_words = {
+            "open",
+            "close",
+            "launch",
+            "start",
+            "volume",
+            "screenshot",
+            "lock",
+            "shutdown",
+            "restart",
+            "sleep",
+            "type",
+            "press",
+            "click",
+            "search",
+        }
+        if words[0] in skip_words and len(words) < 6:
+            return False
+
+        return True
+
+    def _extract_file_reference(self, command: str) -> tuple[str | None, str | None, str | None]:
+        """
+        Detect whether the command references a specific file and try to extract
+        (folder_hint, subfolder_hint, filename_hint). Returns (None, None, None)
+        when no obvious file reference is present.
+        """
+        cmd = (command or "").lower()
+        # Look for a filename with common extensions
+        file_exts = r"(?:\.php|\.java|\.py|\.js|\.html|\.css|\.txt|\.md|\.ts|\.json|\.yaml|\.yml|\.xml)"
+        m = re.search(r"([\w\-\s]+?\S+)" + file_exts, cmd)
+        filename = None
+        if m:
+            filename = m.group(0).strip()
+
+        # Look for lab/subfolder hints like 'lab 20' or 'lab-20'
+        subfolder = None
+        labm = re.search(r"lab[\s_-]?(\d{1,3})", cmd)
+        if labm:
+            subfolder = f"lab {labm.group(1)}"
+
+        # Folder hint: phrases after 'in' or 'of' up to 6 tokens
+        folder = None
+        fm = re.search(r"(?:in|of)\s+([\w\-\s]{3,60})", cmd)
+        if fm:
+            candidate = fm.group(1).strip()
+            # trim to first reasonable phrase
+            folder = " ".join(candidate.split()[:6])
+
+        if not filename and not subfolder and not folder:
+            return (None, None, None)
+        return (folder, subfolder, filename)
+
+    def _resolve_file_by_description(self, folder_hint: str | None, subfolder_hint: str | None, filename_hint: str | None, rag_index) -> str:
+        """
+        Attempt to resolve a file path described by hints using the RAG index's
+        known filenames. Returns the file content if a confident match is found,
+        otherwise empty string.
+        """
+        try:
+            candidates = rag_index.get_all_indexed_filenames()
+        except Exception:
+            candidates = []
+
+        if not candidates:
+            return ""
+
+        q = " ".join(filter(None, [folder_hint or "", subfolder_hint or "", filename_hint or ""]))
+        q_compact = re.sub(r"[^a-z0-9]+", "", (q or "").lower())
+        best = None
+        best_score = 0
+        for p in candidates:
+            name_compact = re.sub(r"[^a-z0-9]+", "", p.lower())
+            try:
+                score = fuzz.partial_ratio(q_compact, name_compact)
+            except Exception:
+                score = 0
+            if score > best_score:
+                best_score = score
+                best = p
+
+        if best and best_score >= 60:
+            try:
+                # Limit read size to avoid huge contexts
+                with open(best, "r", encoding="utf-8", errors="ignore") as f:
+                    content = f.read(64 * 1024)  # read first 64KB
+                logger.info("file_read_injected", query=q, matched_path=best, match_score=best_score)
+                return f"[Direct File Read: {os.path.basename(best)} ({os.path.dirname(best)})]\n" + content
+            except Exception as e:
+                logger.debug("file_read_failed", path=best, error=str(e))
+        return ""
+
+    def _extract_key_nouns(self, query: str) -> str:
+        """Extract the most important nouns from a query for fallback retrieval."""
+        stop_words = {
+            "tell",
+            "me",
+            "about",
+            "the",
+            "a",
+            "an",
+            "what",
+            "is",
+            "are",
+            "how",
+            "does",
+            "do",
+            "summarise",
+            "summarize",
+            "describe",
+            "explain",
+            "show",
+            "give",
+            "please",
+            "can",
+            "you",
+            "and",
+            "or",
+            "in",
+            "of",
+            "for",
+            "to",
+            "with",
+        }
+        words = (query or "").lower().split()
+        key_words = [w for w in words if w not in stop_words and len(w) > 2]
+        return " ".join(key_words)
+
+    def _expand_project_query(self, query: str) -> str:
+        """Expand project knowledge questions with likely code/file terms."""
+        query_lower = (query or "").lower()
+        knowledge_triggers = [
+            "tell me about",
+            "what is",
+            "summarise",
+            "summarize",
+            "describe",
+            "explain",
+            "what does",
+            "how does",
+            "what are",
+            "show me",
+        ]
+        is_knowledge_query = any(trigger in query_lower for trigger in knowledge_triggers)
+        if not is_knowledge_query:
+            return query
+
+        expanded = query
+        if "userauth" in query_lower or "user auth" in query_lower:
+            expanded += (
+                " authentication login register "
+                "user session JWT token controller "
+                "service repository movie ticket theatre theater screen seat booking payment"
+            )
+
+        if "project" in query_lower:
+            expanded += " main service controller repository model class method"
+
+        return expanded
+
     async def _get_rag_context(self, query: str) -> str:
         rag_index = getattr(self.memory, "personal_rag", None)
         if rag_index is None:
@@ -213,9 +387,50 @@ class AsyncPipeline:
 
         try:
             loop = asyncio.get_running_loop()
+            # If command seems like a direct file reference, attempt to resolve the exact file first
+            folder_hint, subfolder_hint, filename_hint = self._extract_file_reference(query)
+            if any((folder_hint, subfolder_hint, filename_hint)):
+                try:
+                    direct = await asyncio.wait_for(loop.run_in_executor(None, partial(self._resolve_file_by_description, folder_hint, subfolder_hint, filename_hint, rag_index)), timeout=2.0)
+                    if direct:
+                        logger.info("rag_direct_file_context", query=query, method="direct_read")
+                        return direct
+                except Exception:
+                    pass
+            search_query = self._expand_project_query(query)
+
+            def _search_matches(q: str):
+                return rag_index.search(q, limit=3, use_cache=False)
+
+            results = await asyncio.wait_for(loop.run_in_executor(None, partial(_search_matches, search_query)), timeout=2.0)
+
+            top_score = float(results[0].get("score", 0.0)) if results else 0.0
+            if not results or top_score < 58.0:
+                key_nouns = self._extract_key_nouns(query)
+                if key_nouns and key_nouns != search_query:
+                    fallback_results = await asyncio.wait_for(loop.run_in_executor(None, partial(_search_matches, key_nouns)), timeout=2.0)
+                    if fallback_results and float(fallback_results[0].get("score", 0.0)) >= top_score:
+                        results = fallback_results
+                        search_query = key_nouns
+                        top_score = float(results[0].get("score", 0.0))
+
+            if not results:
+                return ""
+
             context = await asyncio.wait_for(
-                loop.run_in_executor(None, rag_index.build_context, query),
+                loop.run_in_executor(None, rag_index.build_context, search_query, 3),
                 timeout=2.0,
+            )
+            if not context:
+                return ""
+
+            logger.info(
+                "rag_context_injected",
+                query=query,
+                search_query=search_query,
+                results_count=len(results),
+                top_score=top_score,
+                sources=[r.get("title") or os.path.basename(r.get("path", "")) for r in results],
             )
             return context or ""
 
@@ -258,30 +473,66 @@ class AsyncPipeline:
                 interrupt = False
             sentences_queue.append((sentence_buffer.strip(), interrupt))
 
-        # Play sentences sequentially to avoid overlapping audio
+        # Accumulate sentences into natural-length chunks before TTS to avoid choppy playback
+        chunk_buffer = ""
+        first_chunk = True
         for sentence, interrupt in sentences_queue:
             try:
-                # Estimate playback duration (approx words / 2.5 words-per-second) and suppress VAD
+                # Decide whether to flush the buffer with this new sentence
+                flush = False
                 try:
-                    words = len(sentence.split())
-                    est_seconds = max(0.5, (words / 2.5) + 0.5)
+                    if hasattr(self.tts, "should_flush_sentence_buffer"):
+                        flush = self.tts.should_flush_sentence_buffer(chunk_buffer, sentence)
                 except Exception:
-                    est_seconds = 2.0
+                    # Default: flush after each sentence if helper is not available
+                    flush = True
 
-                # If the VAD supports suppression, request it for the estimated duration
-                try:
-                    if hasattr(self.vad, "suppress_for"):
-                        await asyncio.to_thread(self.vad.suppress_for, est_seconds + 1.5)
-                except Exception:
-                    pass
+                if flush and chunk_buffer.strip():
+                    # Play the accumulated chunk
+                    try:
+                        words = len(chunk_buffer.split())
+                        est_seconds = max(0.5, (words / 2.5) + 0.5)
+                    except Exception:
+                        est_seconds = 2.0
+                    try:
+                        if hasattr(self.vad, "suppress_for"):
+                            await asyncio.to_thread(self.vad.suppress_for, est_seconds + 1.5)
+                    except Exception:
+                        pass
+                    try:
+                        await self.tts.speak(chunk_buffer.strip(), interrupt=first_chunk)
+                    except Exception as e:
+                        logger.error("tts_speak_failed", error=str(e), exc_info=True)
+                        self.event_bus.emit("error_occurred", {"component": "tts", "error": str(e)})
+                    chunk_buffer = ""
+                    first_chunk = False
 
-                await self.tts.speak(sentence, interrupt=interrupt)
+                # Append the current sentence to the buffer
+                if chunk_buffer:
+                    chunk_buffer += " " + sentence
+                else:
+                    chunk_buffer = sentence
+
+            except Exception as e:
+                logger.error("tts_chunking_failed", error=str(e), exc_info=True)
+
+        # Flush any remaining buffer
+        if chunk_buffer.strip():
+            try:
+                words = len(chunk_buffer.split())
+                est_seconds = max(0.5, (words / 2.5) + 0.5)
+            except Exception:
+                est_seconds = 2.0
+            try:
+                if hasattr(self.vad, "suppress_for"):
+                    await asyncio.to_thread(self.vad.suppress_for, est_seconds + 1.5)
+            except Exception:
+                pass
+            try:
+                await self.tts.speak(chunk_buffer.strip(), interrupt=first_chunk)
             except Exception as e:
                 logger.error("tts_speak_failed", error=str(e), exc_info=True)
-                self.event_bus.emit(
-                    "error_occurred",
-                    {"component": "tts", "error": str(e)},
-                )
+                self.event_bus.emit("error_occurred", {"component": "tts", "error": str(e)})
 
         return response_text.strip()
 
@@ -302,8 +553,9 @@ class AsyncPipeline:
             self.health_monitor.healthy("pipeline", "online")
         self._loop = asyncio.get_running_loop()
         if self.start_active:
+            self._always_on_until = time.time() + 60.0
             self._open_wake_window()
-            logger.info("activation_window_started", seconds=self.command_window_seconds)
+            logger.info("activation_window_started", seconds=60)
         watchdog = asyncio.create_task(self._watchdog())
         try:
             while True:
@@ -475,29 +727,6 @@ class AsyncPipeline:
             self._set_state(AssistantState.PROCESSING)
             memory_context = await asyncio.to_thread(self.memory.recall_context, clean_command, 3, False)
 
-            # Skip RAG retrieval for non-document intents to avoid polluting prompts
-            # when the minimum relevance threshold is permissive.
-            skip_rag = False
-            try:
-                decision = self.brain.intent_router.detect_intent(clean_command)
-                non_document_tools = {
-                    "get_weather",
-                    "get_current_time",
-                    "get_current_datetime",
-                    "get_system_status",
-                    "read_clipboard",
-                    "take_screenshot",
-                    "get_health_report",
-                }
-                if decision.action == "vision":
-                    skip_rag = True
-                elif decision.action == "tool" and decision.tool_name in non_document_tools:
-                    skip_rag = True
-                elif decision.action == "ask" and decision.tool_name in non_document_tools:
-                    skip_rag = True
-            except Exception:
-                pass
-
             # If a current_project session slot exists, prepend its name to the RAG query
             try:
                 proj = session_state.get_current_project()
@@ -530,16 +759,19 @@ class AsyncPipeline:
                 except asyncio.TimeoutError:
                     pass
 
-                rag_context = "" if skip_rag else await self._get_rag_context(rag_query)
+                rag_context = await self._get_rag_context(rag_query) if self._should_use_rag(clean_command) else ""
                 if rag_context:
                     rag_context = f"[Context: user is currently asking about {proj.get('name')}]\n" + rag_context
             else:
-                rag_context = "" if skip_rag else await self._get_rag_context(clean_command)
+                rag_context = await self._get_rag_context(clean_command) if self._should_use_rag(clean_command) else ""
             augmented_command = clean_command
             if rag_context:
                 augmented_command = f"{rag_context}\nUser question: {clean_command}"
+                augmented_command += "\nAnswer questions about files in maximum 4 sentences. User is listening not reading."
 
-            turn_timeout_seconds = float(getattr(self.config.providers, "overall_turn_timeout_seconds", 30.0))
+            configured_timeout = float(getattr(self.config.providers, "overall_turn_timeout_seconds", 30.0))
+            default_timeout = 45.0 if (rag_context and len(rag_context) > 100) else 20.0
+            turn_timeout_seconds = min(configured_timeout, default_timeout)
             try:
                 response_text = await asyncio.wait_for(
                     self._stream_response(augmented_command, memory_context, rag_context),

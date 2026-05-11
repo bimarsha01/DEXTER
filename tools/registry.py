@@ -28,6 +28,9 @@ _TOOL_MODULES: dict[str, list[str]] = {
         "search_youtube",
         "search_content_platform",
     ],
+    "tools.media_tool": [
+        "play_music",
+    ],
     "tools.file_tools": [
         "create_note",
         "read_note",

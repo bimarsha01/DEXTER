@@ -129,6 +129,21 @@
     "required": ["query"],
     "additionalProperties": false
   },
+  "play_music": {
+    "type": "object",
+    "properties": {
+      "query": {
+        "type": "string",
+        "description": "Song, artist, album or playlist to play."
+      },
+      "platform": {
+        "type": "string",
+        "description": "Music platform, defaults to Spotify."
+      }
+    },
+    "required": ["query"],
+    "additionalProperties": false
+  },
   "play_youtube": {
     "type": "object",
     "properties": {

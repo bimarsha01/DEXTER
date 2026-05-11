@@ -1,0 +1,18 @@
+COMMAND: Tell me about the UserAuth project
+CONTEXT_PRESENT: True
+CONTEXT_PREVIEW: PERSONAL FILE CONTEXT (answer naturally as if you read these files yourself; cite by number when relevant): |  | [1] theatreRepo.java  (Repo) | package com.example.userauth.Repo; import com.example.userauth.Models.Movies; import com.example.userauth.Models.Theatre; import org.springframework.data.jpa.repository.JpaRepository
+LOG_EVENTS:
+  INFO Dexter.pipeline: rag_context_injected | {"query": "Tell me about the UserAuth project", "search_query": "Tell me about the UserAuth project authentication login register user session JWT token controller service repository movie ticket theatre theater screen seat booking payment main service controller repository model class method", "results_count": 5, "top_score": 87.69383637354764, "sources": ["theatreRepo.java", "TheatreController.java", "TheatreController.java", "TheatreAdminController.java", "BookingResponseDto.java"]}
+---
+COMMAND: Summarise the authentication module in UserAuth and how sessions are managed
+CONTEXT_PRESENT: True
+CONTEXT_PREVIEW: PERSONAL FILE CONTEXT (answer naturally as if you read these files yourself; cite by number when relevant): |  | [2] test_rag_document_resolution.py  (tests) | from __future__ import annotations from tools import document_tools def test_answer_document_question_resolves_partial_project_name(tmp_path, monkeypatch): project_fi
+LOG_EVENTS:
+  INFO Dexter.pipeline: rag_context_injected | {"query": "Summarise the authentication module in UserAuth and how sessions are managed", "search_query": "Summarise the authentication module in UserAuth and how sessions are managed authentication login register user session JWT token controller service repository movie ticket theatre theater screen seat booking payment", "results_count": 5, "top_score": 84.37671154421511, "sources": ["TheatreController.java", "TheatreController.java", "test_rag_document_resolution.py", "test_rag_document_resolution.py", "TheatreAdminController.java"]}
+---
+COMMAND: Open the office reporting system
+CONTEXT_PRESENT: True
+CONTEXT_PREVIEW: PERSONAL FILE CONTEXT (answer naturally as if you read these files yourself; cite by number when relevant): |  | [1] test_dexter_smoke.py  (tests) | reporting system.") self.assertEqual(result.corrected, "Open the office reporting system.") @mock.patch("tools.pc_controls._resolve_command", return_value=r"C:\\Program Files\\G
+LOG_EVENTS:
+  INFO Dexter.pipeline: rag_context_injected | {"query": "Open the office reporting system", "search_query": "Open the office reporting system", "results_count": 5, "top_score": 76.53749663953998, "sources": ["test_dexter_smoke.py", "DashboardService.java", "DashboardController.java", "EmployeeServiceImpl.java", "PROJECT_ARCHITECTURE_PLAN.md"]}
+---

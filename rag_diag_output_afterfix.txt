@@ -1,0 +1,52 @@
+Query: UserAuth project movie ticket booking
+Results: 5
+  [83.8] BookingMapper.java
+  package com.example.userauth.Mapper;  import com.example.userauth.DTOs.BookingDtos.BookingResponseDto; import com.exampl
+  [71.4] BookingResponseDto.java
+  package com.example.userauth.DTOs.BookingDtos;   import com.example.userauth.Models.Show; import com.example.userauth.Mo
+  [70.1] BookingMapperImpl.java
+  package com.example.userauth.Mapper;  import com.example.userauth.DTOs.BookingDtos.BookingResponseDto; import com.exampl
+  [68.9] TheatreController.java
+  package com.example.userauth.Controller;  import com.example.userauth.API.ApiResponse; import com.example.userauth.DTOs.
+  [68.7] MovieMinInfo.java
+  package com.example.userauth.Helpers;  public interface MovieMinInfo {         Long getId();         String getTitle(); 
+---
+Query: UserAuth theaters screens seats
+Results: 5
+  [85.9] ShowServices.java
+  name);         log.info("Confirming if the theatre exists or not ");          if (theatre == null) { throw new NotFoundE
+  [83.5] TheatreServices.java
+  package com.example.userauth.Services.Theatre;  import com.example.userauth.DTOs.MovieDtos.MovieResponseDto; import com.
+  [72.7] TheatreResponseDto.java
+  package com.example.userauth.DTOs.TheatreDtos;   import com.example.userauth.Models.Screens; import lombok.AllArgsConstr
+  [72.2] TheatreUpdationDto.java
+  package com.example.userauth.DTOs.TheatreDtos;   import com.example.userauth.Models.Screens; import lombok.AllArgsConstr
+  [72.0] TheatreController.java
+  package com.example.userauth.Controller;  import com.example.userauth.API.ApiResponse; import com.example.userauth.DTOs.
+---
+Query: authentication module sessions JWT
+Results: 5
+  [83.1] jwt.js
+  //logIn and Signup import dotenv from "dotenv" dotenv.config() import jwt from "jsonwebtoken" import { Users } from "../
+  [64.6] auth.middleware.js
+  import { verify } from "../utils/jwt.js";  export const authenticate = (req, res, next) => {   const token = req.cookies
+  [64.6] auth.middleware.js
+  import { verify } from "../utils/jwt.js";  export const authenticate = (req, res, next) => {   const token = req.cookies
+  [60.4] authMiddleware.js
+  const jwt = require('jsonwebtoken'); const Admin = require('../models/Admin');  const protect = async (req, res, next) =
+  [60.4] authMiddleware.js
+  const jwt = require('jsonwebtoken'); const Admin = require('../models/Admin');  const protect = async (req, res, next) =
+---
+Query: office reporting system Java Spring
+Results: 5
+  [76.5] DashboardController.java
+  package com.office.officereportingsystem.controller;  //import com.office.officereportingsystem.entity.DailyReport; //im
+  [76.2] EmployeeProjectController.java
+  om.office.officereportingsystem.service.User.EmployeeService; import lombok.RequiredArgsConstructor; import lombok.exter
+  [76.0] EmployerController.java
+  ystem.repository.UserRepo; import com.office.officereportingsystem.service.Employer.EmployerService; import com.office.o
+  [75.6] ReportEntryRepo.java
+  package com.office.officereportingsystem.repository;  import com.office.officereportingsystem.entity.ReportEntry; import
+  [75.6] EmployeeServiceImpl.java
+  stem.repository.EmployeeProjectRepo; import com.office.officereportingsystem.repository.ProjectRepo; import com.office.o
+---
