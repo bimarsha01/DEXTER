@@ -7,7 +7,7 @@ Scope: Full workspace scan + runtime verification + external market context
 Dexter is a serious pre-product prototype with a strong architecture direction and real implementation depth. It is already beyond a demo: async pipeline, multi-LLM fallback, tool schemas, guardrails, memory, wake handling, metrics, and test coverage exist.
 
 Current maturity (honest view):
-- Technical maturity: late prototype / early beta
+- Technical maturity: late prototype / early 
 - Product maturity: pre-commercial MVP
 - Commercial maturity: not yet sale-ready without packaging, compliance, licensing, and support hardening
 
