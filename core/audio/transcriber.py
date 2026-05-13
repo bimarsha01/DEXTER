@@ -1,5 +1,7 @@
 import os
 import threading
+import numpy as np
+import soundfile as sf
 from faster_whisper import WhisperModel
 from utils.logger import get_logger
 from utils.vocabulary import build_whisper_vocabulary
@@ -92,6 +94,39 @@ class DexterTranscriber:
 
         return self._model
 
+    def _normalize_audio(self, audio_path: str) -> str:
+        """
+        Normalize audio volume to a consistent level before transcription.
+        Returns the path to the normalized audio file, or the original path.
+        """
+        try:
+            data, samplerate = sf.read(audio_path)
+            if getattr(data, "size", 0) == 0:
+                return audio_path
+            if len(getattr(data, "shape", [])) > 1:
+                data = np.mean(data, axis=1)
+
+            rms = float(np.sqrt(np.mean(data ** 2))) if data.size else 0.0
+            if rms < 0.001:
+                target_rms = 0.1
+                if rms > 0:
+                    data = data * (target_rms / rms)
+                    data = np.clip(data, -1.0, 1.0)
+                    base, ext = os.path.splitext(audio_path)
+                    norm_path = f"{base}_normalized{ext or '.wav'}"
+                    sf.write(norm_path, data, samplerate)
+                    logger.debug(
+                        "audio_normalized",
+                        original_rms=float(rms),
+                        target_rms=target_rms,
+                        path=norm_path,
+                    )
+                    return norm_path
+            return audio_path
+        except Exception as e:
+            logger.warning("audio_normalization_failed", error=str(e))
+            return audio_path
+
     def transcribe(self, audio_file: str, on_partial=None) -> str:
         """
         Takes an audio filepath and returns the transcribed text.
@@ -101,6 +136,7 @@ class DexterTranscriber:
             logger.error("transcriber_audio_missing", path=audio_file)
             return ""
 
+        normalized_path = self._normalize_audio(audio_file)
         logger.debug("transcriber_run_started", path=audio_file, beam_size=self.beam_size)
         model = self._ensure_model()
         prompt = (self.initial_prompt or "").strip()
@@ -109,17 +145,27 @@ class DexterTranscriber:
                 prompt = f"{DEFAULT_WAKE_PROMPT} {prompt}"
         else:
             prompt = DEFAULT_WAKE_PROMPT
+        cfg = get_config()
+        audio_cfg = getattr(cfg, "audio_settings", None)
+        vad_params = {
+            "threshold": float(getattr(audio_cfg, "vad_threshold", 0.3)),
+            "min_speech_duration_ms": int(getattr(audio_cfg, "min_speech_duration_ms", 100)),
+            "min_silence_duration_ms": int(getattr(audio_cfg, "min_silence_duration_ms", 800)),
+            "speech_pad_ms": int(getattr(audio_cfg, "speech_pad_ms", 400)),
+        }
         segments, info = model.transcribe(
-            audio_file,
+            normalized_path,
             beam_size=self.beam_size,
             best_of=self.best_of,
-            temperature=self.temperature,
+            temperature=[0.0, 0.2, 0.4],
             patience=self.patience,
             log_prob_threshold=self.log_prob_threshold,
             no_speech_threshold=self.no_speech_threshold,
-            condition_on_previous_text=self.condition_on_previous_text,
+            condition_on_previous_text=False,
             initial_prompt=prompt,
-            vad_filter=True,  # Skip silence segments for speed
+            word_timestamps=False,
+            vad_filter=True,
+            vad_parameters=vad_params,
         )
 
         # Join all spoken segments

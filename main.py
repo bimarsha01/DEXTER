@@ -90,8 +90,9 @@ async def main():
         health_monitor.healthy("startup", "configuration loaded")
 
         # Load Whisper on GPU for speech-to-text
+        stt_model = runtime_config.stt.model or runtime_config.models.whisper_model
         transcriber = DexterTranscriber(
-            model_size=runtime_config.models.whisper_model,
+            model_size=stt_model,
             beam_size=runtime_config.stt.beam_size,
             best_of=runtime_config.stt.best_of,
             temperature=runtime_config.stt.temperature,

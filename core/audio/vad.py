@@ -8,11 +8,21 @@ import soundfile as sf
 import torch
 import time
 from utils.logger import get_logger
+from utils.config import get_config
 
 logger = get_logger("vad")
 
 class VADListener:
-    def __init__(self, sample_rate=16000, chunk_size=512):
+    def __init__(
+        self,
+        sample_rate=16000,
+        chunk_size=512,
+        vad_threshold: float | None = None,
+        min_speech_duration_ms: int | None = None,
+        min_silence_duration_ms: int | None = None,
+        speech_pad_ms: int | None = None,
+        max_speech_duration_s: int | None = None,
+    ):
         self.sample_rate = sample_rate
         self.chunk_size = chunk_size
         self.q = queue.Queue()
@@ -22,6 +32,24 @@ class VADListener:
         self._clap_active = False
         self._clap_start = 0.0
         self._last_clap_time = 0.0
+
+        cfg = get_config()
+        audio_cfg = getattr(cfg, "audio_settings", None)
+        self.vad_threshold = float(
+            vad_threshold if vad_threshold is not None else getattr(audio_cfg, "vad_threshold", 0.3)
+        )
+        self.min_speech_duration_ms = int(
+            min_speech_duration_ms if min_speech_duration_ms is not None else getattr(audio_cfg, "min_speech_duration_ms", 100)
+        )
+        self.min_silence_duration_ms = int(
+            min_silence_duration_ms if min_silence_duration_ms is not None else getattr(audio_cfg, "min_silence_duration_ms", 800)
+        )
+        self.speech_pad_ms = int(
+            speech_pad_ms if speech_pad_ms is not None else getattr(audio_cfg, "speech_pad_ms", 400)
+        )
+        self.max_speech_duration_s = int(
+            max_speech_duration_s if max_speech_duration_s is not None else getattr(audio_cfg, "max_speech_duration_s", 30)
+        )
         
         logger.info("vad_initializing")
         # Load Silero VAD from PyTorch Hub
@@ -55,7 +83,7 @@ class VADListener:
     def listen(
         self,
         output_file=None,
-        silence_threshold=1.5,
+        silence_threshold: float | None = None,
         on_speech_start=None,
         on_clap=None,
         clap_sensitivity: float = 3.0,
@@ -73,8 +101,18 @@ class VADListener:
         recording = []
         is_speaking = False
         silence_start_time = None
+        speech_start_time = None
+        speech_ms = 0.0
         output_file = self._resolve_output_path(output_file)
         was_interrupted = False
+        pre_buffer = []
+        pre_buffer_samples = 0
+        pad_samples = int(self.sample_rate * (self.speech_pad_ms / 1000.0))
+        base_silence_s = (
+            float(silence_threshold)
+            if silence_threshold is not None
+            else float(self.min_silence_duration_ms) / 1000.0
+        )
         
         logger.info("vad_listening_started")
 
@@ -115,12 +153,26 @@ class VADListener:
                         
                     # Calculate probability that this chunk is human speech
                     speech_prob = self.model(tensor_chunk, self.sample_rate).item()
+                    chunk_duration_ms = (len(tensor_chunk) / self.sample_rate) * 1000.0
 
-                    if speech_prob > 0.5:
-                        if not is_speaking:
+                    if not is_speaking:
+                        pre_buffer.append(chunk)
+                        pre_buffer_samples += len(chunk)
+                        while pre_buffer_samples > pad_samples and pre_buffer:
+                            removed = pre_buffer.pop(0)
+                            pre_buffer_samples -= len(removed)
+
+                    if speech_prob > self.vad_threshold:
+                        speech_ms += chunk_duration_ms
+                        if not is_speaking and speech_ms >= self.min_speech_duration_ms:
                             logger.debug("vad_speech_started")
                             is_speaking = True
+                            speech_start_time = time.time()
                             was_interrupted = True  # Mark that we detected speech during listening
+                            if pre_buffer:
+                                recording.extend(pre_buffer)
+                                pre_buffer = []
+                                pre_buffer_samples = 0
                             if on_speech_start:
                                 try:
                                     on_speech_start()
@@ -130,9 +182,11 @@ class VADListener:
                                         error=str(e),
                                         exc_info=True,
                                     )
-                        recording.append(chunk)
+                        if is_speaking:
+                            recording.append(chunk)
                         silence_start_time = None  # Reset silence timer
                     else:
+                        speech_ms = 0.0
                         if is_speaking:
                             recording.append(chunk)
                             if silence_start_time is None:
@@ -140,12 +194,17 @@ class VADListener:
                             
                             # If interrupted (speech detected during playback): shorter timeout
                             # Otherwise: normal timeout
-                            effective_threshold = 0.8 if was_interrupted else silence_threshold
+                            effective_threshold = min(0.8, base_silence_s) if was_interrupted else base_silence_s
                             
                             # If they have been silent for X seconds, stop recording
                             if time.time() - silence_start_time > effective_threshold:
                                 logger.debug("vad_speech_ended", was_interrupted=was_interrupted, silence_duration=(time.time() - silence_start_time))
                                 break
+
+                    if is_speaking and speech_start_time is not None:
+                        if time.time() - speech_start_time > float(self.max_speech_duration_s):
+                            logger.info("vad_max_speech_duration_reached", seconds=self.max_speech_duration_s)
+                            break
         except Exception as e:
             logger.error("vad_microphone_error", error=str(e), exc_info=True)
             return None

@@ -171,14 +171,35 @@ class Brain:
         if provider != "groq":
             return list(self.groq_tools)
 
+        def _is_knowledge_query(text: str) -> bool:
+            q = (text or "").lower()
+            triggers = (
+                "tell me about",
+                "summarize",
+                "summarise",
+                "describe",
+                "explain",
+                "overview",
+                "documentation",
+                "readme",
+                "project",
+                "codebase",
+                "repository",
+            )
+            return any(t in q for t in triggers)
+
         query_text = (query or "").lower()
+        is_knowledge_query = _is_knowledge_query(query_text)
         media_query = any(keyword in query_text for keyword in ("play ", "spotify", "youtube music", "music", "song", "album", "playlist", "artist"))
         available = {t.get("function", {}).get("name"): t for t in (self.groq_tools or [])}
         if not available:
             return []
 
         group_scores: list[tuple[float, str]] = []
+        allowed_groups = {"document"} if is_knowledge_query else set(TOOL_GROUPS.keys())
         for group_name in TOOL_GROUPS:
+            if group_name not in allowed_groups:
+                continue
             score = float(fuzz.partial_ratio(group_name, query_text))
             group_scores.append((score, group_name))
 
@@ -191,7 +212,14 @@ class Brain:
         if media_query and "play_music" in available:
             selected_names.add("play_music")
 
+        if is_knowledge_query:
+            for tool_name in TOOL_GROUPS.get("document", []):
+                if tool_name in available:
+                    selected_names.add(tool_name)
+
         for tool_name in ALWAYS_INCLUDE:
+            if is_knowledge_query:
+                continue
             # For media queries avoid including time-related tools which can confuse intent
             if media_query and tool_name in {"get_current_time", "get_current_datetime"}:
                 continue
@@ -203,6 +231,11 @@ class Brain:
         # Ensure time tools are not present when this is clearly a media playback request
         if media_query:
             for t in TOOL_GROUPS.get("time", []):
+                if t in selected_names:
+                    selected_names.discard(t)
+
+        if is_knowledge_query:
+            for t in TOOL_GROUPS.get("search", []) + TOOL_GROUPS.get("youtube", []):
                 if t in selected_names:
                     selected_names.discard(t)
 
@@ -518,6 +551,10 @@ class Brain:
         self.provider_state[name] = state
         metrics.update_provider_health(name, True, state["score"], state.get("cooldown_until", 0.0), str(error))
 
+    def _emit_llm_event(self, event_type: str, **fields: Any) -> None:
+        if self._event_bus:
+            self._event_bus.emit(event_type, fields)
+
     def _is_rate_limit_error(self, error: Exception) -> bool:
         # Be defensive: provider SDKs use different exception classes / messages.
         msg = str(error).lower()
@@ -634,11 +671,13 @@ class Brain:
             )
         elif self._can_use_gemini():
             try:
+                self._emit_llm_event("llm_call_started", provider="gemini")
                 _t0 = time.perf_counter()
                 prompt = self._compose_prompt(user_command, long_term_memory, indexed_context, provider="gemini")
                 response_text = await self._process_gemini(prompt)
                 _ms = (time.perf_counter() - _t0) * 1000
                 logger.info("llm_call_completed", provider="gemini", duration_ms=_ms)
+                self._emit_llm_event("llm_call_completed", provider="gemini", duration_ms=_ms)
                 self._record_provider_success("gemini")
                 self._add_history("user", user_command)
                 self._add_history("assistant", response_text)
@@ -654,6 +693,8 @@ class Brain:
                         self._disable_gemini_globally(cooldown)
                 logger.warning("gemini_request_failed", error=rate_msg, exc_info=True)
                 logger.info("llm_fallback", from_provider="gemini", to_provider="groq")
+                self._emit_llm_event("llm_call_failed", provider="gemini", error=rate_msg)
+                self._emit_llm_event("llm_fallback", from_provider="gemini", to_provider="groq")
                 # On quota/rate-limit, wait briefly and annotate the next prompt to encourage brevity
                 if rate_limited:
                     try:
@@ -666,6 +707,7 @@ class Brain:
         # ── Try Groq (Fallback) ──
         if self._can_use_provider("groq", self.groq_available):
             try:
+                self._emit_llm_event("llm_call_started", provider="groq")
                 _t0 = time.perf_counter()
                 prompt = self._compose_prompt(user_command, long_term_memory, indexed_context, provider="groq")
                 if fallback_note:
@@ -673,6 +715,7 @@ class Brain:
                 response_text = await self._process_groq(prompt, query_hint=user_command)
                 _ms = (time.perf_counter() - _t0) * 1000
                 logger.info("llm_call_completed", provider="groq", duration_ms=_ms)
+                self._emit_llm_event("llm_call_completed", provider="groq", duration_ms=_ms)
                 self._record_provider_success("groq")
                 self._add_history("user", user_command)
                 self._add_history("assistant", response_text)
@@ -683,15 +726,19 @@ class Brain:
                 self._provider_health.record_groq_failure()
                 logger.warning("groq_request_failed", error=str(e), exc_info=True)
                 logger.info("llm_fallback", from_provider="groq", to_provider="ollama")
+                self._emit_llm_event("llm_call_failed", provider="groq", error=str(e))
+                self._emit_llm_event("llm_fallback", from_provider="groq", to_provider="ollama")
 
         # ── Try Ollama (Local Offline) ──
         if self._can_use_provider("ollama", self.ollama_available):
             try:
+                self._emit_llm_event("llm_call_started", provider="ollama")
                 _t0 = time.perf_counter()
                 prompt = self._compose_prompt(user_command, long_term_memory, indexed_context, provider="ollama")
                 response_text = await self._process_ollama(prompt)
                 _ms = (time.perf_counter() - _t0) * 1000
                 logger.info("llm_call_completed", provider="ollama", duration_ms=_ms)
+                self._emit_llm_event("llm_call_completed", provider="ollama", duration_ms=_ms)
                 self._record_provider_success("ollama")
                 self._add_history("user", user_command)
                 self._add_history("assistant", response_text)
@@ -699,6 +746,7 @@ class Brain:
             except Exception as e:
                 self._record_provider_failure("ollama", e, False)
                 logger.error("ollama_request_failed", error=str(e), exc_info=True)
+                self._emit_llm_event("llm_call_failed", provider="ollama", error=str(e))
 
         return (
             "I apologize, sir. All of my neural networks are currently unreachable. "
@@ -727,6 +775,7 @@ class Brain:
             fallback_note = ""
             try:
                 response_text = ""
+                self._emit_llm_event("llm_stream_started", provider="gemini")
                 _t0 = time.perf_counter()
                 prompt = self._compose_prompt(user_command, long_term_memory, indexed_context, provider="gemini")
                 async for chunk in self._stream_gemini(prompt):
@@ -735,6 +784,7 @@ class Brain:
                 if response_text:
                     _ms = (time.perf_counter() - _t0) * 1000
                     logger.info("llm_stream_completed", provider="gemini", duration_ms=_ms)
+                    self._emit_llm_event("llm_stream_completed", provider="gemini", duration_ms=_ms)
                     self._record_provider_success("gemini")
                     self._add_history("user", user_command)
                     self._add_history("assistant", response_text)
@@ -748,6 +798,7 @@ class Brain:
                     if "perday" in str(e).lower() or "limit: 0" in str(e).lower():
                         self._disable_gemini_globally(cooldown)
                 logger.warning("gemini_stream_failed", error=str(e), exc_info=True)
+                self._emit_llm_event("llm_stream_failed", provider="gemini", error=str(e))
                 if rate_limited:
                     rate_msg = str(e)
                     try:
@@ -760,6 +811,7 @@ class Brain:
         if self._can_use_provider("groq", self.groq_available):
             try:
                 response_text = ""
+                self._emit_llm_event("llm_stream_started", provider="groq")
                 _t0 = time.perf_counter()
                 prompt = self._compose_prompt(user_command, long_term_memory, indexed_context, provider="groq")
                 if "fallback_note" in locals() and fallback_note:
@@ -770,6 +822,7 @@ class Brain:
                 if response_text:
                     _ms = (time.perf_counter() - _t0) * 1000
                     logger.info("llm_stream_completed", provider="groq", duration_ms=_ms)
+                    self._emit_llm_event("llm_stream_completed", provider="groq", duration_ms=_ms)
                     self._record_provider_success("groq")
                     self._add_history("user", user_command)
                     self._add_history("assistant", response_text)
@@ -779,15 +832,18 @@ class Brain:
                 self._record_provider_failure("groq", e, rate_limited)
                 self._provider_health.record_groq_failure()
                 logger.warning("groq_stream_failed", error=str(e), exc_info=True)
+                self._emit_llm_event("llm_stream_failed", provider="groq", error=str(e))
 
         if self._can_use_provider("ollama", self.ollama_available):
             try:
+                self._emit_llm_event("llm_stream_started", provider="ollama")
                 _t0 = time.perf_counter()
                 prompt = self._compose_prompt(user_command, long_term_memory, indexed_context, provider="ollama")
                 response_text = await self._process_ollama(prompt)
                 if response_text:
                     _ms = (time.perf_counter() - _t0) * 1000
                     logger.info("llm_stream_completed", provider="ollama", duration_ms=_ms)
+                    self._emit_llm_event("llm_stream_completed", provider="ollama", duration_ms=_ms)
                     self._record_provider_success("ollama")
                     self._add_history("user", user_command)
                     self._add_history("assistant", response_text)
@@ -796,6 +852,7 @@ class Brain:
             except Exception as e:
                 self._record_provider_failure("ollama", e, False)
                 logger.warning("ollama_stream_failed", error=str(e), exc_info=True)
+                self._emit_llm_event("llm_stream_failed", provider="ollama", error=str(e))
 
         response_text = await self.process_command(user_command, long_term_memory, indexed_context)
         yield response_text

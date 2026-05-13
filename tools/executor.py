@@ -54,16 +54,33 @@ class ToolExecutor:
             self._schemas[tool_name] = schema
         return self._schemas[tool_name]
 
-    def _sanitize_args(self, args: dict, schema: dict) -> dict:
+    def _sanitize_args(self, tool_name: str, args: dict, schema: dict) -> dict:
         args = args or {}
         properties = schema.get("properties", {})
         if not properties and args:
             raise ValueError("This tool does not accept arguments.")
 
+        search_tools = {
+            "search_google",
+            "search_youtube",
+            "search_content_platform",
+            "play_youtube",
+        }
+        search_keys = {"query", "search_term", "platform", "content_type"}
+
+        def _clean_search_text(value: str) -> str:
+            cleaned = value.replace("\r", " ").replace("\n", " ")
+            cleaned = re.sub(r"(\$\(|&&|\|\|)", " ", cleaned)
+            cleaned = cleaned.replace("|", " ").replace(";", " ").replace("`", " ")
+            cleaned = re.sub(r"\s+", " ", cleaned).strip()
+            return cleaned
+
         clean = {}
         for key, value in args.items():
             if properties and key not in properties:
                 continue
+            if isinstance(value, str) and tool_name in search_tools and key in search_keys:
+                value = _clean_search_text(value)
             if isinstance(value, str) and UNSAFE_PATTERN.search(value):
                 raise ValueError(f"Unsafe characters detected in argument '{key}'.")
             clean[key] = value
@@ -140,6 +157,10 @@ class ToolExecutor:
         return RiskLevel.LOW.value, False, "allowed"
 
     async def execute(self, tool_name: str, args: dict, event_bus: Any = None) -> ToolResult:
+        def _emit(event_type: str, **fields: Any) -> None:
+            if event_bus is not None:
+                event_bus.emit(event_type, fields)
+
         func = self._tools.get(tool_name)
         if not func:
             logger.info(
@@ -148,6 +169,15 @@ class ToolExecutor:
                 success=False,
                 duration_ms=0.0,
                 error="tool_not_available",
+            )
+            _emit(
+                "tool_execution_completed",
+                tool_name=tool_name,
+                success=False,
+                duration_ms=0.0,
+                error="tool_not_available",
+                risk_level=RiskLevel.LOW.value,
+                policy_decision="tool_not_available",
             )
             return ToolResult(
                 success=False,
@@ -163,9 +193,11 @@ class ToolExecutor:
 
         start = time.perf_counter()
         logger.info("tool_execution_started", tool_name=tool_name)
+        args_keys = sorted((args or {}).keys())
+        _emit("tool_execution_started", tool_name=tool_name, args_keys=args_keys)
         try:
             schema = self._get_schema(tool_name, func)
-            clean_args = self._sanitize_args(args or {}, schema)
+            clean_args = self._sanitize_args(tool_name, args or {}, schema)
             self._validate_args(clean_args, schema)
             self._validate_paths(clean_args, config)
 
@@ -181,6 +213,16 @@ class ToolExecutor:
                     duration_ms=duration_ms,
                     error=err_msg,
                     risk_level=risk_level,
+                    policy_decision=policy_decision,
+                )
+                _emit(
+                    "tool_execution_completed",
+                    tool_name=tool_name,
+                    success=False,
+                    duration_ms=duration_ms,
+                    error=err_msg,
+                    risk_level=risk_level,
+                    confirmation_required=True,
                     policy_decision=policy_decision,
                 )
                 return ToolResult(
@@ -214,6 +256,16 @@ class ToolExecutor:
                 duration_ms=duration_ms,
                 error=None,
             )
+            _emit(
+                "tool_execution_completed",
+                tool_name=tool_name,
+                success=True,
+                duration_ms=duration_ms,
+                error=None,
+                risk_level=risk_level,
+                confirmation_required=confirmation_required,
+                policy_decision=policy_decision,
+            )
             if event_bus is not None:
                 event_bus.emit("tool_called", {"tool_name": tool_name, "args": clean_args})
             return ToolResult(
@@ -238,6 +290,15 @@ class ToolExecutor:
                 duration_ms=duration_ms,
                 error=err_msg,
             )
+            _emit(
+                "tool_execution_completed",
+                tool_name=tool_name,
+                success=False,
+                duration_ms=duration_ms,
+                error=err_msg,
+                risk_level=RiskLevel.LOW.value,
+                policy_decision="invalid_args",
+            )
             return ToolResult(
                 success=False,
                 data=None,
@@ -258,6 +319,15 @@ class ToolExecutor:
                 duration_ms=duration_ms,
                 error=err_msg,
             )
+            _emit(
+                "tool_execution_completed",
+                tool_name=tool_name,
+                success=False,
+                duration_ms=duration_ms,
+                error=err_msg,
+                risk_level=RiskLevel.LOW.value,
+                policy_decision="invalid_args",
+            )
             return ToolResult(
                 success=False,
                 data=None,
@@ -277,6 +347,15 @@ class ToolExecutor:
                 success=False,
                 duration_ms=duration_ms,
                 error=err_msg,
+            )
+            _emit(
+                "tool_execution_completed",
+                tool_name=tool_name,
+                success=False,
+                duration_ms=duration_ms,
+                error=err_msg,
+                risk_level=RiskLevel.MEDIUM.value,
+                policy_decision="timeout",
             )
             return ToolResult(
                 success=False,
@@ -303,6 +382,15 @@ class ToolExecutor:
                 success=False,
                 duration_ms=duration_ms,
                 error=err_msg,
+            )
+            _emit(
+                "tool_execution_completed",
+                tool_name=tool_name,
+                success=False,
+                duration_ms=duration_ms,
+                error=err_msg,
+                risk_level=RiskLevel.MEDIUM.value,
+                policy_decision="execution_failed",
             )
             return ToolResult(
                 success=False,

@@ -201,6 +201,34 @@ class AsyncPipeline:
 
         return False
 
+    @staticmethod
+    def _transcript_is_usable(text: str) -> bool:
+        """
+        Check if a transcript is worth processing.
+        Filters out noise, empty results, and transcription artifacts.
+        """
+        if not text or not text.strip():
+            return False
+
+        cleaned = re.sub(r"\s+", " ", text.strip().lower())
+
+        # Too short to be a real command
+        if len(cleaned.split()) < 2:
+            return False
+
+        noise_patterns = [
+            "thank you",
+            "thanks for watching",
+            "please subscribe",
+            "[music]",
+            "[applause]",
+            "...",
+        ]
+        if any(p in cleaned for p in noise_patterns):
+            return False
+
+        return True
+
     def _should_use_rag(self, command: str) -> bool:
         """
         Determine if this command should get RAG context injected.
@@ -577,6 +605,7 @@ class AsyncPipeline:
 
     async def _handle_once(self) -> None:
         cid = bind_correlation_id(uuid4().hex)
+        turn_start = time.perf_counter()
         self._set_state(AssistantState.LISTENING)
         logger.debug("pipeline_listening_started", cid=cid)
         
@@ -630,10 +659,18 @@ class AsyncPipeline:
                 metrics.record_latency("stt_ms", (time.perf_counter() - stt_start) * 1000)
             except asyncio.TimeoutError:
                 logger.warning("transcription_timeout", cid=cid)
+                self.event_bus.emit(
+                    "error_occurred",
+                    {"component": "stt", "error": "transcription_timeout"},
+                )
                 self._set_state(AssistantState.IDLE)
                 return
             except Exception as e:
                 logger.error("transcription_failed", error=str(e), exc_info=True)
+                self.event_bus.emit(
+                    "error_occurred",
+                    {"component": "stt", "error": str(e)},
+                )
                 self._set_state(AssistantState.IDLE)
                 return
 
@@ -657,6 +694,14 @@ class AsyncPipeline:
                 )
             self.event_bus.emit("transcript_received", {"text": identified_text, "correlation_id": cid})
             logger.debug("transcript_final", text=identified_text)
+
+            if not self._transcript_is_usable(identified_text):
+                logger.info(
+                    "transcript_rejected_low_quality",
+                    transcript=identified_text,
+                )
+                self._set_state(AssistantState.IDLE)
+                return
 
             effective_mode = self._effective_activation_mode()
             preprocessed_text = apply_wake_word_aliases(identified_text)
@@ -779,6 +824,10 @@ class AsyncPipeline:
                 )
             except asyncio.TimeoutError:
                 logger.error("pipeline_llm_timeout", turn_id=cid)
+                self.event_bus.emit(
+                    "error_occurred",
+                    {"component": "llm", "error": "pipeline_llm_timeout"},
+                )
                 await self.tts.speak("I didn't get a response in time. Please try again.")
                 self._set_state(AssistantState.IDLE)
                 return
@@ -800,4 +849,10 @@ class AsyncPipeline:
 
             self._set_state(AssistantState.IDLE)
         finally:
+            try:
+                duration_ms = (time.perf_counter() - turn_start) * 1000
+                metrics.record_latency("turn_ms", duration_ms)
+                self.event_bus.emit("turn_completed", {"duration_ms": duration_ms})
+            except Exception:
+                pass
             clear_correlation_id()

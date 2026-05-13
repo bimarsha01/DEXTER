@@ -24,7 +24,7 @@ class ModelsConfig(BaseModel):
     primary_llm: str = "gemini-2.0-flash"
     fallback_llm: str = "llama-3.3-70b-versatile"
     local_llm: str = "qwen3-coder:480b-cloud"
-    whisper_model: str = "small.en"
+    whisper_model: str = "medium.en"
     tts_voice: str = "en-GB-RyanNeural"
 
 
@@ -123,6 +123,11 @@ class AudioSettingsConfig(BaseModel):
     sample_rate: int = 16000
     chunk_size: int = 512
     device_index: int | None = None
+    vad_threshold: float = 0.3
+    min_speech_duration_ms: int = 100
+    min_silence_duration_ms: int = 800
+    speech_pad_ms: int = 400
+    max_speech_duration_s: int = 30
 
 
 class SpeedConfig(BaseModel):
@@ -134,6 +139,7 @@ class SpeedConfig(BaseModel):
 class SttConfig(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
+    model: str | None = None
     beam_size: int = 5
     best_of: int = 5
     temperature: float = 0.0

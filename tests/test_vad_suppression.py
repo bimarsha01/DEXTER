@@ -26,13 +26,13 @@ def test_vad_suppress_for_prevents_speech_callback_within_window(monkeypatch):
         def __len__(self):
             return 512
 
-    # Speech probability: first processed chunk => speech, second processed chunk => silence.
+    # Speech probability: first 4 processed chunks => speech, then silence.
     call_state = {"i": 0}
 
     def fake_model(_tensor_chunk, _sample_rate):
         i = call_state["i"]
         call_state["i"] += 1
-        return FakeProb(0.9 if i == 0 else 0.0)
+        return FakeProb(0.9 if i < 4 else 0.0)
 
     fake_utils = (
         lambda *_a, **_kw: [],
@@ -75,7 +75,7 @@ def test_vad_suppress_for_prevents_speech_callback_within_window(monkeypatch):
     def run_listen():
         results["out"] = listener.listen(
             output_file=None,
-            silence_threshold=0.01,  # short; will be overridden to 0.8 after first speech
+            silence_threshold=None,  # use configured 0.8s default
             on_speech_start=on_speech_start,
             on_clap=None,
         )
@@ -94,7 +94,8 @@ def test_vad_suppress_for_prevents_speech_callback_within_window(monkeypatch):
     # Chunk 2: enqueue only after suppression window has elapsed.
     while real_time.time() - suppress_start < 2.05:
         real_time.sleep(0.01)
-    listener.q.put([0.0] * 512)  # speech
+    for _ in range(4):
+        listener.q.put([0.0] * 512)  # speech
 
     # Chunk 3: initial silence (sets silence_start_time).
     listener.q.put([0.0] * 512)  # silence
