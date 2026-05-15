@@ -255,15 +255,16 @@ class IntentRouter:
         return IntentDecision(action="none")
 
     def _strip_filler_prefixes(self, text: str) -> str:
-        cleaned = re.sub(r"[.!?]+$", "", text.strip())
+        cleaned = re.sub(r"[?.!,]+$", "", (text or "").strip().lower())
         cleaned = re.sub(r"\s+", " ", cleaned).strip()
         if not cleaned:
             return cleaned
-        tokens = cleaned.split(" ")
-        fillers = {"ok", "okay", "hey", "hi", "dexter", "please"}
-        while tokens and tokens[0] in fillers:
-            tokens.pop(0)
-        return " ".join(tokens)
+        cleaned = re.sub(
+            r"^(?:\b(?:ok|okay|hey|hi|hello|dexter|please)\b[,\s]*)+",
+            "",
+            cleaned,
+        ).strip()
+        return cleaned
 
     def _resolve_known_url(self, target: str) -> str:
         clean = target.strip().lower()

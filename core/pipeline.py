@@ -141,9 +141,16 @@ class AsyncPipeline:
             return [p for p in parts[:-1] if p.strip()], ""
         return [p for p in parts[:-1] if p.strip()], parts[-1]
 
-    @staticmethod
-    def _looks_actionable_utterance(text: str) -> bool:
-        normalized = (text or "").strip().lower()
+    def _strip_leading_fillers(self, text: str) -> str:
+        cleaned = re.sub(r"[^a-zA-Z0-9\s]", " ", (text or "").strip().lower())
+        tokens = [t for t in cleaned.split() if t]
+        fillers = {"hey", "hi", "hello", "ok", "okay", "dexter"}
+        while tokens and tokens[0] in fillers:
+            tokens.pop(0)
+        return " ".join(tokens)
+
+    def _looks_actionable_utterance(self, text: str) -> bool:
+        normalized = self._strip_leading_fillers(text)
         if not normalized:
             return False
 
@@ -236,7 +243,10 @@ class AsyncPipeline:
         RAG helps for knowledge questions about files and projects. It does not
         help for simple PC control commands.
         """
-        words = (command or "").lower().split()
+        cleaned = self._strip_leading_fillers(command)
+        if self._looks_actionable_utterance(cleaned):
+            return False
+        words = (cleaned or "").split()
         if len(words) < 4:
             return False
 
@@ -401,6 +411,8 @@ class AsyncPipeline:
         return expanded
 
     async def _get_rag_context(self, query: str) -> str:
+        if self._looks_actionable_utterance(query):
+            return ""
         rag_index = getattr(self.memory, "personal_rag", None)
         if rag_index is None:
             return ""
@@ -604,6 +616,8 @@ class AsyncPipeline:
             watchdog.cancel()
 
     async def _handle_once(self) -> None:
+        command_text = "<pending>"
+        print(f"[DEBUG] _handle_once called with: {command_text}")
         cid = bind_correlation_id(uuid4().hex)
         turn_start = time.perf_counter()
         self._set_state(AssistantState.LISTENING)

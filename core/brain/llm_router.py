@@ -834,6 +834,12 @@ class Brain:
                 logger.warning("groq_stream_failed", error=str(e), exc_info=True)
                 self._emit_llm_event("llm_stream_failed", provider="groq", error=str(e))
 
+                decision = self.intent_router.detect_intent(user_command)
+                if decision.action in {"tool", "ask", "vision"}:
+                    response_text = await self.process_command(user_command, long_term_memory, indexed_context)
+                    yield response_text
+                    return
+
         if self._can_use_provider("ollama", self.ollama_available):
             try:
                 self._emit_llm_event("llm_stream_started", provider="ollama")
