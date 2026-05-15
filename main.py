@@ -102,6 +102,11 @@ async def main():
             condition_on_previous_text=runtime_config.stt.condition_on_previous_text,
             initial_prompt=runtime_config.stt.initial_prompt,
         )
+        if not safe_mode:
+            try:
+                await asyncio.to_thread(transcriber.warm_up)
+            except Exception as e:
+                logger.warning("transcriber_warmup_failed", error=str(e))
 
         # Load Silero VAD for voice activity detection.
         # If torch/VAD is unavailable, keep the assistant alive with listening disabled.

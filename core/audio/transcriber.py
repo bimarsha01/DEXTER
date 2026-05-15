@@ -75,6 +75,15 @@ class DexterTranscriber:
             temperature=self.temperature,
         )
 
+    def warm_up(self) -> None:
+        """Preload the Whisper model so the first transcription doesn't time out."""
+        try:
+            logger.info("transcriber_warmup_started", model_size=self.model_size)
+            self._ensure_model()
+            logger.info("transcriber_warmup_completed", model_size=self.model_size)
+        except Exception as e:
+            logger.warning("transcriber_warmup_failed", error=str(e))
+
     def _ensure_model(self) -> WhisperModel:
         if self._model is not None:
             return self._model
