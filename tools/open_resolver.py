@@ -25,7 +25,7 @@ def resolve_open_target(query: str | None = None, match_id: str | None = None, s
     if not query or not query.strip():
         return {
             "status": "error",
-            "message": "Please tell me what to open, sir.",
+            "message": "Please tell me what to open.",
         }
 
     index = get_open_target_index()
@@ -33,7 +33,7 @@ def resolve_open_target(query: str | None = None, match_id: str | None = None, s
     if not matches:
         return {
             "status": "not_found",
-            "message": "I could not find anything matching that name, sir. Could you spell it out or describe it differently?",
+            "message": "I could not find anything matching that name. Could you spell it out or describe it differently?",
         }
 
     best = matches[0]
@@ -65,21 +65,21 @@ def _resolve_selection(match_id: str, selection: str) -> dict:
     if not payload:
         return {
             "status": "not_found",
-            "message": "That request expired, sir. Please try again.",
+            "message": "That request expired. Please try again.",
         }
 
     if time.time() > payload.get("expires_at", 0):
         _PENDING_MATCHES.pop(match_id, None)
         return {
             "status": "not_found",
-            "message": "That request expired, sir. Please try again.",
+            "message": "That request expired. Please try again.",
         }
 
     options = payload.get("options", [])
     if not options:
         return {
             "status": "not_found",
-            "message": "I could not find any options for that request, sir.",
+            "message": "I could not find any options for that request.",
         }
 
     selection_text = selection.strip().lower()
@@ -110,7 +110,7 @@ def _resolve_selection(match_id: str, selection: str) -> dict:
 
     return {
         "status": "ask",
-        "message": "Please say the option number or name, sir.",
+        "message": "Please say the option number or name.",
         "match_id": match_id,
     }
 
@@ -131,7 +131,7 @@ def _parse_option_index(text: str) -> int | None:
 
 
 def _format_options(matches) -> str:
-    lines = ["I found a few matches, sir. Did you mean:"]
+    lines = ["I found a few matches. Did you mean:"]
     for idx, match in enumerate(matches, start=1):
         candidate = match.candidate
         label = _describe_candidate(candidate)
@@ -154,19 +154,19 @@ def _describe_candidate(candidate) -> str:
 
 def _open_candidate(candidate) -> str:
     if candidate.source == "process":
-        return f"{candidate.name} is already running, sir."
+        return f"{candidate.name} is already running."
 
     if candidate.path:
         if not _is_path_allowed(candidate.path):
-            return "That location is not allowed by the current security policy, sir."
+            return "That location is not allowed by the current security policy."
         try:
             os.startfile(candidate.path)
-            return f"Opened {candidate.name}, sir."
+            return f"Opened {candidate.name}."
         except Exception as e:
             logger.error("open_target_failed", name=candidate.name, error=str(e), exc_info=True)
-            return f"I could not open {candidate.name}, sir."
+            return f"I could not open {candidate.name}."
 
-    return f"I could not open {candidate.name}, sir."
+    return f"I could not open {candidate.name}."
 
 
 def _is_path_allowed(path: str) -> bool:

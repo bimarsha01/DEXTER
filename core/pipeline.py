@@ -8,12 +8,13 @@ from rapidfuzz import fuzz
 from uuid import uuid4
 from typing import Optional
 
-from core.event_bus import EventBus
+from core.activation_manager import ActivationConfig, ActivationManager
+from core.event_bus import EventBus, DexterEvents
 from core.health import HealthMonitor
 from core.state_machine import AssistantState
 from core.wake_word.detector import WakeWordDetector
 from core.session_activity import session_activity
-from utils.transcript_correction import TranscriptCorrector, apply_wake_word_aliases
+from utils.transcript_correction import TranscriptCorrector, apply_wake_word_corrections
 from utils.logger import get_logger, bind_correlation_id, clear_correlation_id
 from utils.metrics import metrics
 from utils.config import DexterConfig
@@ -33,6 +34,7 @@ class AsyncPipeline:
         brain,
         event_bus: Optional[EventBus] = None,
         health_monitor: Optional[HealthMonitor] = None,
+        asr_engine=None,
     ) -> None:
         self.config = config
         self.transcriber = transcriber
@@ -42,6 +44,8 @@ class AsyncPipeline:
         self.brain = brain
         self.event_bus = event_bus or EventBus()
         self.health_monitor = health_monitor
+        self.asr_engine = asr_engine
+        self._last_transcript = ""
 
         self.state = AssistantState.IDLE
         self._state_changed_at = time.time()
@@ -76,10 +80,50 @@ class AsyncPipeline:
         self._consecutive_activation_drops = 0
         self._always_on_until = 0.0
 
+        act = config.activation
+        smart_mode = (act.mode or "smart").strip().lower()
+        if smart_mode not in {"smart", "wake_word", "always_on"}:
+            smart_mode = "wake_word" if self.activation_mode == "wake_word" else "smart"
+        self._activation = ActivationManager(
+            ActivationConfig(
+                mode=smart_mode,  # type: ignore[arg-type]
+                wake_word=(act.wake_word or "dexter").strip().lower(),
+                active_hours_start=getattr(act, "active_hours_start", "09:00"),
+                active_hours_end=getattr(act, "active_hours_end", "18:00"),
+                active_days=getattr(act, "active_days", None),
+                always_on_after_n_interactions=int(
+                    getattr(act, "always_on_after_n_interactions", 3) or 3
+                ),
+                always_on_window_seconds=float(
+                    getattr(act, "always_on_window_seconds", 120) or 120
+                ),
+                always_on_timeout_seconds=float(
+                    getattr(act, "always_on_timeout_seconds", 300) or 300
+                ),
+            )
+        )
+
+    def _contains_wake_word(self, text: str) -> bool:
+        if self.wake_detector is None:
+            return False
+        return bool(self.wake_detector.detect(text).triggered)
+
+    def _strip_wake_word(self, text: str) -> str:
+        if self.wake_detector is None:
+            return text
+        detection = self.wake_detector.detect(text)
+        if detection.triggered and detection.cleaned_text.strip():
+            return detection.cleaned_text
+        return text
+
     def _effective_activation_mode(self) -> str:
+        if self.activation_mode == "clap":
+            return "clap"
         if self._always_on_until > time.time():
             return "always_on"
-        return self.activation_mode
+        if self._activation.current_mode == "always_on":
+            return "always_on"
+        return "wake_word"
 
     def _record_activation_drop(self, transcript_text: str, reason: str) -> None:
         self._consecutive_activation_drops += 1
@@ -109,12 +153,26 @@ class AsyncPipeline:
                 to_state=state.name,
             )
             self.event_bus.emit("state_changed", {"state": state.name})
+            rag_index = getattr(self.memory, "personal_rag", None)
+            if rag_index is not None and hasattr(rag_index, "set_pipeline_state"):
+                try:
+                    rag_index.set_pipeline_state(state.name)
+                except Exception:
+                    pass
             if state == AssistantState.PROCESSING:
                 session_activity.mark_active()
             elif state == AssistantState.IDLE:
                 session_activity.mark_idle()
             if self.health_monitor is not None:
                 self.health_monitor.healthy("pipeline", f"state={state.name}")
+
+    def _log_activation_failure(self, transcript_text: str, reason: str) -> None:
+        logger.warning(
+            "command_dropped_activation_failed",
+            transcript=transcript_text[:50],
+            reason=reason,
+            activation_mode=self.config.activation.mode,
+        )
 
     def _is_awake(self) -> bool:
         return time.time() < self.awake_until
@@ -133,7 +191,8 @@ class AsyncPipeline:
         if self._loop:
             self._loop.call_soon_threadsafe(self._handle_clap_activation)
 
-    def _split_sentences(self, text: str) -> tuple[list[str], str]:
+    @staticmethod
+    def _split_sentences(text: str) -> tuple[list[str], str]:
         parts = re.split(r"(?<=[.!?])\s+", text)
         if len(parts) <= 1:
             return [], text
@@ -141,7 +200,8 @@ class AsyncPipeline:
             return [p for p in parts[:-1] if p.strip()], ""
         return [p for p in parts[:-1] if p.strip()], parts[-1]
 
-    def _strip_leading_fillers(self, text: str) -> str:
+    @staticmethod
+    def _strip_leading_fillers(text: str) -> str:
         cleaned = re.sub(r"[^a-zA-Z0-9\s]", " ", (text or "").strip().lower())
         tokens = [t for t in cleaned.split() if t]
         fillers = {"hey", "hi", "hello", "ok", "okay", "dexter"}
@@ -149,8 +209,9 @@ class AsyncPipeline:
             tokens.pop(0)
         return " ".join(tokens)
 
-    def _looks_actionable_utterance(self, text: str) -> bool:
-        normalized = self._strip_leading_fillers(text)
+    @staticmethod
+    def _looks_actionable_utterance(text: str) -> bool:
+        normalized = AsyncPipeline._strip_leading_fillers(text)
         if not normalized:
             return False
 
@@ -209,6 +270,38 @@ class AsyncPipeline:
         return False
 
     @staticmethod
+    def _detect_activation_command(text: str) -> tuple[str, float, str] | None:
+        """Voice commands to switch activation mode. Returns (mode, duration_sec, spoken)."""
+        normalized = re.sub(r"\s+", " ", (text or "").lower().strip())
+        commands = {
+            "stay active": ("always_on", 3600.0, "I'll stay active for the next hour."),
+            "go passive": ("wake_word", 3600.0, "Going passive — say Dexter when you need me."),
+            "always listen": ("always_on", 86400.0, "Always listening."),
+            "go quiet": ("wake_word", 86400.0, "Going quiet."),
+            "active mode": ("always_on", 3600.0, "Active mode on."),
+            "passive mode": ("wake_word", 3600.0, "Passive mode on."),
+        }
+        for phrase, payload in commands.items():
+            if normalized == phrase or normalized.endswith(phrase):
+                return payload
+        return None
+
+    def _detect_correction_intent(self, text: str) -> str | None:
+        """Detect if the user is explicitly correcting the previous misheard command."""
+        text = text.lower().strip()
+        patterns = [
+            r"^no i said\s+(.+)$",
+            r"^i meant\s+(.+)$",
+            r"^no,? i meant\s+(.+)$",
+            r"^not that,? i meant\s+(.+)$"
+        ]
+        for p in patterns:
+            m = re.match(p, text)
+            if m:
+                return m.group(1).strip()
+        return None
+
+    @staticmethod
     def _transcript_is_usable(text: str) -> bool:
         """
         Check if a transcript is worth processing.
@@ -238,38 +331,48 @@ class AsyncPipeline:
 
     def _should_use_rag(self, command: str) -> bool:
         """
-        Determine if this command should get RAG context injected.
-
-        RAG helps for knowledge questions about files and projects. It does not
-        help for simple PC control commands.
+        Determine if this command benefits from personal file context.
+        Prefer injecting context when uncertain — missing context hurts more
+        than an extra retrieval.
         """
-        cleaned = self._strip_leading_fillers(command)
-        if self._looks_actionable_utterance(cleaned):
-            return False
-        words = (cleaned or "").split()
-        if len(words) < 4:
+        words = (command or "").lower().split()
+        word_count = len(words)
+
+        if word_count < 3:
             return False
 
-        skip_words = {
-            "open",
-            "close",
-            "launch",
-            "start",
-            "volume",
-            "screenshot",
-            "lock",
-            "shutdown",
-            "restart",
-            "sleep",
-            "type",
-            "press",
-            "click",
-            "search",
+        hard_skip_starters = {
+            "open", "close", "launch", "start",
+            "shutdown", "restart", "sleep", "lock",
+            "volume", "mute", "unmute", "screenshot",
+            "type", "press", "click", "minimize",
+            "maximize", "play", "pause", "stop",
         }
-        if words[0] in skip_words and len(words) < 6:
+        if words[0] in hard_skip_starters and word_count <= 5:
             return False
 
-        return True
+        knowledge_triggers = {
+            "what", "tell", "explain", "describe",
+            "summarize", "summarise", "how", "why",
+            "show", "give", "find", "search", "look",
+            "read", "check", "review", "analyse",
+            "analyze", "about", "regarding",
+        }
+        if words[0] in knowledge_triggers:
+            return True
+
+        project_indicators = [
+            "project", "folder", "file", "code",
+            "function", "class", "module", "script",
+            "lab", "assignment", "document", "report",
+            "userauth", "bimarsha", "practical",
+            "office", "reporting", "dexter",
+        ]
+        command_lower = command.lower()
+        if any(p in command_lower for p in project_indicators):
+            return True
+
+        return word_count > 6
 
     def _extract_file_reference(self, command: str) -> tuple[str | None, str | None, str | None]:
         """
@@ -378,6 +481,19 @@ class AsyncPipeline:
         key_words = [w for w in words if w not in stop_words and len(w) > 2]
         return " ".join(key_words)
 
+    def _active_llm_provider(self) -> str:
+        """Best-effort guess of which provider will handle this turn."""
+        try:
+            if self.brain.gemini_available and self.brain._can_use_gemini():
+                return "gemini"
+            if self.brain.groq_available and self.brain._can_use_provider("groq", True):
+                return "groq"
+            if self.brain.ollama_available:
+                return "ollama"
+        except Exception:
+            pass
+        return "gemini"
+
     def _expand_project_query(self, query: str) -> str:
         """Expand project knowledge questions with likely code/file terms."""
         query_lower = (query or "").lower()
@@ -410,9 +526,7 @@ class AsyncPipeline:
 
         return expanded
 
-    async def _get_rag_context(self, query: str) -> str:
-        if self._looks_actionable_utterance(query):
-            return ""
+    async def _get_rag_context(self, query: str, provider: str = "gemini") -> str:
         rag_index = getattr(self.memory, "personal_rag", None)
         if rag_index is None:
             return ""
@@ -422,60 +536,111 @@ class AsyncPipeline:
                 logger.debug("[RAG] index still warming up, context will be empty this turn")
                 return ""
         except Exception:
-            # If readiness probing fails, fall back to best-effort context building.
             pass
+
+        timeout = 1.5 if getattr(rag_index, "_indexing_active", False) else 3.0
 
         try:
             loop = asyncio.get_running_loop()
-            # If command seems like a direct file reference, attempt to resolve the exact file first
             folder_hint, subfolder_hint, filename_hint = self._extract_file_reference(query)
             if any((folder_hint, subfolder_hint, filename_hint)):
                 try:
-                    direct = await asyncio.wait_for(loop.run_in_executor(None, partial(self._resolve_file_by_description, folder_hint, subfolder_hint, filename_hint, rag_index)), timeout=2.0)
+                    direct = await asyncio.wait_for(
+                        loop.run_in_executor(
+                            None,
+                            partial(
+                                self._resolve_file_by_description,
+                                folder_hint,
+                                subfolder_hint,
+                                filename_hint,
+                                rag_index,
+                            ),
+                        ),
+                        timeout=timeout,
+                    )
                     if direct:
                         logger.info("rag_direct_file_context", query=query, method="direct_read")
                         return direct
                 except Exception:
                     pass
+
             search_query = self._expand_project_query(query)
 
             def _search_matches(q: str):
-                return rag_index.search(q, limit=3, use_cache=False)
+                return rag_index.search(q, limit=5, use_cache=True)
 
-            results = await asyncio.wait_for(loop.run_in_executor(None, partial(_search_matches, search_query)), timeout=2.0)
+            results = await asyncio.wait_for(
+                loop.run_in_executor(None, partial(_search_matches, search_query)),
+                timeout=timeout,
+            )
 
             top_score = float(results[0].get("score", 0.0)) if results else 0.0
             if not results or top_score < 58.0:
                 key_nouns = self._extract_key_nouns(query)
                 if key_nouns and key_nouns != search_query:
-                    fallback_results = await asyncio.wait_for(loop.run_in_executor(None, partial(_search_matches, key_nouns)), timeout=2.0)
+                    fallback_results = await asyncio.wait_for(
+                        loop.run_in_executor(None, partial(_search_matches, key_nouns)),
+                        timeout=timeout,
+                    )
                     if fallback_results and float(fallback_results[0].get("score", 0.0)) >= top_score:
                         results = fallback_results
                         search_query = key_nouns
                         top_score = float(results[0].get("score", 0.0))
 
             if not results:
+                self.event_bus.emit(
+                    DexterEvents.RAG_CONTEXT_EMPTY,
+                    {"query": query, "reason": "no_matches"},
+                )
                 return ""
 
+            def _format_context():
+                if hasattr(rag_index, "format_context_for_provider"):
+                    return rag_index.format_context_for_provider(
+                        results, search_query, provider
+                    )
+                return rag_index.build_context(search_query, limit=3)
+
             context = await asyncio.wait_for(
-                loop.run_in_executor(None, rag_index.build_context, search_query, 3),
-                timeout=2.0,
+                loop.run_in_executor(None, _format_context),
+                timeout=timeout,
             )
             if not context:
                 return ""
 
             logger.info(
                 "rag_context_injected",
-                query=query,
-                search_query=search_query,
+                query=query[:80],
+                search_query=search_query[:80],
+                provider=provider,
                 results_count=len(results),
-                top_score=top_score,
-                sources=[r.get("title") or os.path.basename(r.get("path", "")) for r in results],
+                top_score=round(top_score, 2),
+                sources=[
+                    os.path.basename((r.get("path") or "").replace("\\", "/"))
+                    for r in results
+                ],
             )
-            return context or ""
+            self.event_bus.emit(
+                DexterEvents.RAG_CONTEXT_USED,
+                {
+                    "query": query,
+                    "provider": provider,
+                    "sources": [
+                        {
+                            "path": r.get("path"),
+                            "chunk_label": (r.get("metadata") or {}).get("chunk_label"),
+                            "chunk_type": (r.get("metadata") or {}).get("chunk_type"),
+                            "score": r.get("score"),
+                            "rerank_score": r.get("rerank_score"),
+                        }
+                        for r in results
+                    ],
+                },
+            )
+            return context
 
         except asyncio.TimeoutError:
-            logger.warning("rag_context_timeout", query=query)
+            logger.warning("rag_context_timeout", query=query[:80], provider=provider)
             return ""
         except Exception as e:
             logger.error("rag_context_failed", error=str(e), exc_info=True)
@@ -574,6 +739,7 @@ class AsyncPipeline:
                 logger.error("tts_speak_failed", error=str(e), exc_info=True)
                 self.event_bus.emit("error_occurred", {"component": "tts", "error": str(e)})
 
+        self.event_bus.emit("response_completed", {"text": response_text.strip()})
         return response_text.strip()
 
     async def _watchdog(self) -> None:
@@ -616,8 +782,6 @@ class AsyncPipeline:
             watchdog.cancel()
 
     async def _handle_once(self) -> None:
-        command_text = "<pending>"
-        print(f"[DEBUG] _handle_once called with: {command_text}")
         cid = bind_correlation_id(uuid4().hex)
         turn_start = time.perf_counter()
         self._set_state(AssistantState.LISTENING)
@@ -718,13 +882,39 @@ class AsyncPipeline:
                 return
 
             effective_mode = self._effective_activation_mode()
-            preprocessed_text = apply_wake_word_aliases(identified_text)
+            preprocessed_text = apply_wake_word_corrections(identified_text)
+
+            activation_cmd = self._detect_activation_command(preprocessed_text)
+            if activation_cmd:
+                mode, duration, spoken = activation_cmd
+                self._activation.set_override(mode, duration)  # type: ignore[arg-type]
+                self.event_bus.emit(
+                    DexterEvents.ACTIVATION_MODE_CHANGED,
+                    {"mode": mode, "reason": "voice_command", "duration": duration},
+                )
+                await self.tts.speak(spoken)
+                self._set_state(AssistantState.IDLE)
+                return
+
+            # Detect explicit correction ("I meant X") and train ASR engine
+            if self.asr_engine and self._last_transcript:
+                intended = self._detect_correction_intent(preprocessed_text)
+                if intended:
+                    self.asr_engine.confirm_correction(self._last_transcript, intended)
+                    preprocessed_text = intended
+                    logger.info("user_corrected_asr", wrong=self._last_transcript, right=intended)
+
+            self._last_transcript = preprocessed_text
 
             if effective_mode == "wake_word":
                 detection = self.wake_detector.detect(preprocessed_text) if self.wake_detector else None
                 bypass_activation = False
 
                 if detection and detection.triggered:
+                    self.event_bus.emit(
+                        DexterEvents.WAKE_WORD_DETECTED,
+                        {"transcript": preprocessed_text[:80]},
+                    )
                     self._open_wake_window()
                     clean_command = detection.cleaned_text
                     if not clean_command.strip():
@@ -743,7 +933,13 @@ class AsyncPipeline:
                         self._open_wake_window()
                         logger.info("activation_bypassed", mode="wake_word", reason="actionable_utterance")
                     else:
+                        self._activation.record_drop()
+                        self._log_activation_failure(preprocessed_text, "wake_word_not_found")
                         self._record_activation_drop(preprocessed_text, "wake_word_not_detected")
+                        self.event_bus.emit(
+                            DexterEvents.COMMAND_DROPPED,
+                            {"reason": "wake_word_required", "transcript": preprocessed_text[:50]},
+                        )
                         self._set_state(AssistantState.IDLE)
                         return
 
@@ -757,6 +953,7 @@ class AsyncPipeline:
                         self._open_wake_window()
                         logger.info("activation_bypassed", mode=effective_mode, reason="actionable_utterance")
                     else:
+                        self._log_activation_failure(preprocessed_text, "activation_not_awake")
                         self._set_state(AssistantState.IDLE)
                         return
 
@@ -771,6 +968,12 @@ class AsyncPipeline:
                     return
 
             self._reset_activation_drop_counter()
+            self._activation.record_interaction()
+            prev_mode = self._activation.current_mode
+            self.event_bus.emit(
+                DexterEvents.ACTIVATION_MODE_CHANGED,
+                {"mode": prev_mode, "reason": "interaction"},
+            )
             logger.info("command_accepted", command=clean_command)
             # Advance turn counter for this accepted command
             self._turn_count += 1
@@ -818,11 +1021,25 @@ class AsyncPipeline:
                 except asyncio.TimeoutError:
                     pass
 
-                rag_context = await self._get_rag_context(rag_query) if self._should_use_rag(clean_command) else ""
+                rag_context = (
+                    await self._get_rag_context(rag_query, provider=self._active_llm_provider())
+                    if self._should_use_rag(clean_command)
+                    else ""
+                )
                 if rag_context:
                     rag_context = f"[Context: user is currently asking about {proj.get('name')}]\n" + rag_context
             else:
-                rag_context = await self._get_rag_context(clean_command) if self._should_use_rag(clean_command) else ""
+                rag_context = (
+                    await self._get_rag_context(clean_command, provider=self._active_llm_provider())
+                    if self._should_use_rag(clean_command)
+                    else ""
+                )
+            logger.debug(
+                "rag_context_result",
+                has_context=bool(rag_context),
+                context_length=len(rag_context) if rag_context else 0,
+                preview=rag_context[:100] if rag_context else "EMPTY",
+            )
             augmented_command = clean_command
             if rag_context:
                 augmented_command = f"{rag_context}\nUser question: {clean_command}"
@@ -860,6 +1077,13 @@ class AsyncPipeline:
                 )
             except Exception as e:
                 logger.error("memory_save_failed", error=str(e), exc_info=True)
+
+            rag_proxy = getattr(self.memory, "personal_rag", None)
+            if rag_proxy is not None and hasattr(rag_proxy, "on_voice_activity"):
+                try:
+                    rag_proxy.on_voice_activity()
+                except Exception:
+                    pass
 
             self._set_state(AssistantState.IDLE)
         finally:

@@ -126,25 +126,10 @@ def detect_hardware() -> HardwareProfile:
 
 
 def _detect_gpu() -> bool:
-    """
-    Attempt to detect GPU presence.
-    
-    Returns:
-        True if GPU is likely available.
-    """
-    # Check for CUDA via environment
+    """Attempt to detect GPU presence."""
     if os.environ.get("CUDA_VISIBLE_DEVICES"):
         return True
-    
-    # Try importing torch and checking for CUDA
-    try:
-        import torch
-        if torch.cuda.is_available():
-            return True
-    except ImportError:
-        pass
-    
-    return False
+    return _check_gpu()
 
 
 def get_low_power_settings(profile_name: str = None) -> LowPowerSettings:
@@ -169,6 +154,64 @@ def get_low_power_settings(profile_name: str = None) -> LowPowerSettings:
         profile_name = "standard"
     
     return PROFILES[profile_name]
+
+
+def _check_gpu() -> bool:
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            return True
+    except ImportError:
+        pass
+    try:
+        import subprocess
+
+        result = subprocess.run(
+            ["nvidia-smi"],
+            capture_output=True,
+            timeout=3,
+        )
+        return result.returncode == 0
+    except Exception:
+        return False
+
+
+def get_recommended_config() -> dict:
+    """
+    Returns recommended config values based on detected hardware.
+    Called once at startup to auto-configure.
+    """
+    ram_gb = psutil.virtual_memory().total / (1024**3)
+    cpu_cores = psutil.cpu_count(logical=False) or psutil.cpu_count(logical=True) or 1
+    has_gpu = _check_gpu()
+
+    if has_gpu:
+        whisper_model = "small.en"
+        embedding_threads = 4
+        note = "GPU detected — using enhanced models"
+    elif ram_gb >= 16 and cpu_cores >= 8:
+        whisper_model = "base.en"
+        embedding_threads = 4
+        note = "High-end CPU — using base Whisper"
+    elif ram_gb >= 8:
+        whisper_model = "base.en"
+        embedding_threads = 2
+        note = "Mid-range CPU — using base Whisper"
+    else:
+        whisper_model = "tiny.en"
+        embedding_threads = 1
+        note = "Low-end CPU — using tiny Whisper for responsiveness"
+
+    return {
+        "whisper_model": whisper_model,
+        "embedding_threads": embedding_threads,
+        "disable_rag_warming": ram_gb < 6,
+        "note": note,
+        "ram_gb": round(ram_gb, 1),
+        "cpu_cores": cpu_cores,
+        "has_gpu": has_gpu,
+    }
 
 
 def apply_low_power_overrides(config_dict: dict) -> dict:

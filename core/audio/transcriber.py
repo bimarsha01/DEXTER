@@ -61,9 +61,11 @@ class DexterTranscriber:
                 if vocab_prompt and len(vocab_prompt.strip()) > 10:
                     self.initial_prompt = vocab_prompt.strip()
                 else:
-                    self.initial_prompt = getattr(cfg.stt, "initial_prompt", DEFAULT_INITIAL_PROMPT).strip()
+                    self.initial_prompt = self._build_initial_prompt(cfg)
             except Exception:
                 self.initial_prompt = DEFAULT_INITIAL_PROMPT
+        
+        self._initial_prompt = getattr(self, 'initial_prompt', DEFAULT_INITIAL_PROMPT)
         self.model_size = model_size
         self._model: WhisperModel | None = None
         self._model_lock = threading.Lock()
@@ -103,38 +105,75 @@ class DexterTranscriber:
 
         return self._model
 
-    def _normalize_audio(self, audio_path: str) -> str:
-        """
-        Normalize audio volume to a consistent level before transcription.
-        Returns the path to the normalized audio file, or the original path.
-        """
+    def _build_initial_prompt(self, config) -> str:
+        from pathlib import Path
+        import os
+        
+        base = [
+            "Dexter", "Chrome", "Spotify", 
+            "YouTube", "UserAuth", "office reporting",
+            "web practical", "Bimarsha", "Kathmandu",
+            "Spring Boot", "Java", "Python",
+            "theatre", "booking", "payment",
+            "screenshot", "volume", "weather"
+        ]
+        
+        terms = set(base)
+        
+        roots = getattr(
+            config, 'rag', None
+        )
+        personal_roots = getattr(
+            roots, 'personal_roots', []
+        ) if roots else []
+        
+        for root_str in personal_roots[:3]:
+            root = Path(
+                os.path.expandvars(
+                    root_str.replace(
+                        '%USERPROFILE%', 
+                        str(Path.home())
+                    )
+                )
+            )
+            if root.exists():
+                try:
+                    for item in root.iterdir():
+                        if item.is_dir():
+                            name = item.name.replace(
+                                '-', ' '
+                            ).replace('_', ' ')
+                            terms.add(name)
+                except PermissionError:
+                    pass
+        
+        return ", ".join(sorted(terms)[:60])
+
+    def _normalize_audio(self, path: str) -> str:
         try:
-            data, samplerate = sf.read(audio_path)
+            data, sr = sf.read(path)
             if getattr(data, "size", 0) == 0:
-                return audio_path
+                return path
             if len(getattr(data, "shape", [])) > 1:
                 data = np.mean(data, axis=1)
 
-            rms = float(np.sqrt(np.mean(data ** 2))) if data.size else 0.0
-            if rms < 0.001:
-                target_rms = 0.1
-                if rms > 0:
-                    data = data * (target_rms / rms)
-                    data = np.clip(data, -1.0, 1.0)
-                    base, ext = os.path.splitext(audio_path)
-                    norm_path = f"{base}_normalized{ext or '.wav'}"
-                    sf.write(norm_path, data, samplerate)
-                    logger.debug(
-                        "audio_normalized",
-                        original_rms=float(rms),
-                        target_rms=target_rms,
-                        path=norm_path,
-                    )
-                    return norm_path
-            return audio_path
+            rms = np.sqrt(np.mean(data**2))
+            if rms < 0.01 and rms > 0:
+                data = np.clip(
+                    data * (0.1 / rms), -1.0, 1.0
+                )
+                norm_path = path.replace(
+                    '.wav', '_norm.wav'
+                )
+                sf.write(norm_path, data, sr)
+                logger.debug("audio_normalized",
+                             original_rms=float(rms))
+                return norm_path
+            return path
         except Exception as e:
-            logger.warning("audio_normalization_failed", error=str(e))
-            return audio_path
+            logger.warning("audio_norm_failed",
+                           error=str(e))
+            return path
 
     def transcribe(self, audio_file: str, on_partial=None) -> str:
         """
@@ -148,31 +187,28 @@ class DexterTranscriber:
         normalized_path = self._normalize_audio(audio_file)
         logger.debug("transcriber_run_started", path=audio_file, beam_size=self.beam_size)
         model = self._ensure_model()
-        prompt = (self.initial_prompt or "").strip()
-        if prompt:
-            if not prompt.lower().startswith("dexter"):
-                prompt = f"{DEFAULT_WAKE_PROMPT} {prompt}"
-        else:
-            prompt = DEFAULT_WAKE_PROMPT
+        prompt = DEFAULT_WAKE_PROMPT
+        extra_prompt = (self.initial_prompt or "").strip()
+        if extra_prompt:
+            if extra_prompt.lower().startswith("dexter"):
+                prompt = extra_prompt
+            else:
+                prompt = f"{DEFAULT_WAKE_PROMPT} {extra_prompt}"
         cfg = get_config()
         audio_cfg = getattr(cfg, "audio_settings", None)
         vad_params = {
-            "threshold": float(getattr(audio_cfg, "vad_threshold", 0.3)),
-            "min_speech_duration_ms": int(getattr(audio_cfg, "min_speech_duration_ms", 100)),
-            "min_silence_duration_ms": int(getattr(audio_cfg, "min_silence_duration_ms", 800)),
-            "speech_pad_ms": int(getattr(audio_cfg, "speech_pad_ms", 400)),
+            "threshold": 0.25,
+            "min_speech_duration_ms": 100,
+            "min_silence_duration_ms": 900,
+            "speech_pad_ms": 400,
         }
         segments, info = model.transcribe(
             normalized_path,
             beam_size=self.beam_size,
-            best_of=self.best_of,
+            best_of=5,
             temperature=[0.0, 0.2, 0.4],
-            patience=self.patience,
-            log_prob_threshold=self.log_prob_threshold,
-            no_speech_threshold=self.no_speech_threshold,
             condition_on_previous_text=False,
-            initial_prompt=prompt,
-            word_timestamps=False,
+            initial_prompt=self._initial_prompt,
             vad_filter=True,
             vad_parameters=vad_params,
         )

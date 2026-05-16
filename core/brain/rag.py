@@ -23,6 +23,31 @@ from core.session_activity import session_activity
 
 logger = get_logger("personal_rag")
 
+# PRE-FIX AUDIT (read before changes):
+# 1. Minimum score: config.yaml rag.minimum_relevance_score (45.0);
+#    fallback MINIMUM_RELEVANCE_SCORE (55.0) in search() via get_config().
+# 2. _boost_filename_matches: called in PersonalRAGIndex.search() after vector scoring.
+# 3. RAG injection: pipeline._get_rag_context -> augmented_command + llm_router indexed_context.
+# 4. Reranking: none before this pass (vector + fuzz boost + threshold only).
+# 5. Chunk size/overlap: config rag.chunk_size=600, rag.chunk_overlap=100
+#    (StructureAwareChunker uses MAX_CHUNK_CHARS=800 for AST chunks).
+
+# Files matching these patterns are penalized — they often contain mock/fixture data.
+DEPRIORITIZED_FILE_PATTERNS = [
+    "test_",
+    "_test.py",
+    "_spec.py",
+    "spec_",
+    "mock",
+    "fixture",
+    "conftest",
+    "rag_diagnostic",
+    "voice_command_harness",
+    "runtime_spot_check",
+]
+
+RERANKER_MODEL_DEFAULT = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+
 SUPPORTED_TEXT_EXTENSIONS = {
     ".txt", ".md", ".py", ".json", ".yaml", ".yml",
     ".csv", ".ini", ".cfg", ".toml", ".log",
@@ -47,6 +72,50 @@ SKIP_EXTENSIONS = {
 
 
 @dataclass
+class RagSearchHit:
+    """Normalized search result used for boosting, penalties, and reranking."""
+
+    path: str
+    content: str
+    score: float
+    title: str = ""
+    kind: str = "document"
+    metadata: dict = field(default_factory=dict)
+    rerank_score: float | None = None
+
+    @property
+    def filename(self) -> str:
+        return self.path or self.title or ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "path": self.path,
+            "text": self.content,
+            "content": self.content,
+            "title": self.title or os.path.basename(self.path),
+            "kind": self.kind,
+            "score": self.score,
+            "rerank_score": self.rerank_score,
+            "file_extension": self.metadata.get("file_extension", ""),
+            "parent_folder": self.metadata.get("parent_folder", ""),
+            "metadata": dict(self.metadata),
+        }
+
+    @classmethod
+    def from_payload(cls, payload: dict[str, Any]) -> "RagSearchHit":
+        path = payload.get("path") or payload.get("metadata", {}).get("filepath") or ""
+        return cls(
+            path=path,
+            content=payload.get("content") or payload.get("text") or "",
+            score=float(payload.get("score", 0.0)),
+            title=payload.get("title") or os.path.basename(path),
+            kind=payload.get("kind", "document"),
+            metadata=dict(payload.get("metadata") or {}),
+            rerank_score=payload.get("rerank_score"),
+        )
+
+
+@dataclass
 class RagChunk:
     source_path: str
     text: str
@@ -60,6 +129,10 @@ class RagChunk:
     parent_folder: str = ""
     file_size_bytes: int = 0
     indexed_at: float = field(default_factory=time.time)
+    chunk_type: str = "prose"
+    chunk_label: str = ""
+    start_line: int = 0
+    language: str = "text"
 
 
 class _LRUCache:
@@ -83,8 +156,192 @@ class _LRUCache:
             self._store.popitem(last=False)
 
 
-INDEX_SCHEMA_VERSION = 2
+INDEX_SCHEMA_VERSION = 3
 MINIMUM_RELEVANCE_SCORE = 55.0
+
+
+class StructureAwareChunker:
+    """Chunks documents based on structure, not arbitrary character counts."""
+
+    MAX_CHUNK_CHARS = 800
+    OVERLAP_CHARS = 150
+
+    def chunk(self, content: str, filepath: str) -> list[dict]:
+        ext = Path(filepath).suffix.lower()
+        language = self._detect_language(ext)
+
+        if language == "python":
+            return self._chunk_python(content, filepath)
+        if language in (
+            "java", "csharp", "kotlin", "go", "cpp",
+            "typescript", "javascript",
+        ):
+            return self._chunk_brace_language(content, filepath, language)
+        if language == "markdown":
+            return self._chunk_markdown(content, filepath)
+        if language in ("yaml", "json", "toml"):
+            return self._chunk_config(content, filepath)
+        return self._chunk_prose(content, filepath)
+
+    def _detect_language(self, ext: str) -> str:
+        lang_map = {
+            ".py": "python", ".java": "java", ".cs": "csharp",
+            ".kt": "kotlin", ".go": "go", ".cpp": "cpp", ".c": "cpp",
+            ".ts": "typescript", ".js": "javascript", ".tsx": "typescript",
+            ".md": "markdown", ".yaml": "yaml", ".yml": "yaml",
+            ".json": "json", ".toml": "toml", ".txt": "prose",
+            ".xml": "xml", ".html": "prose", ".sql": "prose",
+        }
+        return lang_map.get(ext, "prose")
+
+    def _chunk_python(self, content: str, filepath: str) -> list[dict]:
+        import ast
+
+        chunks: list[dict] = []
+        try:
+            tree = ast.parse(content)
+            lines = content.splitlines()
+            for node in ast.walk(tree):
+                if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+                    start = node.lineno - 1
+                    end = getattr(node, "end_lineno", start + 50) or (start + 50)
+                    chunk_text = "\n".join(lines[start:end])
+                    label = (
+                        f"class {node.name}"
+                        if isinstance(node, ast.ClassDef)
+                        else f"function {node.name}"
+                    )
+                    chunk_type = "class" if isinstance(node, ast.ClassDef) else "function"
+                    for sub in self._split_if_large(chunk_text, self.MAX_CHUNK_CHARS):
+                        chunks.append({
+                            "text": sub,
+                            "chunk_type": chunk_type,
+                            "chunk_label": label,
+                            "start_line": start + 1,
+                            "filepath": filepath,
+                            "language": "python",
+                        })
+        except SyntaxError:
+            return self._chunk_prose(content, filepath)
+        return chunks if chunks else self._chunk_prose(content, filepath)
+
+    def _chunk_brace_language(self, content: str, filepath: str, language: str) -> list[dict]:
+        chunks: list[dict] = []
+        lines = content.splitlines()
+        depth = 0
+        current_block: list[str] = []
+        block_start = 0
+        block_label = "block"
+
+        for i, line in enumerate(lines):
+            stripped = line.strip()
+            if depth == 0 and any(
+                kw in stripped
+                for kw in (
+                    "class ", "interface ", "enum ", "struct ", "func ",
+                    "public ", "private ", "protected ", "def ",
+                )
+            ):
+                block_label = stripped[:80]
+                block_start = i
+
+            current_block.append(line)
+            for ch in line:
+                if ch == "{":
+                    depth += 1
+                elif ch == "}":
+                    depth -= 1
+
+            if depth == 0 and current_block:
+                block_text = "\n".join(current_block)
+                if len(block_text.strip()) > 20:
+                    ctype = "class" if "class " in block_label else "function"
+                    for sub in self._split_if_large(block_text, self.MAX_CHUNK_CHARS):
+                        chunks.append({
+                            "text": sub,
+                            "chunk_type": ctype,
+                            "chunk_label": block_label[:60],
+                            "start_line": block_start + 1,
+                            "filepath": filepath,
+                            "language": language,
+                        })
+                current_block = []
+                block_label = "block"
+
+        return chunks if chunks else self._chunk_prose(content, filepath)
+
+    def _chunk_markdown(self, content: str, filepath: str) -> list[dict]:
+        sections = re.split(r"\n(?=#{1,3} )", content)
+        chunks: list[dict] = []
+        for section in sections:
+            if not section.strip():
+                continue
+            label_match = re.match(r"^#{1,3} (.+)", section)
+            label = label_match.group(1) if label_match else "section"
+            for sub in self._split_if_large(section, self.MAX_CHUNK_CHARS):
+                chunks.append({
+                    "text": sub,
+                    "chunk_type": "section",
+                    "chunk_label": label,
+                    "start_line": 0,
+                    "filepath": filepath,
+                    "language": "markdown",
+                })
+        return chunks
+
+    def _chunk_config(self, content: str, filepath: str) -> list[dict]:
+        if len(content) <= self.MAX_CHUNK_CHARS:
+            return [{
+                "text": content,
+                "chunk_type": "config",
+                "chunk_label": Path(filepath).name,
+                "start_line": 1,
+                "filepath": filepath,
+                "language": "config",
+            }]
+        return self._chunk_prose(content, filepath)
+
+    def _chunk_prose(self, content: str, filepath: str) -> list[dict]:
+        paragraphs = [p.strip() for p in content.split("\n\n") if p.strip()]
+        chunks: list[dict] = []
+        current = ""
+        for para in paragraphs:
+            if len(current) + len(para) < self.MAX_CHUNK_CHARS:
+                current = (current + "\n\n" + para).strip() if current else para
+            else:
+                if current:
+                    chunks.append({
+                        "text": current.strip(),
+                        "chunk_type": "prose",
+                        "chunk_label": Path(filepath).name,
+                        "start_line": 0,
+                        "filepath": filepath,
+                        "language": "text",
+                    })
+                current = para
+        if current:
+            chunks.append({
+                "text": current.strip(),
+                "chunk_type": "prose",
+                "chunk_label": Path(filepath).name,
+                "start_line": 0,
+                "filepath": filepath,
+                "language": "text",
+            })
+        return chunks
+
+    def _split_if_large(self, text: str, max_chars: int) -> list[str]:
+        if len(text) <= max_chars:
+            return [text]
+        parts: list[str] = []
+        start = 0
+        while start < len(text):
+            end = start + max_chars
+            parts.append(text[start:end])
+            if end >= len(text):
+                break
+            start = end - self.OVERLAP_CHARS
+        return parts
 
 
 def _slugify_collection_key(value: str) -> str:
@@ -204,6 +461,34 @@ class PersonalRAGIndex:
         self._stop_poll = threading.Event()
         self._cache = _LRUCache(maxsize=200)
         self._next_poll_delay_seconds = self._refresh_seconds
+        self._chunker = StructureAwareChunker()
+
+        cfg = get_config()
+        rag_cfg = cfg.rag
+        self._min_score = float(getattr(rag_cfg, "minimum_relevance_score", MINIMUM_RELEVANCE_SCORE))
+        self._retrieval_candidates = int(getattr(rag_cfg, "retrieval_candidates", 12))
+        self._final_results = int(getattr(rag_cfg, "final_results", 5))
+        self._reranker_enabled = bool(getattr(rag_cfg, "reranker_enabled", True))
+        self._reranker_model = str(getattr(rag_cfg, "reranker_model", RERANKER_MODEL_DEFAULT))
+        self._background_batch_size = int(getattr(rag_cfg, "background_batch_size", 64))
+        self._background_batch_sleep_seconds = float(
+            getattr(rag_cfg, "background_batch_sleep_seconds", 2.0)
+        )
+        self._background_embedding_threads = int(
+            getattr(rag_cfg, "background_embedding_threads", 2)
+        )
+        self._cpu_throttle_threshold_percent = int(
+            getattr(rag_cfg, "cpu_throttle_threshold_percent", 65)
+        )
+
+        self._embed_lock = threading.Lock()
+        self._indexing_active = False
+        self._reranker = None
+        self._pipeline_state: str = "IDLE"
+        self._last_voice_activity: float = 0.0
+        self._query_cache: dict[str, tuple[list[dict], float]] = {}
+        self._QUERY_CACHE_MAX_SIZE = 50
+        self._QUERY_CACHE_TTL_SECONDS = 300.0
 
         logger.info(
             "personal_rag_initialized",
@@ -299,20 +584,53 @@ class PersonalRAGIndex:
             logger.warning("rag_snapshot_save_failed", error=str(e), exc_info=True)
 
     # ── Indexing ────────────────────────────────────────────────────
-    def refresh_incremental(self) -> None:
-        """Walk roots, detect changed/removed files, update the index with progress tracking."""
+    def on_voice_activity(self) -> None:
+        """Called when the user finishes an utterance — defers background refresh."""
+        self._last_voice_activity = time.time()
+
+    def set_pipeline_state(self, state: str) -> None:
+        self._pipeline_state = (state or "IDLE").upper()
+
+    def _should_refresh_now(self) -> bool:
+        now = time.time()
+        if now - self._last_refresh < self._refresh_seconds:
+            return False
+
+        if self._pipeline_state not in ("IDLE", "LISTENING"):
+            logger.debug(
+                "rag_refresh_deferred",
+                reason="pipeline_busy",
+                state=self._pipeline_state,
+            )
+            return False
+
+        if self._last_voice_activity and now - self._last_voice_activity < 60:
+            logger.debug(
+                "rag_refresh_deferred",
+                reason="recent_voice_activity",
+                seconds_since=round(now - self._last_voice_activity),
+            )
+            return False
+
         cfg = get_config()
         if bool(getattr(cfg.rag, "refresh_only_when_idle", True)):
             idle_threshold = float(getattr(cfg.rag, "refresh_idle_threshold_seconds", 30.0))
             if not session_activity.is_session_idle(idle_threshold):
-                self._next_poll_delay_seconds = 60.0
-                logger.info(
-                    "rag_refresh_deferred",
-                    user=self.user_id,
-                    reason="session_active",
-                    retry_seconds=60,
-                )
-                return
+                return False
+
+        return True
+
+    def refresh_incremental(self) -> None:
+        """Walk roots, detect changed/removed files, update the index with progress tracking."""
+        if not self._should_refresh_now():
+            self._next_poll_delay_seconds = 60.0
+            logger.info(
+                "rag_refresh_deferred",
+                user=self.user_id,
+                reason="gating",
+                retry_seconds=60,
+            )
+            return
 
         self._next_poll_delay_seconds = self._refresh_seconds
         with self._index_lock:
@@ -365,14 +683,28 @@ class PersonalRAGIndex:
                         except Exception:
                             fsize = 0
 
-                        for idx, chunk in enumerate(self._chunk_text(text, ext)):
+                        structured = self._chunker.chunk(text, p)
+                        for idx, chunk_dict in enumerate(structured):
+                            chunk_text = chunk_dict.get("text", "")
+                            if not chunk_text.strip():
+                                continue
+                            lang = chunk_dict.get("language", "text")
                             chunks.append(RagChunk(
-                                source_path=p, text=chunk, chunk_index=idx,
-                                file_hash=file_hash, modified_at=modified_at,
-                                title=title, kind=self._classify_kind(ext),
+                                source_path=p,
+                                text=chunk_text,
+                                chunk_index=idx,
+                                file_hash=file_hash,
+                                modified_at=modified_at,
+                                title=title,
+                                kind=self._classify_kind(ext),
                                 importance=self._estimate_importance(p),
-                                file_extension=ext, parent_folder=parent,
+                                file_extension=ext,
+                                parent_folder=parent,
                                 file_size_bytes=fsize,
+                                chunk_type=chunk_dict.get("chunk_type", "prose"),
+                                chunk_label=chunk_dict.get("chunk_label", ""),
+                                start_line=int(chunk_dict.get("start_line", 0) or 0),
+                                language=lang,
                             ))
 
                         # Progress tracking with ETA
@@ -452,7 +784,14 @@ class PersonalRAGIndex:
                 )
                 return
 
-        bs = self._batch_size
+        self._indexing_active = True
+        try:
+            return self._upsert_chunks_inner(chunks)
+        finally:
+            self._indexing_active = False
+
+    def _upsert_chunks_inner(self, chunks: List[RagChunk]) -> None:
+        bs = min(self._batch_size, max(10, self._background_batch_size))
         total_batches = (len(chunks) + bs - 1) // bs
         logger.info("rag_upsert_start", user=self.user_id, total_chunks=len(chunks), batches=total_batches)
 
@@ -466,6 +805,7 @@ class PersonalRAGIndex:
             metadatas = [
                 {
                     "path": c.source_path,
+                    "filepath": c.source_path,
                     "title": c.title,
                     "kind": c.kind,
                     "chunk_index": c.chunk_index,
@@ -477,6 +817,10 @@ class PersonalRAGIndex:
                     "parent_folder": c.parent_folder,
                     "file_size_bytes": c.file_size_bytes,
                     "indexed_at": c.indexed_at,
+                    "chunk_type": c.chunk_type,
+                    "chunk_label": c.chunk_label,
+                    "start_line": c.start_line,
+                    "language": c.language,
                     "index_schema_version": self._index_schema_version,
                     "embedding_model": self._embedding_profile.model_name,
                     "embedding_provider": self._embedding_profile.provider,
@@ -564,15 +908,38 @@ class PersonalRAGIndex:
             except Exception as e:
                 logger.warning("rag_upsert_batch_failed", batch=batch_idx, error=str(e), exc_info=True)
 
+    def _wait_if_cpu_hot(self) -> None:
+        try:
+            import psutil
+        except ImportError:
+            return
+
+        threshold = self._cpu_throttle_threshold_percent
+        while True:
+            cpu = psutil.cpu_percent(interval=0.5)
+            if cpu <= threshold:
+                break
+            logger.debug("rag_throttling", cpu_percent=cpu, threshold=threshold)
+            time.sleep(3.0)
+
     def _embed_batch_worker(self, batch_idx: int, documents: List[str]) -> tuple:
-        """Worker function for concurrent embedding."""
+        """Worker function for concurrent embedding with CPU throttling."""
         embeddings = None
         embed_time = 0
         try:
-            t0 = time.perf_counter()
-            embeddings = list(self._ef(documents))
-            t1 = time.perf_counter()
-            embed_time = int((t1 - t0) * 1000)
+            self._wait_if_cpu_hot()
+            try:
+                import torch
+
+                torch.set_num_threads(max(1, self._background_embedding_threads))
+            except ImportError:
+                pass
+            with self._embed_lock:
+                t0 = time.perf_counter()
+                embeddings = list(self._ef(documents))
+                t1 = time.perf_counter()
+                embed_time = int((t1 - t0) * 1000)
+            time.sleep(self._background_batch_sleep_seconds)
         except Exception as e:
             logger.warning("rag_batch_embedding_failed", batch=batch_idx, error=str(e), exc_info=True)
         return batch_idx, embeddings, embed_time
@@ -643,31 +1010,196 @@ class PersonalRAGIndex:
             logger.debug("rag_delete_path_failed", path=path, error=str(e))
 
     # ── Search & Scoring ───────────────────────────────────────────
+    def _cache_key(self, query: str) -> str:
+        return hashlib.md5(query.lower().strip().encode("utf-8", errors="ignore")).hexdigest()
+
+    def _get_cached(self, query: str) -> list[dict] | None:
+        key = self._cache_key(query)
+        entry = self._query_cache.get(key)
+        if not entry:
+            return None
+        results, timestamp = entry
+        if time.time() - timestamp < self._QUERY_CACHE_TTL_SECONDS:
+            logger.debug("rag_cache_hit", query=query[:50])
+            return results
+        del self._query_cache[key]
+        return None
+
+    def _set_cached(self, query: str, results: list[dict]) -> None:
+        if len(self._query_cache) >= self._QUERY_CACHE_MAX_SIZE:
+            oldest = min(self._query_cache, key=lambda k: self._query_cache[k][1])
+            del self._query_cache[oldest]
+        self._query_cache[self._cache_key(query)] = (results, time.time())
+
+    def _get_reranker(self):
+        if not self._reranker_enabled:
+            return None
+        if self._reranker is None:
+            try:
+                from sentence_transformers import CrossEncoder
+
+                self._reranker = CrossEncoder(self._reranker_model, max_length=512)
+                logger.info("rag_reranker_loaded", model=self._reranker_model)
+            except Exception as e:
+                logger.warning("rag_reranker_load_failed", error=str(e))
+                self._reranker_enabled = False
+        return self._reranker
+
+    def _hits_from_payload(self, payload: list[dict]) -> list[RagSearchHit]:
+        return [RagSearchHit.from_payload(p) for p in payload]
+
+    def _payload_from_hits(self, hits: list[RagSearchHit]) -> list[dict]:
+        return [h.to_dict() for h in hits]
+
+    def _apply_source_quality_penalties(self, hits: list[RagSearchHit]) -> list[RagSearchHit]:
+        for hit in hits:
+            filename_lower = os.path.basename(hit.filename).lower()
+            path_lower = hit.filename.lower()
+            for pattern in DEPRIORITIZED_FILE_PATTERNS:
+                if pattern in filename_lower or pattern in path_lower:
+                    original = hit.score
+                    hit.score = hit.score * 0.55
+                    logger.debug(
+                        "rag_source_penalized",
+                        filename=hit.filename,
+                        pattern_matched=pattern,
+                        original_score=round(original, 2),
+                        penalized_score=round(hit.score, 2),
+                    )
+                    break
+        hits.sort(key=lambda h: h.score, reverse=True)
+        return hits
+
+    def _rerank_results(self, query: str, hits: list[RagSearchHit], top_n: int = 5) -> list[RagSearchHit]:
+        reranker = self._get_reranker()
+        if reranker is None or len(hits) <= 1:
+            return hits[:top_n]
+
+        try:
+            pairs = [(query, h.content[:400]) for h in hits]
+            scores = reranker.predict(pairs)
+            for hit, score in zip(hits, scores):
+                hit.rerank_score = float(score)
+
+            before_top3 = [os.path.basename(h.filename) for h in hits[:3]]
+            reranked = sorted(hits, key=lambda h: h.rerank_score or 0.0, reverse=True)
+            after_top3 = [os.path.basename(h.filename) for h in reranked[:3]]
+            logger.debug(
+                "rag_reranked",
+                query=query[:80],
+                before_top3=before_top3,
+                after_top3=after_top3,
+            )
+            return reranked[:top_n]
+        except Exception as e:
+            logger.warning("rag_rerank_failed", error=str(e))
+            return hits[:top_n]
+
+    @staticmethod
+    def format_context_header(results: list[dict], query: str = "") -> str:
+        code_extensions = {
+            ".py", ".java", ".js", ".ts", ".php", ".html", ".css",
+            ".jsx", ".tsx", ".go", ".rs", ".cpp", ".c", ".cs", ".rb",
+        }
+        code_count = 0
+        for r in results:
+            path = (r.get("path") or "").lower()
+            if any(path.endswith(ext) for ext in code_extensions):
+                code_count += 1
+
+        if results and code_count >= len(results) // 2:
+            return (
+                "PERSONAL FILE CONTEXT — CODE FILES\n"
+                "Read this code carefully. Explain what it does in plain English. "
+                "Describe the logic, not just the syntax. Focus on what the user "
+                "actually built and why it works the way it does.\n\n"
+            )
+        return (
+            "PERSONAL FILE CONTEXT\n"
+            "(Answer naturally as if you read these files yourself; cite by number when relevant.)\n\n"
+        )
+
+    def format_context_for_provider(
+        self,
+        results: list[dict],
+        query: str,
+        provider: str = "gemini",
+    ) -> str:
+        if not results:
+            return ""
+
+        if provider == "groq":
+            trimmed = results[:2]
+            max_chars = 250
+        elif provider == "ollama":
+            trimmed = results[:1]
+            max_chars = 150
+        else:
+            trimmed = results[:3]
+            max_chars = 500
+
+        lines = [self.format_context_header(trimmed, query)]
+        for i, r in enumerate(trimmed, 1):
+            path = r.get("path") or ""
+            fname = os.path.basename(path.replace("\\", "/"))
+            folder = ""
+            parts = path.replace("\\", "/").split("/")
+            if len(parts) > 1:
+                folder = parts[-2]
+            meta = r.get("metadata") or {}
+            label = meta.get("chunk_label", "")
+            label_str = f" — {label}" if label else ""
+            lines.append(f"[{i}] {fname}{label_str}" + (f"  ({folder})" if folder else ""))
+            content = (r.get("content") or r.get("text") or "").strip()
+            lines.append(content[:max_chars])
+            lines.append("")
+
+        lines.append(
+            "When answering: be specific, cite [source numbers], "
+            "explain what you found as if you read these files yourself."
+        )
+        return "\n".join(lines).strip()
+
     def search(self, query: str, limit: int = 4, use_cache: bool = True) -> List[Dict[str, Any]]:
         query_key = f"{self.user_id}:{query}:{limit}"
         now = time.time()
+
         if use_cache:
-            cached = self._cache.get(query_key)
-            if cached and now - cached[0] < 60.0:
-                return cached[1]
+            session_cached = self._get_cached(query)
+            if session_cached is not None:
+                return session_cached
+            lru_cached = self._cache.get(query_key)
+            if lru_cached and now - lru_cached[0] < 60.0:
+                return lru_cached[1]
 
         try:
-            # Compute query embedding (use cached embedding fn) and query by embeddings
+            n_candidates = max(limit, self._retrieval_candidates)
             query_embeddings = None
             if self._ef is not None:
                 try:
-                    t0 = time.perf_counter()
-                    query_embeddings = list(self._ef([query]))
-                    t1 = time.perf_counter()
-                    logger.debug("rag_query_embedded", user=self.user_id, embed_ms=int((t1 - t0) * 1000))
+                    with self._embed_lock:
+                        t0 = time.perf_counter()
+                        query_embeddings = list(self._ef([query]))
+                        t1 = time.perf_counter()
+                    logger.debug(
+                        "rag_query_embedded",
+                        user=self.user_id,
+                        embed_ms=int((t1 - t0) * 1000),
+                        indexing_active=self._indexing_active,
+                    )
                 except Exception:
                     query_embeddings = None
 
             if query_embeddings is not None:
-                results = self._collection.query(query_embeddings=query_embeddings, n_results=max(1, int(limit) * 2))
+                results = self._collection.query(
+                    query_embeddings=query_embeddings,
+                    n_results=max(1, n_candidates),
+                )
             else:
-                # Fallback to text query if collection supports it
-                results = self._collection.query(query_texts=[query], n_results=max(1, int(limit) * 2))
+                results = self._collection.query(
+                    query_texts=[query],
+                    n_results=max(1, n_candidates),
+                )
 
             documents = (results.get("documents") or [[]])[0]
             metadatas = (results.get("metadatas") or [[]])[0]
@@ -681,54 +1213,57 @@ class PersonalRAGIndex:
                 text_sim = float(fuzz.partial_ratio(query, document or meta.get("title", "")))
                 importance = float(meta.get("importance") or 0)
                 final_score = (0.65 * vector_score) + (0.30 * text_sim) + (0.05 * importance)
+                path = meta.get("path", "") or meta.get("filepath", "")
                 payload.append({
                     "text": document,
-                    "path": meta.get("path", ""),
+                    "content": document,
+                    "path": path,
                     "title": meta.get("title", ""),
                     "kind": meta.get("kind", "document"),
                     "score": final_score,
                     "raw_vector_score": vector_score,
                     "file_extension": meta.get("file_extension", ""),
                     "parent_folder": meta.get("parent_folder", ""),
+                    "metadata": {
+                        "filepath": path,
+                        "chunk_label": meta.get("chunk_label", ""),
+                        "chunk_type": meta.get("chunk_type", ""),
+                        "language": meta.get("language", ""),
+                        "start_line": meta.get("start_line", 0),
+                    },
                 })
-            # Log raw results
+
             logger.debug("rag_query_raw_results", query=query, raw_count=len(payload))
 
-            # Capture pre-boost top5 for debug
-            pre_boost_top5 = sorted(payload, key=lambda p: p.get("score", 0.0), reverse=True)[:5]
-            logger.debug(
-                "rag_pre_boost_top5",
-                query=query,
-                top5=[{p.get("title") or p.get("path"): p.get("score")} for p in pre_boost_top5],
-            )
-
-            # Apply filename/parent boosting (safe: skip if metadata missing)
             payload = self._boost_filename_matches(payload, query)
-            payload.sort(key=lambda p: p.get("score", 0.0), reverse=True)
+            hits = self._hits_from_payload(payload)
+            hits = self._apply_source_quality_penalties(hits)
 
-            post_boost_top5 = payload[:5]
-            logger.debug(
-                "rag_post_boost_top5",
-                query=query,
-                top5=[{p.get("title") or p.get("path"): p.get("score")} for p in post_boost_top5],
-            )
+            min_score = self._min_score
+            filtered_hits = [h for h in hits if h.score >= min_score]
+            top_n = min(limit, self._final_results) if limit else self._final_results
+            final_hits = self._rerank_results(query, filtered_hits, top_n=top_n)
+            payload = self._payload_from_hits(final_hits)
 
-            # Apply configurable minimum relevance filter
-            cfg = get_config()
-            min_score = float(getattr(cfg.rag, 'minimum_relevance_score', MINIMUM_RELEVANCE_SCORE))
-            filtered_payload = [p for p in payload if p.get("score", 0.0) >= min_score]
             logger.debug(
                 "rag_accepted_results",
                 query=query,
-                accepted_count=len(filtered_payload),
+                accepted_count=len(payload),
                 threshold=min_score,
-                top5=[{p.get("title") or p.get("path"): p.get("score")} for p in filtered_payload[:5]],
+                top5=[{p.get("title") or p.get("path"): p.get("score")} for p in payload[:5]],
             )
 
-            max_results = int(getattr(get_config().rag, 'max_results', limit))
-            payload = filtered_payload[:max_results]
             self._cache.put(query_key, (now, payload))
-            logger.info("rag_search", user=self.user_id, query=query, results=len(payload), threshold=min_score)
+            if use_cache:
+                self._set_cached(query, payload)
+            logger.info(
+                "rag_search",
+                user=self.user_id,
+                query=query,
+                results=len(payload),
+                threshold=min_score,
+                reranked=bool(self._reranker_enabled),
+            )
             return payload
         except Exception as e:
             logger.warning("personal_rag_search_failed", user=self.user_id, error=str(e), exc_info=True)
@@ -855,49 +1390,109 @@ class PersonalRAGIndex:
         return boosted
 
     def build_context(self, query: str, limit: int = 4, summary: bool = False) -> str:
-        """Build compressed context from RAG results — no file re-reads."""
-        matches = self.search(query, limit=limit)
-        if not matches:
+        """Build LLM context from search results with structure-aware source headers."""
+        results = self.search(query, limit=limit)
+        if not results:
             return ""
+
         cfg = get_config()
-        excerpt_max = int(getattr(cfg.rag, 'excerpt_max_chars', 450))
+        excerpt_max = int(getattr(cfg.rag, "excerpt_max_chars", 450))
         lines = [
-            "PERSONAL FILE CONTEXT (answer naturally as if you read these files yourself; cite by number when relevant):",
+            "PERSONAL FILE CONTEXT",
+            f"(These are actual excerpts from the user's files, retrieved for query: '{query}')",
+            "Answer naturally from this content. Cite source numbers when relevant.",
             "",
         ]
-        seen_paths: set[str] = set()
+
+        seen_keys: set[str] = set()
         idx = 0
+        code_langs = {
+            "python", "java", "csharp", "kotlin", "go",
+            "cpp", "typescript", "javascript",
+        }
 
-        for match in matches:
-            path = match.get("path") or "unknown"
-            if path in seen_paths:
+        for result in results:
+            meta = result.get("metadata") or {}
+            filepath = meta.get("filepath") or result.get("path") or "unknown"
+            chunk_label = meta.get("chunk_label", "")
+            chunk_type = meta.get("chunk_type", "")
+            language = meta.get("language", "")
+
+            content = (result.get("content") or result.get("text") or "").strip()
+            if self._is_import_only(content) or not content:
                 continue
-            seen_paths.add(path)
+
+            dedupe_key = f"{filepath}:{chunk_label}:{content[:80]}"
+            if dedupe_key in seen_keys:
+                continue
+            seen_keys.add(dedupe_key)
             idx += 1
-            title = match.get("title") or os.path.basename(path)
-            parent = match.get("parent_folder") or os.path.basename(os.path.dirname(path))
 
-            excerpt = (match.get("text") or "").strip()
-            # Skip import/package/require/include/using-only excerpts entirely.
-            if self._is_import_only(excerpt):
-                continue
+            display_path = PersonalRAGIndex._shorten_path(filepath)
+            label_str = f" — {chunk_label}" if chunk_label else ""
+            type_str = f" [{chunk_type}]" if chunk_type else ""
+            lines.append(f"[{idx}] {display_path}{label_str}{type_str}")
 
-            if not excerpt:
-                continue
-
-            excerpt = " ".join(excerpt.split())
-            if len(excerpt) > excerpt_max:
-                # Keep total excerpt line length within `excerpt_max_chars`.
-                if excerpt_max <= 3:
-                    excerpt = excerpt[:excerpt_max].rstrip()
-                else:
-                    excerpt = excerpt[: excerpt_max - 3].rstrip() + "..."
-
-            lines.append(f"[{idx}] {title}  ({parent})")
-            lines.append(excerpt)
+            if language in code_langs:
+                content = PersonalRAGIndex._remove_import_lines(content)
+                snippet = content[:excerpt_max]
+                lines.append(f"```{language}")
+                lines.append(snippet)
+                lines.append("```")
+            else:
+                flat = " ".join(content.split())
+                if len(flat) > excerpt_max:
+                    flat = flat[: excerpt_max - 3].rstrip() + "..."
+                lines.append(flat)
             lines.append("")
 
+        if idx == 0:
+            return ""
+
+        lines.append(
+            "When answering: be specific, cite [source numbers], "
+            "explain what you found as if you read these files yourself."
+        )
         return "\n".join(lines).strip()
+
+    def reindex_all(self) -> None:
+        """Drop and rebuild the index with structure-aware chunks."""
+        with self._index_lock:
+            try:
+                all_data = self._collection.get(include=["metadatas"]) or {}
+                ids = all_data.get("ids") or []
+                if ids:
+                    self._collection.delete(ids=ids)
+            except Exception as e:
+                logger.warning("rag_reindex_clear_failed", error=str(e))
+
+            self._last_snapshot = {}
+            for root in self._roots:
+                if not root or not os.path.isdir(root):
+                    continue
+                for path in self._walk_files(root):
+                    try:
+                        mtime = os.path.getmtime(path)
+                        self._last_snapshot[path] = {"mtime": mtime, "size": os.path.getsize(path)}
+                    except Exception:
+                        continue
+            self.refresh_incremental()
+            logger.info("rag_reindex_all_completed", user=self.user_id)
+
+    @staticmethod
+    def _shorten_path(filepath: str) -> str:
+        parts = Path(filepath).parts
+        return "/".join(parts[-3:]) if len(parts) >= 3 else filepath
+
+    @staticmethod
+    def _remove_import_lines(code: str) -> str:
+        lines = code.splitlines()
+        prefixes = ("import ", "package ", "using ", "#include", "require(")
+        meaningful = [
+            ln for ln in lines
+            if not any(ln.strip().startswith(kw) for kw in prefixes)
+        ]
+        return "\n".join(meaningful)
 
     def get_all_indexed_filenames(self) -> list[str]:
         """

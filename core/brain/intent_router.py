@@ -6,6 +6,7 @@ from typing import Dict, Optional
 from utils.config import DexterConfig
 from utils.logger import get_logger
 from tools.pc_controls import APP_MAP
+from utils.asr_corrections import ASRCorrectionEngine
 
 logger = get_logger("intent_router")
 
@@ -31,22 +32,16 @@ class PendingAction:
 
 
 class IntentRouter:
-    _CITY_ASR_ALIASES = {
-        "cut mondo": "Kathmandu",
-        "cut mondo right": "Kathmandu",
-        "kat mondo": "Kathmandu",
-        "kath mandoo": "Kathmandu",
-        "kathmandhu": "Kathmandu",
-    }
 
-    def __init__(self, config: DexterConfig):
-        self.default_city = (config.defaults.city or "Kathmandu").strip()
+    def __init__(self, config: DexterConfig, asr_engine: ASRCorrectionEngine | None = None):
+        self.default_city = (config.defaults.city or "").strip()
+        self._asr_engine = asr_engine
         logger.info("intent_router_initialized", has_default_city=bool(self.default_city))
 
     def resolve_pending(self, text: str, pending: PendingAction) -> IntentDecision:
         lowered = text.lower().strip()
         if lowered in {"cancel", "never mind", "nevermind", "stop"}:
-            return IntentDecision(action="cancel", prompt="Understood, sir. I have cancelled that request.")
+            return IntentDecision(action="cancel", prompt="Got it, cancelled.")
 
         if pending.kind == "confirm":
             if lowered in {"yes", "confirm", "do it", "proceed", "ok", "okay"}:
@@ -158,6 +153,16 @@ class IntentRouter:
             content_type = self._infer_content_type(action, query, platform)
             if not platform:
                 platform = self._default_platform_for_content(content_type)
+            if action in {"play", "watch"} or content_type in {"music", "podcast"}:
+                return IntentDecision(
+                    action="tool",
+                    tool_name="play_media",
+                    args={
+                        "query": query,
+                        "platform": platform,
+                        "content_type": content_type,
+                    },
+                )
             return IntentDecision(
                 action="tool",
                 tool_name="search_content_platform",
@@ -176,7 +181,7 @@ class IntentRouter:
                 return IntentDecision(
                     action="ask",
                     tool_name="get_weather",
-                    prompt="Which city should I check, sir?",
+                    prompt="Which city?",
                 )
             return IntentDecision(action="tool", tool_name="get_weather", args={"city": city})
 
@@ -213,7 +218,7 @@ class IntentRouter:
         if file_match:
             return IntentDecision(action="vision", vision_mode="file", file_path=file_match.group(1))
         if any(kw in lowered for kw in ["function", "code", "bug", "error in this file"]):
-            return IntentDecision(action="ask", vision_mode="file", prompt="Which file should I inspect, sir? Provide a relative path.")
+            return IntentDecision(action="ask", vision_mode="file", prompt="Which file should I look at? Give me a relative path.")
 
         # Weather
         if "weather" in normalized or "forecast" in normalized:
@@ -225,7 +230,7 @@ class IntentRouter:
                     return IntentDecision(
                         action="ask",
                         tool_name="get_weather",
-                        prompt="Which city should I check, sir?",
+                        prompt="Which city?",
                     )
             return IntentDecision(action="tool", tool_name="get_weather", args={"city": city})
 
@@ -237,7 +242,7 @@ class IntentRouter:
                 if self._should_launch_directly(app_name):
                     return IntentDecision(action="tool", tool_name="open_application", args={"app_name": app_name})
                 return IntentDecision(action="tool", tool_name="resolve_open_target", args={"query": app_name})
-            return IntentDecision(action="ask", tool_name="resolve_open_target", prompt="What should I open, sir?")
+            return IntentDecision(action="ask", tool_name="resolve_open_target", prompt="What should I open?")
 
         # Clipboard
         if "clipboard" in normalized and any(
@@ -250,7 +255,7 @@ class IntentRouter:
             content = copy_match.group(1).strip()
             if content:
                 return IntentDecision(action="tool", tool_name="copy_to_clipboard", args={"text": content})
-            return IntentDecision(action="ask", tool_name="copy_to_clipboard", prompt="What should I copy to the clipboard, sir?")
+            return IntentDecision(action="ask", tool_name="copy_to_clipboard", prompt="What should I copy to the clipboard?")
 
         return IntentDecision(action="none")
 
@@ -470,8 +475,11 @@ class IntentRouter:
                 flags=re.IGNORECASE,
             )
             city = re.sub(r"\s+", " ", city).strip(" -,'")
-            if city.lower() in self._CITY_ASR_ALIASES:
-                return self._CITY_ASR_ALIASES[city.lower()]
+            # Use ASR engine for dynamic correction if available
+            if self._asr_engine is not None:
+                corrected, was_corrected = self._asr_engine.correct(city)
+                if was_corrected:
+                    return corrected
             return city
 
         # Prefer explicit prepositional cities at the end of the utterance.

@@ -37,7 +37,7 @@ def read_note(filename: str) -> str:
     logger.info("note_read_started", path=filepath)
     
     if not os.path.exists(filepath):
-        return f"Sir, I could not find a note named {filename}."
+        return f"I could not find a note named {filename}."
         
     try:
         with open(filepath, "r", encoding="utf-8") as f:
@@ -56,7 +56,7 @@ def list_notes() -> str:
         files = os.listdir(NOTES_DIR)
         txt_files = [f for f in files if f.endswith(".txt")]
         if not txt_files:
-            return "You have no saved notes at the moment, sir."
+            return "You have no saved notes at the moment."
         return f"Here are your saved notes: {', '.join(txt_files)}"
     except Exception as e:
         logger.error("note_list_failed", error=str(e), exc_info=True)

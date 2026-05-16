@@ -12,6 +12,7 @@ import json
 import asyncio
 import time
 import random
+import groq
 from typing import Any, Optional
 from rapidfuzz import fuzz
 
@@ -44,6 +45,7 @@ TOOL_GROUPS = {
     "note": ["create_note", "read_note", "list_notes"],
     "browser": ["open_url", "open_url_in_browser"],
     "youtube": ["play_youtube"],
+    "media": ["play_media", "play_music"],
     "routine": ["save_automation_routine", "list_automation_routines", "run_automation_routine", "delete_automation_routine"],
     "keyboard": ["type_text", "press_shortcut", "enter_key", "minimize_all_windows"],
     "health": ["get_health_report"],
@@ -55,16 +57,31 @@ ALWAYS_INCLUDE = ["get_current_datetime", "get_weather", "open_application"]
 class ProviderHealth:
     """Persisted in-memory provider cooldown and failure state."""
 
+    gemini_disabled_until: float = 0.0
+
     def __init__(self):
         self.gemini_disabled_until: float = 0.0
         self.groq_failure_count: int = 0
         self.groq_last_failure: float = 0.0
 
+    @classmethod
+    def disable_gemini_daily(cls) -> None:
+        cls.gemini_disabled_until = time.time() + 86400
+        logger.warning(
+            "gemini_disabled_24h",
+            reason="daily_quota_exhausted",
+            retry_after="24 hours",
+        )
+
     def disable_gemini(self, seconds: float) -> None:
         self.gemini_disabled_until = time.time() + max(0.0, float(seconds))
 
-    def is_gemini_available(self) -> bool:
-        return time.time() > self.gemini_disabled_until
+    @classmethod
+    def is_gemini_available(cls) -> bool:
+        return time.time() > cls.gemini_disabled_until
+
+    def gemini_is_available(self) -> bool:
+        return time.time() > max(self.gemini_disabled_until, self.__class__.gemini_disabled_until)
 
     def record_groq_failure(self) -> None:
         self.groq_failure_count += 1
@@ -79,14 +96,14 @@ class Brain:
     GEMINI_QUOTA_DISABLE_SECONDS = 86400.0
     _gemini_disabled_until_global: float = 0.0
 
-    def __init__(self, event_bus: Optional[EventBus] = None):
+    def __init__(self, event_bus: Optional[EventBus] = None, asr_engine=None):
         logger.info("brain_initializing")
 
         self._cfg: DexterConfig = get_config()
         self._event_bus: Optional[EventBus] = event_bus
 
         self.tools_list = load_tools()
-        self.intent_router = IntentRouter(self._cfg)
+        self.intent_router = IntentRouter(self._cfg, asr_engine=asr_engine)
         self.shared_history = []
         self.pending_action = None
         self.max_history_tokens = int(self._cfg.history.max_tokens)
@@ -97,27 +114,47 @@ class Brain:
             "ollama": {"failures": 0, "score": 1.0, "cooldown_until": 0.0, "last_error": ""},
         }
 
-        self.system_instruction = """You are Dexter, a personal AI assistant on this Windows PC. You are smart, warm, and direct. You sound like a knowledgeable friend — calm, confident, occasionally dry. Never a butler, never a service agent.
-    Never say: "Certainly", "Of course", "Sure thing", "Great question", "Absolutely", "Right away", "Understood", "sir", "ma'am". Not once, not ever.
-    Never repeat the question back. Never narrate what you are about to do. Just do it.
-    Use contractions — "I'll", "it's", "that's". They sound natural spoken aloud.
-    PC action confirmations: one short phrase only. "Done." "Opened." "Volume's at 50." "Locked."
-    When you don't know: "Not sure about that one." That is enough.
-    When someone says you got it wrong: "You're right, let me fix that." Not an apology paragraph.
-    Examples:
-    "What time is it?" → "It's 2:30."
-    "Open Chrome." → "Done."
-    "What's the weather?" → [call tool, say result naturally like] "22 degrees, light rain this afternoon."
-    "Play Hotel California on Spotify." → "On it." [plays it]
-    "You got that wrong." → "You're right, let me fix that."
-    "Tell me about UserAuth project." → [read the files, explain naturally] "That's actually a movie ticket booking system despite the name. Main service handles seat reservations and payment flows. Want me to dig into any part?"
-    "When you have PERSONAL FILE CONTEXT: read it, understand it, explain it like a smart person talking to a friend. Specific, natural, no academic hedging.
-    Spoken response length depends on the request type:
-    - Simple commands (open, close, volume, time, weather): 1 sentence maximum. Short and done.
-    - General questions: 2-3 sentences.
-    - When user asks to summarize, explain, describe, tell me about, or give details: speak naturally for as long as the topic needs. Do not cut yourself short. Cover the key points properly. Aim for 4-8 sentences for summaries.
-    - Never pad with filler. Never cut off important information to stay short.
-    When user asks to play music use play_music with song/artist and platform. Never use open_application for music — use play_music."""
+        self.system_instruction = """You are Dexter, a personal AI assistant running on this Windows PC.
+
+You are smart, direct, and warm. You talk like a capable friend — not a butler, not a support agent, not a robot.
+
+Rules:
+- Never say: sir, ma'am, Certainly, Of course, Sure thing, Great question, Absolutely, Right away, Understood.
+- Never repeat the question back.
+- Never say what you're about to do before doing it. Just do it.
+- Use contractions: I'll, it's, that's, you're, I've. They sound natural spoken aloud.
+- Keep answers to 1-3 sentences unless the user asked for detail.
+- For PC actions, confirm in one word or phrase: "Done." "Opened." "Locked." "Volume's at 50."
+- When wrong: "You're right, let me fix that." Never a paragraph of apology.
+- When unsure: "Not sure about that one." That's enough.
+
+Examples:
+  "What time is it?" → "It's 2:30."
+  "Open Chrome." → "Done."
+  "What's the weather?" → "22 degrees, light rain this afternoon."
+  "Play Hotel California on Spotify." → "On it." [plays it]
+  "You got that wrong." → "You're right, let me fix that."
+  "Tell me about UserAuth." → [reads files] "That's a movie ticket booking system. Main service handles reservations and payment. Want more detail on any part?"
+
+When you have PERSONAL FILE CONTEXT: read it, understand it, explain it like a smart person talking to a friend. Specific, natural, no hedging phrases like "based on the retrieved context."
+
+When you receive code in the file context, explain the logic in plain English as if talking to the developer who wrote it. Describe what each section does, what problem it solves, and how the pieces fit together. Do not just restate the code — explain it.
+
+For PC control: one short confirmation after the action. No narration before.
+When asked about weather: call get_weather immediately with the city.
+When user asks to play any music, song, video, or podcast — always use play_media.
+If they name a platform (Spotify, YouTube, Apple Music, etc.) include it.
+If they don't name a platform, omit platform and the tool uses their default.
+Never use open_application just to open a music app — use play_media so content gets searched.
+When asked to open an app: use open_application.
+
+Spoken response length depends on the request type:
+- Simple commands (open, close, volume, time, weather): 1 sentence maximum. Short and done.
+- General questions: 2-3 sentences.
+- When user asks to summarize, explain, describe, tell me about, or give details: speak naturally for as long as the topic needs. Do not cut yourself short. Cover the key points properly. Aim for 4-8 sentences for summaries.
+- Never pad with filler. Never cut off important information to stay short.
+
+When user asks to play music use play_media with song/artist and platform. Never use open_application for music — use play_media."""
 
         # Initialize all three LLM backends
         self._init_gemini()
@@ -175,6 +212,7 @@ class Brain:
             q = (text or "").lower()
             triggers = (
                 "tell me about",
+                "summary",
                 "summarize",
                 "summarise",
                 "describe",
@@ -209,8 +247,11 @@ class Brain:
                 if tool_name in available:
                     selected_names.add(tool_name)
 
-        if media_query and "play_music" in available:
-            selected_names.add("play_music")
+        if media_query:
+            if "play_media" in available:
+                selected_names.add("play_media")
+            elif "play_music" in available:
+                selected_names.add("play_music")
 
         if is_knowledge_query:
             for tool_name in TOOL_GROUPS.get("document", []):
@@ -239,7 +280,7 @@ class Brain:
                 if t in selected_names:
                     selected_names.discard(t)
 
-        max_tools = max(1, int(self._cfg.providers.groq_max_tools))
+        max_tools = min(10, max(1, int(self._cfg.providers.groq_max_tools)))
         ordered_names = sorted(selected_names)
         trimmed = ordered_names[:max_tools]
         selected = [available[name] for name in trimmed if name in available]
@@ -500,6 +541,15 @@ class Brain:
         except Exception:
             pass
 
+        if rag_context:
+            source_count = rag_context.count("\n[")
+            if source_count > 2:
+                sections.append(
+                    "NOTE: Multiple files are shown above. "
+                    "Synthesize across them — explain how they relate "
+                    "rather than summarising each one separately."
+                )
+
         sections.append(f"User question: {user_command}")
         return "\n\n".join(section for section in sections if section)
 
@@ -554,6 +604,15 @@ class Brain:
     def _emit_llm_event(self, event_type: str, **fields: Any) -> None:
         if self._event_bus:
             self._event_bus.emit(event_type, fields)
+
+    @staticmethod
+    def _is_time_query(text: str) -> bool:
+        q = (text or "").lower()
+        if re.search(r"\b(time|date|timezone|clock)\b", q):
+            return True
+        if "what day" in q or "day is it" in q or "today" in q:
+            return True
+        return False
 
     def _is_rate_limit_error(self, error: Exception) -> bool:
         # Be defensive: provider SDKs use different exception classes / messages.
@@ -749,8 +808,8 @@ class Brain:
                 self._emit_llm_event("llm_call_failed", provider="ollama", error=str(e))
 
         return (
-            "I apologize, sir. All of my neural networks are currently unreachable. "
-            "Please verify your API keys in config.yaml and check your internet connection."
+            "All my providers are unreachable right now. "
+            "Check your API keys in config.yaml and your internet connection."
         )
 
     async def process_command_stream(self, user_command: str, long_term_memory: str = "", indexed_context: str = ""):
@@ -758,6 +817,9 @@ class Brain:
             response_text = await self.process_command(user_command, long_term_memory, indexed_context)
             yield response_text
             return
+
+        if not ProviderHealth.is_gemini_available():
+            logger.info("gemini_skipped", reason="quota_exhausted")
 
         decision = self.intent_router.detect_intent(user_command)
         if decision.action != "none":
@@ -796,6 +858,7 @@ class Brain:
                 if cooldown > 0:
                     self._provider_health.disable_gemini(cooldown)
                     if "perday" in str(e).lower() or "limit: 0" in str(e).lower():
+                        ProviderHealth.disable_gemini_daily()
                         self._disable_gemini_globally(cooldown)
                 logger.warning("gemini_stream_failed", error=str(e), exc_info=True)
                 self._emit_llm_event("llm_stream_failed", provider="gemini", error=str(e))
@@ -876,7 +939,7 @@ class Brain:
 
         status = payload.get("status")
         if status == "ask":
-            prompt = payload.get("message") or "Please choose an option, sir."
+            prompt = payload.get("message") or "Which one?"
             match_id = payload.get("match_id")
             if match_id:
                 self.pending_action = PendingAction(
@@ -969,7 +1032,7 @@ class Brain:
 
         if decision.vision_mode == "file":
             if not decision.file_path:
-                return "Which file should I inspect, sir?"
+                return "Which file should I look at?"
             file_text = await execute_tool("read_workspace_file", {"relative_path": decision.file_path}, event_bus=self._event_bus)
             file_prompt = f"{prompt}\n\nFile: {decision.file_path}\n\n{file_text}"
             return await self._process_text_fallback(file_prompt)
@@ -1017,7 +1080,7 @@ class Brain:
                 self._record_provider_failure("ollama", e, False)
                 logger.warning("text_fallback_ollama_failed", error=str(e), exc_info=True)
 
-        return "I cannot access any LLM providers at the moment, sir."
+        return "Can't reach any LLM providers right now."
 
     async def check_provider_status(self) -> tuple[dict[str, str], str]:
         """Ping providers at startup and return status map and primary provider."""
@@ -1124,7 +1187,7 @@ class Brain:
         if response.text:
             return response.text
 
-        return "Command executed, sir."
+        return "Done."
 
     @staticmethod
     def _split_sentences_for_stream(text: str) -> tuple[list[str], str]:
@@ -1362,7 +1425,7 @@ class Brain:
         if response.text:
             return response.text
 
-        return "Vision task completed, sir."
+        return "Done."
 
     # ─── Groq Processing ─────────────────────────────────────────────────────
 
@@ -1371,6 +1434,7 @@ class Brain:
         Process via Groq with manual function calling.
         If the LLM wants to call a tool, we execute it and send the result back.
         """
+        query_text = query_hint or prompt
         base_messages = [{"role": "system", "content": self.system_instruction}]
         base_messages += self._build_shared_messages()
         base_messages.append({"role": "user", "content": prompt})
@@ -1385,9 +1449,12 @@ class Brain:
                 tool_choice="auto" if selected_tools else "none",
                 max_tokens=1024,
             )
-        except Exception as e:
-            if allow_tools and "Failed to call a function" in str(e):
-                logger.warning("groq_function_call_failed_retrying_without_tools")
+        except groq.APIError as e:
+            if "Failed to call a function" in str(e):
+                logger.warning(
+                    "groq_tool_call_failed_retrying",
+                    error=str(e)
+                )
                 return await self._process_groq(prompt, query_hint=query_hint, allow_tools=False)
             raise
         elapsed_ms = (time.perf_counter() - llm_start) * 1000
@@ -1426,6 +1493,10 @@ class Brain:
                     args = {}
                 logger.info("groq_tool_call", tool_name=func_name)
 
+                if func_name in {"get_current_time", "get_current_datetime"} and not self._is_time_query(query_text):
+                    logger.warning("tool_call_blocked", tool_name=func_name, reason="non_time_query")
+                    return await self._process_groq(prompt, query_hint=query_hint, allow_tools=False)
+
                 tool_result = await execute_tool(func_name, args, event_bus=self._event_bus)
                 summary = self._summarize_tool_output(func_name, tool_result)
                 tool_summaries.append(f"[tool:{func_name}] {summary}")
@@ -1445,9 +1516,12 @@ class Brain:
                     model=self._cfg.models.fallback_llm,
                     messages=tool_messages,
                 )
-            except Exception as e:
+            except groq.APIError as e:
                 if "Failed to call a function" in str(e):
-                    logger.warning("groq_followup_function_call_failed_retrying_without_tools")
+                    logger.warning(
+                        "groq_tool_call_failed_retrying",
+                        error=str(e)
+                    )
                     return await self._process_groq(prompt, query_hint=query_hint, allow_tools=False)
                 raise
             elapsed_ms += (time.perf_counter() - followup_start) * 1000
@@ -1463,9 +1537,10 @@ class Brain:
         if msg.content:
             return msg.content
 
-        return "Command executed, sir."
+        return "Done."
 
     async def _stream_groq_with_tools(self, prompt: str, query_hint: str = "", allow_tools: bool = True):
+        query_text = query_hint or prompt
         base_messages = [{"role": "system", "content": self.system_instruction}]
         base_messages += self._build_shared_messages()
         base_messages.append({"role": "user", "content": prompt})
@@ -1480,10 +1555,18 @@ class Brain:
                 tool_choice="auto" if selected_tools else "none",
                 stream=True,
             )
-        except Exception as e:
-            if allow_tools and "Failed to call a function" in str(e):
-                logger.warning("groq_stream_function_call_failed_retrying_without_tools")
-                async for chunk in self._stream_groq_with_tools(prompt, query_hint=query_hint, allow_tools=False):
+        except groq.APIError as e:
+            if "Failed to call a function" in str(e):
+                logger.warning(
+                    "groq_tool_call_failed_retrying",
+                    error=str(e)
+                )
+                # Retry without tools
+                async for chunk in self._stream_groq_with_tools(
+                    prompt,
+                    query_hint=query_hint,
+                    allow_tools=False  # plain text only
+                ):
                     yield chunk
                 return
             raise
@@ -1528,6 +1611,14 @@ class Brain:
 
         if tool_buffers and allow_tools:
             tool_calls = self._deduplicate_tool_calls([tool_buffers[idx] for idx in sorted(tool_buffers)])
+            if any(
+                call.get("function", {}).get("name") in {"get_current_time", "get_current_datetime"}
+                for call in tool_calls
+            ) and not self._is_time_query(query_text):
+                logger.warning("tool_call_blocked", tool_name="get_current_time", reason="non_time_query")
+                async for chunk in self._stream_groq_with_tools(prompt, query_hint=query_hint, allow_tools=False):
+                    yield chunk
+                return
             tool_messages = list(base_messages)
             tool_messages.append(
                 {
@@ -1562,10 +1653,18 @@ class Brain:
                     messages=tool_messages,
                     stream=True,
                 )
-            except Exception as e:
+            except groq.APIError as e:
                 if "Failed to call a function" in str(e):
-                    logger.warning("groq_stream_followup_failed_retrying_without_tools")
-                    async for chunk in self._stream_groq_with_tools(prompt, query_hint=query_hint, allow_tools=False):
+                    logger.warning(
+                        "groq_tool_call_failed_retrying",
+                        error=str(e)
+                    )
+                    # Retry without tools
+                    async for chunk in self._stream_groq_with_tools(
+                        prompt,
+                        query_hint=query_hint,
+                        allow_tools=False  # plain text only
+                    ):
                         yield chunk
                     return
                 raise

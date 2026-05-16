@@ -2,6 +2,7 @@ import os
 import subprocess
 import ctypes
 import shutil
+import webbrowser
 from utils.logger import get_logger
 
 logger = get_logger("pc_controls")
@@ -67,6 +68,10 @@ APP_MAP = {
     "photos": "ms-photos:",
     "mail": "outlookmail:",
     "calendar": "outlookcal:",
+    "youtube": "https://www.youtube.com",
+    "youtube music": "https://music.youtube.com",
+    "gmail": "https://mail.google.com",
+    "google": "https://www.google.com",
 }
 
 
@@ -204,11 +209,19 @@ def open_application(app_name: str) -> str:
         if os.path.exists(cached_path):
             try:
                 subprocess.Popen([cached_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                return f"Successfully opened {app_name} (from cache), sir."
+                return f"Successfully opened {app_name}."
             except Exception as e:
                 logger.error("app_open_cached_failed", app_name=app_name, error=str(e))
 
     command = APP_MAP.get(app_name) or app_name
+    if command.startswith("http://") or command.startswith("https://"):
+        try:
+            webbrowser.open(command)
+            logger.info("app_opened_as_url", app_name=app_name, url=command)
+            return f"Opened {app_name}."
+        except Exception as e:
+            logger.error("app_open_url_failed", app_name=app_name, error=str(e), exc_info=True)
+            return f"Failed to open {app_name} in your browser."
     resolved = _resolve_command(command)
     if resolved and (os.path.exists(resolved) or resolved == command):
         try:
@@ -217,7 +230,7 @@ def open_application(app_name: str) -> str:
                 _APP_CACHE[app_name] = resolved
             else:
                 os.startfile(command)
-            return f"Successfully opened {app_name}, sir."
+            return f"Successfully opened {app_name}."
         except Exception as e:
             logger.debug("app_open_s1_failed", error=str(e))
 
@@ -226,7 +239,7 @@ def open_application(app_name: str) -> str:
         try:
             subprocess.Popen([reg_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             _APP_CACHE[app_name] = reg_path
-            return f"Successfully opened {app_name} (registry), sir."
+            return f"Successfully opened {app_name}."
         except Exception as e:
             logger.debug("app_open_s2_failed", error=str(e))
 
@@ -235,7 +248,7 @@ def open_application(app_name: str) -> str:
         try:
             subprocess.Popen([lnk_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             _APP_CACHE[app_name] = lnk_path
-            return f"Successfully opened {app_name} (start menu), sir."
+            return f"Successfully opened {app_name}."
         except Exception as e:
             logger.debug("app_open_s5_failed", error=str(e))
 
@@ -244,17 +257,17 @@ def open_application(app_name: str) -> str:
         try:
             subprocess.Popen([fuzz_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             _APP_CACHE[app_name] = fuzz_path
-            return f"Successfully opened {app_name} (fuzzy search), sir."
+            return f"Successfully opened {app_name}."
         except Exception as e:
             logger.debug("app_open_s3_failed", error=str(e))
 
     try:
         subprocess.Popen(["cmd", "/c", "start", "", app_name])
-        return f"Attempted to open {app_name} via Windows Shell, sir."
+        return f"Attempted to open {app_name} via Windows Shell."
     except Exception as e:
         logger.error("app_open_start_failed", app_name=app_name, error=str(e), exc_info=True)
 
-    return f"I could not find {app_name} installed on your system sir. Would you like me to search for it online instead?"
+    return f"I could not find {app_name} installed on your system. Want me to search for it online?"
 
 
 def close_application(app_name: str) -> str:
@@ -288,7 +301,7 @@ def close_application(app_name: str) -> str:
             capture_output=True, text=True, timeout=10
         )
         if result.returncode == 0:
-            return f"Successfully closed {app_name}, sir."
+            return f"Successfully closed {app_name}."
         else:
             return f"Could not find a running instance of {app_name}."
     except Exception as e:
@@ -299,7 +312,7 @@ def close_application(app_name: str) -> str:
 def set_system_volume(level: int) -> str:
     """Sets the Windows system master volume to an exact percentage between 0 and 100."""
     if level < 0 or level > 100:
-        return "Volume level must be between 0 and 100 percent, sir."
+        return "Volume level must be between 0 and 100 percent."
 
     logger.info("system_volume_set_requested", level_percent=level)
 
@@ -314,7 +327,7 @@ def set_system_volume(level: int) -> str:
         volume = cast(interface, POINTER(IAudioEndpointVolume))
         # SetMasterVolumeLevelScalar takes 0.0 to 1.0
         volume.SetMasterVolumeLevelScalar(level / 100.0, None)
-        return f"Volume set to {level}%, sir."
+        return f"Volume set to {level}%."
 
     except ImportError:
         logger.warning("volume_control_fallback", reason="pycaw_not_installed")
@@ -334,10 +347,10 @@ def set_system_volume(level: int) -> str:
             ["powershell", "-NoProfile", "-Command", ps_cmd],
             capture_output=True, timeout=15
         )
-        return f"Volume set to approximately {level}%, sir."
+        return f"Volume set to approximately {level}%."
     except Exception as e:
         logger.error("volume_key_simulation_failed", error=str(e), exc_info=True)
-        return "I was unable to adjust the volume, sir."
+        return "I was unable to adjust the volume."
 
 
 def lock_workstation() -> str:
@@ -345,7 +358,7 @@ def lock_workstation() -> str:
     logger.info("workstation_lock_requested")
     try:
         ctypes.windll.user32.LockWorkStation()
-        return "Workstation locked successfully, sir."
+        return "Workstation locked."
     except Exception as e:
         logger.error("workstation_lock_failed", error=str(e), exc_info=True)
         return f"Failed to lock workstation: {str(e)}"

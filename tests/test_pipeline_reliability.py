@@ -32,10 +32,10 @@ def test_select_tools_for_provider_caps_groq_tools_at_configured_limit():
 
 def test_provider_health_disable_gemini_skips_after_daily_quota_error():
     health = ProviderHealth()
-    assert health.is_gemini_available() is True
+    assert health.gemini_is_available() is True
 
     health.disable_gemini(3600.0)
-    assert health.is_gemini_available() is False
+    assert health.gemini_is_available() is False
 
 
 def test_pipeline_turn_timeout_returns_to_idle_cleanly():

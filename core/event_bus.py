@@ -8,6 +8,26 @@ from utils.logger import get_logger, get_correlation_id
 logger = get_logger("event_bus")
 
 
+class DexterEvents:
+    """Event names for GUI/MCP subscribers."""
+
+    STATE_CHANGED = "state_changed"
+    TRANSCRIPT_READY = "transcript_ready"
+    RAG_CONTEXT_USED = "rag_context_used"
+    RAG_CONTEXT_EMPTY = "rag_context_empty"
+    PROVIDER_USED = "provider_used"
+    TOOL_CALLED = "tool_called"
+    TOOL_RESULT = "tool_result"
+    RESPONSE_CHUNK = "response_chunk"
+    RESPONSE_COMPLETE = "response_complete"
+    RESPONSE_COMPLETED = "response_completed"
+    ACTIVATION_MODE_CHANGED = "activation_mode_changed"
+    WAKE_WORD_DETECTED = "wake_word_detected"
+    COMMAND_DROPPED = "command_dropped"
+    PROVIDER_FALLBACK = "provider_fallback"
+    RAG_SEARCH_FAILED = "rag_search_failed"
+
+
 class EventBus:
     def __init__(self, maxsize: int = 200) -> None:
         self._subscribers: set[asyncio.Queue] = set()

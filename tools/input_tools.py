@@ -63,7 +63,7 @@ def minimize_all_windows() -> str:
         return "Desktop control unavailable: missing pyautogui module."
     try:
          _pyautogui.hotkey('win', 'd')
-         return "Windows minimized, sir."
+         return "Windows minimized."
     except Exception as e:
         logger.error("desktop_show_failed", error=str(e), exc_info=True)
         return f"Error minimizing windows: {str(e)}"

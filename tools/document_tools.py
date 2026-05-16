@@ -1,8 +1,6 @@
 from __future__ import annotations
 
-import csv
 import getpass
-import json
 import os
 import re
 import threading

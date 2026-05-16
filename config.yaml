@@ -10,8 +10,14 @@ wake_behavior:
   max_prefix_tokens: 4
 
 activation:
-  mode: "wake_word"  # options: "wake_word" or "clap"
+  mode: "smart"             # smart | wake_word | always_on | clap
   wake_word: "dexter"
+  active_hours_start: "09:00"
+  active_hours_end: "18:00"
+  active_days: [0, 1, 2, 3, 4]  # Mon-Fri; omit for all days
+  always_on_after_n_interactions: 3
+  always_on_window_seconds: 120
+  always_on_timeout_seconds: 300
   fallback_to_always_on_after_failures: 3
   clap_sensitivity: 3.0
   active_window_seconds: 30
@@ -20,6 +26,7 @@ activation:
   wake_words:
     - "hey"
     - "hey dexter"
+    - "dexter"
 
 api_keys:
   gemini: ""               # Set GEMINI_API_KEY in .env or environment
@@ -61,7 +68,7 @@ rag:
   chunk_overlap: 100         # Reduced from 120 for speed (still sufficient overlap)
   refresh_seconds: 1800
   embedding_model: "BAAI/bge-base-en-v1.5"   # High-quality BGE embeddings (keep for quality)
-  index_schema_version: 2    # Bump when collection layout or metadata changes
+  index_schema_version: 3    # Bump when collection layout or metadata changes
   max_context_chars: 3000    # Cap context injected into LLM prompts
   batch_size: 256            # Larger batches to reduce embedding round-trips
   max_embedding_threads: 4   # Concurrent batch embedding (0 = serial, >1 = parallel)
@@ -96,13 +103,21 @@ rag:
   boost_cap: 30.0
   refresh_only_when_idle: true
   refresh_idle_threshold_seconds: 30
+  reranker_enabled: true
+  reranker_model: "cross-encoder/ms-marco-MiniLM-L-6-v2"
+  retrieval_candidates: 12
+  final_results: 5
+  background_batch_size: 64
+  background_batch_sleep_seconds: 2.0
+  background_embedding_threads: 2
+  cpu_throttle_threshold_percent: 65
 
 audio_settings:
   sample_rate: 16000
   chunk_size: 512
-  vad_threshold: 0.3
+  vad_threshold: 0.25
   min_speech_duration_ms: 100
-  min_silence_duration_ms: 800
+  min_silence_duration_ms: 900
   speech_pad_ms: 400
   max_speech_duration_s: 30
 
@@ -110,7 +125,7 @@ stt:
   model: "medium.en"
   beam_size: 5
   best_of: 5
-  temperature: 0.0
+  temperature: [0.0, 0.2, 0.4]
   patience: 1.0
   log_prob_threshold: -1.0
   no_speech_threshold: 0.6
@@ -132,3 +147,21 @@ privacy:
   # When true, Dexter logs full spoken transcripts to logs/dexter.log.
   # Keep false by default to avoid persisting sensitive voice content.
   debug_log_transcripts: false
+
+briefing:
+  news_sources:
+    - "technology"
+    - "world"
+    - "science"
+  include_weather: true
+  include_agenda: true
+
+spotify:
+  # Master Keys for OAuth Flow (Provide via .env)
+  # SPOTIFY_CLIENT_ID, SPOTIFY_CLIENT_SECRET
+  client_id: ""
+  client_secret: ""
+  redirect_uri: "http://localhost:8888/callback"
+
+media:
+  default_platform: "spotify"

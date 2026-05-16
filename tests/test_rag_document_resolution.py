@@ -145,14 +145,18 @@ def test_build_context_respects_excerpt_max_chars_and_numbering(monkeypatch):
                     "title": "doc1.md",
                     "parent_folder": "tmp",
                     "text": "A" * 250,
+                    "content": "A" * 250,
                     "score": 90.0,
+                    "metadata": {"filepath": "/tmp/doc1.md", "chunk_label": "section Intro", "chunk_type": "section", "language": "markdown"},
                 },
                 {
                     "path": "/tmp/doc2.md",
                     "title": "doc2.md",
                     "parent_folder": "tmp",
                     "text": "B" * 250,
+                    "content": "B" * 250,
                     "score": 89.0,
+                    "metadata": {"filepath": "/tmp/doc2.md", "chunk_label": "section Body", "chunk_type": "section", "language": "markdown"},
                 },
             ]
 
@@ -188,14 +192,18 @@ def test_build_context_skips_import_only_chunks(monkeypatch):
                     "title": "java_imports.java",
                     "parent_folder": "tmp",
                     "text": "import java.util.*;\nimport java.io.*;",
+                    "content": "import java.util.*;\nimport java.io.*;",
                     "score": 90.0,
+                    "metadata": {"filepath": "/tmp/java_imports.java", "chunk_label": "imports", "chunk_type": "prose", "language": "java"},
                 },
                 {
                     "path": "/tmp/java_mixed.java",
                     "title": "java_mixed.java",
                     "parent_folder": "tmp",
                     "text": "import java.util.*;\npublic class Demo { int x; }",
+                    "content": "import java.util.*;\npublic class Demo { int x; }",
                     "score": 89.0,
+                    "metadata": {"filepath": "/tmp/java_mixed.java", "chunk_label": "class Demo", "chunk_type": "class", "language": "java"},
                 },
             ]
 
@@ -203,7 +211,7 @@ def test_build_context_skips_import_only_chunks(monkeypatch):
     fake._is_import_only = PersonalRAGIndex._is_import_only
 
     ctx = PersonalRAGIndex.build_context(fake, "question", limit=2)
-    assert "java_imports.java" not in ctx  # import-only snippet must be skipped entirely
+    assert "import java.util" not in ctx  # import-only snippet must be skipped entirely
     assert "public class Demo" in ctx  # mixed snippet must retain meaningful code
 
 

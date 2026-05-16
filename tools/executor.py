@@ -41,9 +41,44 @@ class ToolResult:
 
 
 class ToolExecutor:
-    def __init__(self, tools: List[Callable]):
+    def __init__(self, tools: List[Callable], event_bus=None):
         self._tools = {tool.__name__: tool for tool in tools}
         self._schemas: Dict[str, dict] = {}
+        self.event_bus = event_bus
+
+    def get_tool_manifest(self) -> List[dict]:
+        """
+        Returns the JSON schema definitions for all registered tools.
+        Used to export tool capabilities to MCP servers or external frontends.
+        """
+        manifest = []
+        for name, func in self._tools.items():
+            schema = self._get_schema(name, func)
+            if schema:
+                if "function" in schema:
+                    manifest.append(schema)
+                else:
+                    manifest.append({"type": "function", "function": {"name": name, "parameters": schema}})
+        return manifest
+
+    def get_mcp_manifest(self) -> dict:
+        """MCP-compatible tool registration payload."""
+        tools = []
+        for name in self._tools:
+            schema = self._schemas.get(name) or self._get_schema(name, self._tools[name])
+            description = ""
+            func = self._tools.get(name)
+            if func and func.__doc__:
+                description = func.__doc__.strip().split("\n")[0]
+            parameters = schema if isinstance(schema, dict) else {}
+            if "properties" not in parameters and parameters.get("type") != "object":
+                parameters = {"type": "object", "properties": parameters, "additionalProperties": False}
+            tools.append({
+                "name": name,
+                "description": description,
+                "inputSchema": parameters,
+            })
+        return {"tools": tools}
 
     def _get_schema(self, tool_name: str, func: Callable) -> dict:
         if tool_name not in self._schemas:

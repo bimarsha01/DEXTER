@@ -10,9 +10,9 @@ from typing import Optional
 from utils.logger import get_logger
 
 try:
-    from tools.media_tool import play_music
+    from tools.media_tool import play_media
 except Exception:
-    play_music = None
+    play_media = None
 
 try:
     import winreg
@@ -225,8 +225,8 @@ def search_content_platform(query: str, platform: str = "", content_type: str = 
         return "You must provide something to search for."
 
     platform_key = _normalize_platform_name(platform)
-    if platform_key in {"spotify", "youtube music"} and play_music is not None:
-        return play_music(query, platform=platform_key)
+    if platform_key in {"spotify", "youtube music", "youtube", "apple music", "soundcloud"} and play_media is not None:
+        return play_media(query, platform=platform_key)
 
     logger.info(
         "browser_content_search",

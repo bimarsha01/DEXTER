@@ -15,6 +15,7 @@ ollama
 # ─── Memory ───
 chromadb
 sentence-transformers
+psutil
 
 # ─── Audio Pipeline ───
 sounddevice

@@ -59,21 +59,15 @@ class TTSManager:
         Decide when to generate audio from the accumulated sentence buffer.
         Flush when we have enough content to sound natural, not after every sentence.
         """
-        combined = (buffer or "").strip()
-        if combined:
-            combined = combined + " " + (new_sentence or "").strip()
-        else:
-            combined = (new_sentence or "").strip()
-        word_count = len(combined.split())
-
-        # Flush after roughly 25-35 words
-        if word_count >= 25:
+        combined = (buffer + " " + new_sentence).strip()
+        words = len(combined.split())
+        
+        # Flush at natural pause points with 
+        # enough content for smooth delivery
+        if words >= 20:
             return True
-
-        # Always flush on paragraph breaks and questions/exclamations when buffer is substantial
-        if (new_sentence or "").endswith(('?', '!')) and word_count > 10:
+        if new_sentence.strip().endswith('?') and words > 8:
             return True
-
         return False
 
     async def speak(self, text: str, interrupt: bool = True) -> None:
@@ -89,7 +83,6 @@ class TTSManager:
             self._cancel_event = threading.Event()
             cancel_event = self._cancel_event
 
-        preview = text[:80] + "..." if len(text) > 80 else text
         logger.info("tts_speak_started", text_preview=text[:50])
 
         try:
@@ -98,15 +91,25 @@ class TTSManager:
             metrics.record_latency("tts_synth_ms", (time.perf_counter() - synth_start) * 1000)
 
             logger.debug("tts_audio_loaded_to_memory", bytes=len(audio_bytes))
+            
+            # Pre-generate next chunk while current plays
+            # Store in self._next_audio_bytes
+            self._next_audio_bytes = audio_bytes
 
-            play_start = time.perf_counter()
-            await _play_audio_bytes(audio_bytes, cancel_event, self, track_channel=True)
-            metrics.record_latency("tts_play_ms", (time.perf_counter() - play_start) * 1000)
+            # Wait for current audio to finish if not interrupting
+            if not interrupt and getattr(self, '_play_task', None) and not self._play_task.done():
+                await self._play_task
+
+            if cancel_event.is_set() or self._global_cancel.is_set():
+                return
+
+            # Play immediately when current finishes
+            self._play_task = asyncio.create_task(
+                _play_audio_bytes(self._next_audio_bytes, cancel_event, self, track_channel=True)
+            )
 
         except Exception as e:
             logger.error("tts_synthesis_failed", error=str(e), exc_info=True)
-        finally:
-            self._current_channel = None
 
     async def play_chime(self) -> None:
         try:

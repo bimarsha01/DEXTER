@@ -30,6 +30,8 @@ _TOOL_MODULES: dict[str, list[str]] = {
     ],
     "tools.media_tool": [
         "play_music",
+        "pause_music",
+        "next_track",
     ],
     "tools.file_tools": [
         "create_note",
@@ -69,6 +71,9 @@ _TOOL_MODULES: dict[str, list[str]] = {
         "list_automation_routines",
         "run_automation_routine",
         "delete_automation_routine",
+    ],
+    "tools.briefing": [
+        "get_morning_briefing",
     ],
     "tools.vision_tools": [
         "read_workspace_file",

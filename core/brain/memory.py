@@ -75,6 +75,19 @@ class _LazyPersonalRAG:
             return ""
         return index.build_context(query, limit=limit, summary=summary)
 
+    def on_voice_activity(self) -> None:
+        if self._index is not None:
+            self._index.on_voice_activity()
+
+    def set_pipeline_state(self, state: str) -> None:
+        if self._index is not None:
+            self._index.set_pipeline_state(state)
+
+    def format_context_for_provider(self, results, query: str, provider: str = "gemini") -> str:
+        if self._index is None:
+            return ""
+        return self._index.format_context_for_provider(results, query, provider)
+
     def __getattr__(self, name: str):
         index = self._index
         if index is not None:

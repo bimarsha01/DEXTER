@@ -31,7 +31,7 @@ class ModelsConfig(BaseModel):
 class DefaultsConfig(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
-    city: str = "Kathmandu"
+    city: str = ""
 
 
 class SecurityConfig(BaseModel):
@@ -84,6 +84,14 @@ class RagConfig(BaseModel):
     boost_cap: float = 30.0
     refresh_only_when_idle: bool = True
     refresh_idle_threshold_seconds: float = 30.0
+    reranker_enabled: bool = True
+    reranker_model: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+    retrieval_candidates: int = 12
+    final_results: int = 5
+    background_batch_size: int = 64
+    background_batch_sleep_seconds: float = 2.0
+    background_embedding_threads: int = 2
+    cpu_throttle_threshold_percent: int = 65
 
 
 class WakeBehaviorConfig(BaseModel):
@@ -98,14 +106,28 @@ class WakeBehaviorConfig(BaseModel):
 class ActivationConfig(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
-    mode: str = "wake_word"
+    mode: str = "smart"
     wake_word: str = "dexter"
+    active_hours_start: str = "09:00"
+    active_hours_end: str = "18:00"
+    active_days: list[int] | None = None
+    always_on_after_n_interactions: int = 3
+    always_on_window_seconds: float = 120.0
+    always_on_timeout_seconds: float = 300.0
     clap_sensitivity: float = 3.0
     active_window_seconds: int = 30
     start_active: bool = False
     min_command_words: int = 2
     fallback_to_always_on_after_failures: int = 3
-    wake_words: list[str] = Field(default_factory=lambda: ["hey", "hey dexter"])
+    wake_words: list[str] = Field(default_factory=lambda: ["hey", "hey dexter", "dexter"])
+
+
+class MediaConfig(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    default_platform: str = "spotify"
+    spotify_client_id: str = ""
+    spotify_client_secret: str = ""
 
 
 class ProvidersConfig(BaseModel):
@@ -123,9 +145,9 @@ class AudioSettingsConfig(BaseModel):
     sample_rate: int = 16000
     chunk_size: int = 512
     device_index: int | None = None
-    vad_threshold: float = 0.3
+    vad_threshold: float = 0.25
     min_speech_duration_ms: int = 100
-    min_silence_duration_ms: int = 800
+    min_silence_duration_ms: int = 900
     speech_pad_ms: int = 400
     max_speech_duration_s: int = 30
 
@@ -142,7 +164,7 @@ class SttConfig(BaseModel):
     model: str | None = None
     beam_size: int = 5
     best_of: int = 5
-    temperature: float = 0.0
+    temperature: list[float] = Field(default_factory=lambda: [0.0, 0.2, 0.4])
     patience: float = 1.0
     log_prob_threshold: float = -1.0
     no_speech_threshold: float = 0.6
@@ -195,6 +217,22 @@ class PrivacyConfig(BaseModel):
     debug_log_transcripts: bool = False
 
 
+class SpotifyConfig(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    client_id: str = ""
+    client_secret: str = ""
+    redirect_uri: str = "http://localhost:8888/callback"
+
+
+class BriefingConfig(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    news_sources: list[str] = Field(default_factory=lambda: ["technology", "world"])
+    include_weather: bool = True
+    include_agenda: bool = True
+
+
 class DexterConfig(BaseModel):
     """
     Runtime configuration loaded from config.yaml plus .env (API keys).
@@ -219,6 +257,9 @@ class DexterConfig(BaseModel):
     proactive: ProactiveConfig = Field(default_factory=ProactiveConfig)
     runtime: RuntimeConfig = Field(default_factory=RuntimeConfig)
     privacy: PrivacyConfig = Field(default_factory=PrivacyConfig)
+    spotify: SpotifyConfig = Field(default_factory=SpotifyConfig)
+    briefing: BriefingConfig = Field(default_factory=BriefingConfig)
+    media: MediaConfig = Field(default_factory=MediaConfig)
 
     gemini_api_key: str = ""
     groq_api_key: str = ""
@@ -269,6 +310,7 @@ def _ensure_config_shape(config: dict) -> dict:
     config.setdefault("proactive", {})
     config.setdefault("runtime", {})
     config.setdefault("privacy", {})
+    config.setdefault("media", {})
     return config
 
 
@@ -319,6 +361,12 @@ def _load_raw_config() -> dict:
     api = config.pop("api_keys", {})
     config["gemini_api_key"] = os.getenv("GEMINI_API_KEY") or (api.get("gemini") or "")
     config["groq_api_key"] = os.getenv("GROQ_API_KEY") or (api.get("groq") or "")
+    
+    spotify = config.setdefault("spotify", {})
+    spotify["client_id"] = os.getenv("SPOTIFY_CLIENT_ID") or spotify.get("client_id", "")
+    spotify["client_secret"] = os.getenv("SPOTIFY_CLIENT_SECRET") or spotify.get("client_secret", "")
+    spotify["redirect_uri"] = os.getenv("SPOTIFY_REDIRECT_URI") or spotify.get("redirect_uri", "http://localhost:8888/callback")
+    
     return config
 
 

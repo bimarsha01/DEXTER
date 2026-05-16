@@ -12,27 +12,37 @@ from tools.pc_controls import APP_MAP
 logger = get_logger("transcript_correction")
 
 
-WAKE_WORD_ALIASES = {
-    "next up": "dexter",
-    "next star": "dexter",
-    "nectar": "dexter",
-    "decker": "dexter",
-    "next, ": "dexter, ",
+WAKE_WORD_CORRECTIONS = {
     "next up,": "dexter,",
+    "next up": "dexter",
     "next star,": "dexter,",
+    "next star": "dexter",
+    "nectar,": "dexter,",
+    "nectar": "dexter",
+    "decker,": "dexter,",
+    "decker": "dexter",
+    "next,": "dexter,",
 }
 
 
-def apply_wake_word_aliases(text: str) -> str:
-    """Normalize common wake-word ASR aliases before activation checks."""
+def apply_wake_word_corrections(text: str) -> str:
+    """Fix known Whisper mistranscriptions of the wake word 'Dexter'."""
     if not text:
         return text
 
-    corrected = text
-    for alias, canonical in WAKE_WORD_ALIASES.items():
-        pattern = re.compile(rf"\b{re.escape(alias)}\b", re.IGNORECASE)
-        corrected = pattern.sub(canonical, corrected)
-    return corrected
+    text_lower = text.lower()
+    for wrong, right in WAKE_WORD_CORRECTIONS.items():
+        if text_lower.startswith(wrong):
+            corrected = right + text[len(wrong):]
+            logger.info(
+                "wake_word_corrected",
+                original=text[:20],
+                corrected=corrected[:20],
+            )
+            return corrected
+    return text
+def apply_wake_word_aliases(text: str) -> str:
+    return apply_wake_word_corrections(text)
 
 
 @dataclass
@@ -102,6 +112,8 @@ class TranscriptCorrector:
             "reporting",
             "manager",
             "controller",
+            "util",
+            "helper",
         }
 
     def correct(self, text: str) -> CorrectionResult:
