@@ -25,6 +25,22 @@ def is_uri_handler_registered(protocol: str) -> bool:
         return False
 
 
+def play_media(query: str, platform: str | None = None) -> str:
+    """Play music, video, or podcast content using the best available platform."""
+    return play_music(query, platform=platform or "spotify")
+
+
+def play_test_sound() -> str:
+    """Play a short local test tone to verify audio output."""
+    try:
+        import winsound
+        winsound.Beep(880, 300)
+        return "Played a test tone."
+    except Exception as e:
+        logger.error("test_sound_failed", error=str(e), exc_info=True)
+        return "I couldn't play a test sound."
+
+
 def play_music(query: str, platform: str = "spotify") -> str:
     """Play music using native desktop apps (if installed) or web player fallbacks. No API key needed."""
     if not query:

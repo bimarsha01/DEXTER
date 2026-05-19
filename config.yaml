@@ -136,7 +136,11 @@ history:
   max_tokens: 1800
 
 mcp:
-  enabled: false
+  enabled: true
+  server_script: "mcp_server/dexter_mcp_server.py"
+  timeout_seconds: 15
+  # MCP server starts after Dexter is ready so startup speed is not affected
+  start_delay_seconds: 5
 
 proactive:
   enabled: true

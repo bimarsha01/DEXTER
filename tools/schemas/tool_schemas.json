@@ -163,6 +163,23 @@
         ],
         "additionalProperties": false
     },
+    "play_media": {
+        "type": "object",
+        "properties": {
+            "query": {
+                "type": "string",
+                "description": "Song, artist, album, video, or podcast to play."
+            },
+            "platform": {
+                "type": "string",
+                "description": "Target platform such as spotify, youtube, youtube music, apple music, or soundcloud."
+            }
+        },
+        "required": [
+            "query"
+        ],
+        "additionalProperties": false
+    },
     "play_youtube": {
         "type": "object",
         "properties": {
@@ -230,6 +247,14 @@
             "text": {
                 "type": "string",
                 "description": "Text to type into the active window."
+            },
+            "app_name": {
+                "type": "string",
+                "description": "Optional application name or window title to wait for before typing."
+            },
+            "wait_seconds": {
+                "type": "number",
+                "description": "Optional wait time before typing when no app name is provided."
             }
         },
         "required": [
@@ -538,5 +563,196 @@
                 "required": []
             }
         }
+    },
+    "mcp_read_file": {
+        "type": "object",
+        "properties": {
+            "path": {
+                "type": "string",
+                "description": "Absolute or rooted path to the text file to read."
+            }
+        },
+        "required": ["path"],
+        "additionalProperties": false
+    },
+    "mcp_write_file": {
+        "type": "object",
+        "properties": {
+            "path": {
+                "type": "string",
+                "description": "Path to write."
+            },
+            "content": {
+                "type": "string",
+                "description": "Text content to write."
+            },
+            "mode": {
+                "type": "string",
+                "description": "overwrite or append.",
+                "enum": ["overwrite", "append"]
+            }
+        },
+        "required": ["path", "content"],
+        "additionalProperties": false
+    },
+    "mcp_list_directory": {
+        "type": "object",
+        "properties": {
+            "path": {
+                "type": "string",
+                "description": "Directory path to list."
+            },
+            "pattern": {
+                "type": "string",
+                "description": "Glob pattern such as *.py or *."
+            },
+            "include_hidden": {
+                "type": "boolean",
+                "description": "Include dot files."
+            }
+        },
+        "required": ["path"],
+        "additionalProperties": false
+    },
+    "mcp_search_files": {
+        "type": "object",
+        "properties": {
+            "root": {
+                "type": "string",
+                "description": "Root directory for recursive search."
+            },
+            "query": {
+                "type": "string",
+                "description": "Search term (case-insensitive)."
+            },
+            "file_types": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Optional extensions like py, txt, md."
+            },
+            "search_content": {
+                "type": "boolean",
+                "description": "Also search inside file contents."
+            },
+            "max_results": {
+                "type": "integer",
+                "description": "Maximum matches (max 100)."
+            }
+        },
+        "required": ["root", "query"],
+        "additionalProperties": false
+    },
+    "mcp_create_directory": {
+        "type": "object",
+        "properties": {
+            "path": {
+                "type": "string",
+                "description": "Directory path to create."
+            }
+        },
+        "required": ["path"],
+        "additionalProperties": false
+    },
+    "mcp_read_word_doc": {
+        "type": "object",
+        "properties": {
+            "path": {
+                "type": "string",
+                "description": "Path to a .docx file."
+            }
+        },
+        "required": ["path"],
+        "additionalProperties": false
+    },
+    "mcp_read_excel": {
+        "type": "object",
+        "properties": {
+            "path": {
+                "type": "string",
+                "description": "Path to an Excel workbook."
+            },
+            "sheet": {
+                "type": "string",
+                "description": "Sheet name (optional)."
+            },
+            "max_rows": {
+                "type": "integer",
+                "description": "Maximum data rows to return."
+            }
+        },
+        "required": ["path"],
+        "additionalProperties": false
+    },
+    "mcp_read_pdf": {
+        "type": "object",
+        "properties": {
+            "path": {
+                "type": "string",
+                "description": "Path to a PDF file."
+            },
+            "max_pages": {
+                "type": "integer",
+                "description": "Maximum pages to extract."
+            }
+        },
+        "required": ["path"],
+        "additionalProperties": false
+    },
+    "mcp_list_emails": {
+        "type": "object",
+        "properties": {
+            "folder": {
+                "type": "string",
+                "description": "Outlook folder name (Inbox, Sent Items, Drafts, etc.)."
+            },
+            "count": {
+                "type": "integer",
+                "description": "Number of emails to return (max 50)."
+            },
+            "unread_only": {
+                "type": "boolean",
+                "description": "Only unread messages."
+            }
+        },
+        "required": [],
+        "additionalProperties": false
+    },
+    "mcp_create_email_draft": {
+        "type": "object",
+        "properties": {
+            "to": {
+                "type": "string",
+                "description": "Recipient email address(es)."
+            },
+            "subject": {
+                "type": "string",
+                "description": "Email subject."
+            },
+            "body": {
+                "type": "string",
+                "description": "Plain text body."
+            },
+            "cc": {
+                "type": "string",
+                "description": "Optional CC recipients."
+            }
+        },
+        "required": ["to", "subject", "body"],
+        "additionalProperties": false
+    },
+    "mcp_list_calendar_events": {
+        "type": "object",
+        "properties": {
+            "days_ahead": {
+                "type": "integer",
+                "description": "Days forward to include (max 90)."
+            },
+            "days_back": {
+                "type": "integer",
+                "description": "Days back to include (max 30)."
+            }
+        },
+        "required": [],
+        "additionalProperties": false
     }
 }

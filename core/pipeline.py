@@ -79,6 +79,7 @@ class AsyncPipeline:
         self._turn_count = 0
         self._consecutive_activation_drops = 0
         self._always_on_until = 0.0
+        self._diag_enabled = os.environ.get("DEXTER_DIAGNOSTIC", "0") == "1"
 
         act = config.activation
         smart_mode = (act.mode or "smart").strip().lower()
@@ -179,6 +180,10 @@ class AsyncPipeline:
 
     def _open_wake_window(self) -> None:
         self.awake_until = time.time() + self.command_window_seconds
+
+    def _diag(self, event: str, **fields) -> None:
+        if self._diag_enabled:
+            logger.info(f"diagnostic_{event}", **fields)
 
     def _handle_clap_activation(self) -> None:
         self._open_wake_window()
@@ -493,6 +498,10 @@ class AsyncPipeline:
         except Exception:
             pass
         return "gemini"
+
+    def _last_llm_provider(self) -> str:
+        provider = getattr(self.brain, "last_provider", None)
+        return provider or self._active_llm_provider()
 
     def _expand_project_query(self, query: str) -> str:
         """Expand project knowledge questions with likely code/file terms."""
@@ -883,6 +892,11 @@ class AsyncPipeline:
 
             effective_mode = self._effective_activation_mode()
             preprocessed_text = apply_wake_word_corrections(identified_text)
+            self._diag(
+                "transcript_received",
+                transcript=identified_text,
+                activation_mode=effective_mode,
+            )
 
             activation_cmd = self._detect_activation_command(preprocessed_text)
             if activation_cmd:
@@ -975,6 +989,12 @@ class AsyncPipeline:
                 {"mode": prev_mode, "reason": "interaction"},
             )
             logger.info("command_accepted", command=clean_command)
+            self._diag(
+                "command_accepted",
+                command=clean_command,
+                activation_mode=effective_mode,
+                bypass_activation=bypass_activation,
+            )
             # Advance turn counter for this accepted command
             self._turn_count += 1
 
@@ -1040,6 +1060,14 @@ class AsyncPipeline:
                 context_length=len(rag_context) if rag_context else 0,
                 preview=rag_context[:100] if rag_context else "EMPTY",
             )
+            rag_source_count = 0
+            if rag_context:
+                rag_source_count = rag_context.count("\n[")
+            self._diag(
+                "rag_context",
+                sources=rag_source_count,
+                context_chars=len(rag_context) if rag_context else 0,
+            )
             augmented_command = clean_command
             if rag_context:
                 augmented_command = f"{rag_context}\nUser question: {clean_command}"
@@ -1069,6 +1097,13 @@ class AsyncPipeline:
 
             self.event_bus.emit("response_generated", {"text": response_text, "correlation_id": cid})
             logger.info("response_complete", response_preview=response_text[:500])
+            self._diag(
+                "turn_complete",
+                command=clean_command,
+                provider_hint=self._last_llm_provider(),
+                response_preview=response_text[:200],
+                duration_ms=int((time.perf_counter() - turn_start) * 1000),
+            )
 
             try:
                 await asyncio.to_thread(

@@ -45,7 +45,13 @@ class DexterTranscriber:
         """
         self.beam_size = int(beam_size)
         self.best_of = int(best_of)
-        self.temperature = float(temperature)
+        # Handle both single float and list of floats
+        if isinstance(temperature, list):
+            self.temperature = temperature
+        elif temperature is None:
+            self.temperature = 0.0
+        else:
+            self.temperature = float(temperature)
         self.patience = float(patience)
         self.log_prob_threshold = float(log_prob_threshold)
         self.no_speech_threshold = float(no_speech_threshold)
@@ -95,6 +101,7 @@ class DexterTranscriber:
                 return self._model
 
             try:
+                logger.info("whisper_model_downloading", model=self.model_size)
                 # Use float16 for RTX GPUs to maximize speed and save VRAM
                 self._model = WhisperModel(self.model_size, device="cuda", compute_type="float16")
                 logger.info("transcriber_device_ready", device="cuda", compute_type="float16")
@@ -206,7 +213,7 @@ class DexterTranscriber:
             normalized_path,
             beam_size=self.beam_size,
             best_of=5,
-            temperature=[0.0, 0.2, 0.4],
+            temperature=self.temperature,
             condition_on_previous_text=False,
             initial_prompt=self._initial_prompt,
             vad_filter=True,

@@ -121,6 +121,55 @@ class ToolExecutor:
             clean[key] = value
         return clean
 
+    def _coerce_args_to_schema(self, args: dict, schema: dict) -> dict:
+        properties = schema.get("properties", {}) if schema else {}
+        if not properties or not args:
+            return args or {}
+
+        coerced = dict(args)
+        for key, value in args.items():
+            spec = properties.get(key) or {}
+            expected = spec.get("type")
+            if not expected:
+                continue
+            coerced[key] = self._coerce_scalar(value, expected)
+        return coerced
+
+    @staticmethod
+    def _coerce_scalar(value: Any, expected_type: str) -> Any:
+        if value is None:
+            return value
+        if expected_type == "integer":
+            if isinstance(value, bool):
+                return int(value)
+            if isinstance(value, int):
+                return value
+            if isinstance(value, float) and value.is_integer():
+                return int(value)
+            if isinstance(value, str):
+                try:
+                    return int(value.strip())
+                except ValueError:
+                    return value
+        if expected_type == "number":
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                return float(value)
+            if isinstance(value, str):
+                try:
+                    return float(value.strip())
+                except ValueError:
+                    return value
+        if expected_type == "boolean":
+            if isinstance(value, bool):
+                return value
+            if isinstance(value, str):
+                lowered = value.strip().lower()
+                if lowered in {"true", "1", "yes"}:
+                    return True
+                if lowered in {"false", "0", "no"}:
+                    return False
+        return value
+
     def _get_allowed_roots(self, config: DexterConfig) -> List[str]:
         roots = config.security.allowed_file_roots or []
         if any(str(r).strip() in {".", "./"} for r in roots):
@@ -233,6 +282,7 @@ class ToolExecutor:
         try:
             schema = self._get_schema(tool_name, func)
             clean_args = self._sanitize_args(tool_name, args or {}, schema)
+            clean_args = self._coerce_args_to_schema(clean_args, schema)
             self._validate_args(clean_args, schema)
             self._validate_paths(clean_args, config)
 

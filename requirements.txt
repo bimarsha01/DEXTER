@@ -46,3 +46,7 @@ yt-dlp
 python-docx
 pypdf
 openpyxl
+
+# ─── MCP Server ───
+fastmcp
+pywin32

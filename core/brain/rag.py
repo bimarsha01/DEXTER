@@ -484,6 +484,9 @@ class PersonalRAGIndex:
         self._embed_lock = threading.Lock()
         self._indexing_active = False
         self._reranker = None
+        self._reranker_ready = False
+        self._reranker_init_scheduled = False
+        self._startup_time = time.time()
         self._pipeline_state: str = "IDLE"
         self._last_voice_activity: float = 0.0
         self._query_cache: dict[str, tuple[list[dict], float]] = {}
@@ -593,6 +596,8 @@ class PersonalRAGIndex:
 
     def _should_refresh_now(self) -> bool:
         now = time.time()
+        if not self._last_snapshot and self._last_refresh <= 0:
+            return True
         if now - self._last_refresh < self._refresh_seconds:
             return False
 
@@ -772,7 +777,7 @@ class PersonalRAGIndex:
         if not chunks:
             return
         cfg = get_config()
-        if bool(getattr(cfg.rag, "refresh_only_when_idle", True)):
+        if bool(getattr(cfg.rag, "refresh_only_when_idle", True)) and self._last_snapshot:
             idle_threshold = float(getattr(cfg.rag, "refresh_idle_threshold_seconds", 30.0))
             if not session_activity.is_session_idle(idle_threshold):
                 self._next_poll_delay_seconds = 60.0
@@ -1034,6 +1039,17 @@ class PersonalRAGIndex:
     def _get_reranker(self):
         if not self._reranker_enabled:
             return None
+        if not self._reranker_ready:
+            elapsed = time.time() - getattr(self, "_startup_time", time.time())
+            if elapsed < 30.0:
+                if not self._reranker_init_scheduled:
+                    logger.debug(
+                        "rag_reranker_deferred_startup",
+                        wait_seconds=round(30.0 - elapsed, 2),
+                    )
+                    self._reranker_init_scheduled = True
+                return None
+            self._reranker_ready = True
         if self._reranker is None:
             try:
                 from sentence_transformers import CrossEncoder

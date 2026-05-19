@@ -4,9 +4,13 @@ Handles tool loading and dynamic execution for any LLM backend.
 """
 import importlib
 import json
-from typing import Callable
+import os
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Callable, Optional
 
-from tools.executor import ToolExecutor
+from tools.executor import ToolExecutor, ToolResult
+from utils.config import get_config, get_workspace_root
 from utils.logger import get_logger
 
 logger = get_logger("tool_registry")
@@ -29,6 +33,7 @@ _TOOL_MODULES: dict[str, list[str]] = {
         "search_content_platform",
     ],
     "tools.media_tool": [
+        "play_media",
         "play_music",
         "pause_music",
         "next_track",
@@ -84,10 +89,29 @@ _TOOL_MODULES: dict[str, list[str]] = {
     ],
 }
 
+from mcp_server.client import MCP_TOOL_NAMES  # noqa: E402
+
 RAW_TOOLS: list[Callable] = []
 AVAILABLE_TOOLS: list[Callable] = []
 EXECUTOR: ToolExecutor = ToolExecutor([])
 _TOOLS_LOADED = False
+
+_mcp_client: Optional["MCPClient"] = None
+_mcp_ready = False
+
+
+def _make_mcp_stub(name: str) -> Callable:
+    """Placeholder so MCP tools appear in schema audit and LLM tool lists."""
+
+    async def _mcp_stub(**_kwargs):
+        return {
+            "success": False,
+            "error": "MCP tool must be invoked via execute_tool routing.",
+        }
+
+    _mcp_stub.__name__ = name
+    _mcp_stub.__doc__ = f"MCP-backed tool: {name}"
+    return _mcp_stub
 
 
 def _load_module_tools(module_path: str, tool_names: list[str]) -> list[Callable]:
@@ -111,6 +135,8 @@ def _build_tools() -> list[Callable]:
     tools: list[Callable] = []
     for module_path, tool_names in _TOOL_MODULES.items():
         tools.extend(_load_module_tools(module_path, tool_names))
+    for mcp_name in MCP_TOOL_NAMES:
+        tools.append(_make_mcp_stub(mcp_name))
     return tools
 
 
@@ -133,6 +159,87 @@ def load_tools():
     return AVAILABLE_TOOLS
 
 
+def _format_tool_result(result: ToolResult):
+    if result.success:
+        data = result.data
+        if isinstance(data, (dict, list)):
+            return json.dumps(data)
+        return data
+    return result.error or f"Execution of {result.tool_name} failed."
+
+
+async def initialize_mcp(config) -> bool:
+    """
+    Start the MCP server and register its tools.
+    Called after Dexter startup is complete.
+    Returns True if MCP started successfully.
+    """
+    global _mcp_client, _mcp_ready
+
+    if not getattr(config.mcp, "enabled", False):
+        logger.info("mcp_disabled_in_config")
+        return False
+
+    try:
+        from mcp_server.client import MCPClient
+
+        allowed_roots = getattr(config.security, "allowed_file_roots", []) or []
+        if not allowed_roots:
+            home = Path.home()
+            allowed_roots = [
+                home / "Documents",
+                home / "Desktop",
+                Path(get_workspace_root()),
+            ]
+        expanded_roots = []
+        for root in allowed_roots:
+            expanded = Path(str(root).replace("%USERPROFILE%", str(Path.home())))
+            expanded = Path(os.path.expandvars(os.path.expanduser(str(expanded))))
+            if not expanded.is_absolute():
+                expanded = Path(get_workspace_root()) / expanded
+            expanded_roots.append(str(expanded.resolve()))
+
+        _mcp_client = MCPClient(
+            server_script=getattr(
+                config.mcp,
+                "server_script",
+                "mcp_server/dexter_mcp_server.py",
+            ),
+            allowed_roots=expanded_roots,
+            timeout=float(getattr(config.mcp, "timeout_seconds", 15.0)),
+        )
+
+        success = await _mcp_client.start()
+
+        if success:
+            _mcp_ready = True
+            mcp_tools = _mcp_client.get_available_tools()
+            logger.info(
+                "mcp_tools_registered",
+                count=len(mcp_tools),
+                tools=mcp_tools,
+            )
+
+        return success
+
+    except Exception as e:
+        logger.error(
+            "mcp_initialization_failed",
+            error=str(e),
+            exc_info=True,
+        )
+        _mcp_ready = False
+        return False
+
+
+async def shutdown_mcp() -> None:
+    global _mcp_client, _mcp_ready
+    if _mcp_client is not None:
+        await _mcp_client.stop()
+    _mcp_client = None
+    _mcp_ready = False
+
+
 async def execute_tool(func_name: str, arguments: dict, event_bus=None):
     """
     Dynamically finds and executes a tool by name with the given arguments.
@@ -140,12 +247,48 @@ async def execute_tool(func_name: str, arguments: dict, event_bus=None):
     """
     if not _TOOLS_LOADED:
         load_tools()
+
+    if func_name.startswith("mcp_"):
+        if _mcp_ready and _mcp_client is not None:
+            try:
+                EXECUTOR._validate_paths(arguments or {}, get_config())
+            except ValueError as exc:
+                logger.warning(
+                    "mcp_path_validation_failed",
+                    tool_name=func_name,
+                    error=str(exc),
+                )
+                return str(exc)
+
+            mcp_tool_name = func_name[4:]
+            mcp_result = await _mcp_client.call_tool(mcp_tool_name, arguments or {})
+            tool_result = ToolResult(
+                success=mcp_result.success,
+                data=mcp_result.data,
+                error=mcp_result.error,
+                tool_name=func_name,
+                duration_ms=mcp_result.duration_ms,
+                timestamp=datetime.now(timezone.utc),
+            )
+            if event_bus is not None and tool_result.success:
+                event_bus.emit("tool_called", {"tool_name": func_name, "args": arguments})
+            if not tool_result.success:
+                logger.warning(
+                    "tool_dispatch_failed",
+                    tool_name=func_name,
+                    error=tool_result.error or "",
+                )
+            return _format_tool_result(tool_result)
+
+        logger.warning("mcp_tool_unavailable", tool_name=func_name)
+        return (
+            "MCP server is not available. File and document tools are "
+            "temporarily offline. Try again in a moment."
+        )
+
     result = await EXECUTOR.execute(func_name, arguments, event_bus=event_bus)
     if result.success:
-        data = result.data
-        if isinstance(data, (dict, list)):
-            return json.dumps(data)
-        return data
+        return _format_tool_result(result)
 
     logger.warning(
         "tool_dispatch_failed",

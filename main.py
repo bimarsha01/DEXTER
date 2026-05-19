@@ -55,16 +55,6 @@ def _setup_cuda_dlls():
 
 _setup_cuda_dlls()
 
-# ─── Module Imports ──────────────────────────────────────────────────────────
-from core.audio.transcriber import DexterTranscriber
-from core.audio.speaker import TTSManager
-from core.brain.llm_router import Brain
-from core.brain.memory import DexterMemory
-from core.event_bus import EventBus
-from core.pipeline import AsyncPipeline
-from core.proactive import ProactiveAssistant
-
-
 class _DisabledVADListener:
     def listen(self, *args, **kwargs):
         logger.warning(
@@ -118,6 +108,8 @@ async def main():
         logger.info("initializing_stage", stage="background_loaders")
         
         def _load_transcriber():
+            from core.audio.transcriber import DexterTranscriber
+
             stt_model = runtime_config.stt.model or runtime_config.models.whisper_model
             t = DexterTranscriber(
                 model_size=stt_model,
@@ -154,6 +146,8 @@ async def main():
         vad_loader = LazyLoader("VAD", _load_vad)
 
         def _load_memory():
+            from core.brain.memory import DexterMemory
+
             return DexterMemory(disable_rag_warming=runtime_config.runtime.disable_rag_warming)
 
         memory_loader = LazyLoader("Memory", _load_memory)
@@ -163,6 +157,8 @@ async def main():
         
         # TTS manager with cancellation support.
         if not safe_mode:
+            from core.audio.speaker import TTSManager
+
             tts_manager = TTSManager(voice=runtime_config.models.tts_voice)
             health_monitor.healthy("tts", "speaker ready")
         else:
@@ -181,15 +177,17 @@ async def main():
         def _sync_vocab():
             try:
                 logger.debug("vocabulary_sync_started")
-                builder = VocabularyBuilder()
-                builder.sync_all()
-                asr_engine.reload()
+                builder = VocabularyBuilder(asr_engine=asr_engine, config=runtime_config)
+                builder.build_all()
                 logger.debug("vocabulary_sync_completed")
             except Exception as e:
                 logger.warning("vocabulary_sync_failed", error=str(e))
         threading.Thread(target=_sync_vocab, daemon=True, name="VocabSync").start()
 
         # Connect to LLM backends (Gemini → Groq → Ollama)
+        from core.brain.llm_router import Brain
+        from core.event_bus import EventBus
+
         event_bus = EventBus()
         brain = Brain(event_bus=event_bus, asr_engine=asr_engine)
         health_monitor.healthy("brain", "llm router ready")
@@ -205,6 +203,8 @@ async def main():
 
         proactive = None
         if runtime_config.proactive.enabled and not runtime_config.runtime.disable_proactive_mode:
+            from core.proactive import ProactiveAssistant
+
             proactive = ProactiveAssistant(
                 event_bus=event_bus,
                 check_interval_seconds=runtime_config.proactive.reminder_check_seconds,
@@ -247,6 +247,8 @@ async def main():
         logger.info("assistant_ready", activation_mode=activation_mode, wake_words=wake_words)
         logger.info("boot_banner_bottom", char="═", repeat=60)
 
+        from core.pipeline import AsyncPipeline
+
         pipeline = AsyncPipeline(
             config=runtime_config,
             transcriber=transcriber,
@@ -262,9 +264,33 @@ async def main():
         if proactive is not None:
             proactive_task = asyncio.create_task(proactive.run())
 
+        from tools import registry as tool_registry
+
+        async def _start_mcp_background(config, registry_module):
+            """Start MCP server after a short delay so voice pipeline is responsive first."""
+            delay = float(getattr(config.mcp, "start_delay_seconds", 5.0))
+            await asyncio.sleep(delay)
+            success = await registry_module.initialize_mcp(config)
+            if success:
+                logger.info("mcp_ready_for_use")
+            else:
+                logger.warning(
+                    "mcp_unavailable",
+                    message="File and document tools will not be available this session.",
+                )
+
+        mcp_task = asyncio.create_task(
+            _start_mcp_background(runtime_config, tool_registry)
+        )
+
         try:
             await pipeline.run()
         finally:
+            mcp_task.cancel()
+            try:
+                await tool_registry.shutdown_mcp()
+            except Exception as e:
+                logger.warning("mcp_shutdown_error", error=str(e))
             if proactive_task is not None:
                 proactive_task.cancel()
 

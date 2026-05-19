@@ -191,6 +191,7 @@ def open_application(app_name: str) -> str:
     """Opens a Windows application by name (e.g., 'notepad', 'calculator', 'chrome', 'spotify')."""
     app_name = app_name.lower().strip()
     logger.info("app_open_requested", app_name=app_name)
+    ready_message = f"Successfully opened {app_name}. Ready for input."
 
     if any(ch in app_name for ch in ["&", "|", ";"]):
         return "Application name contains unsafe characters."
@@ -209,7 +210,7 @@ def open_application(app_name: str) -> str:
         if os.path.exists(cached_path):
             try:
                 subprocess.Popen([cached_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                return f"Successfully opened {app_name}."
+                return ready_message
             except Exception as e:
                 logger.error("app_open_cached_failed", app_name=app_name, error=str(e))
 
@@ -218,7 +219,7 @@ def open_application(app_name: str) -> str:
         try:
             webbrowser.open(command)
             logger.info("app_opened_as_url", app_name=app_name, url=command)
-            return f"Opened {app_name}."
+            return ready_message
         except Exception as e:
             logger.error("app_open_url_failed", app_name=app_name, error=str(e), exc_info=True)
             return f"Failed to open {app_name} in your browser."
@@ -230,7 +231,7 @@ def open_application(app_name: str) -> str:
                 _APP_CACHE[app_name] = resolved
             else:
                 os.startfile(command)
-            return f"Successfully opened {app_name}."
+            return ready_message
         except Exception as e:
             logger.debug("app_open_s1_failed", error=str(e))
 
@@ -239,7 +240,7 @@ def open_application(app_name: str) -> str:
         try:
             subprocess.Popen([reg_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             _APP_CACHE[app_name] = reg_path
-            return f"Successfully opened {app_name}."
+            return ready_message
         except Exception as e:
             logger.debug("app_open_s2_failed", error=str(e))
 
@@ -248,7 +249,7 @@ def open_application(app_name: str) -> str:
         try:
             subprocess.Popen([lnk_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             _APP_CACHE[app_name] = lnk_path
-            return f"Successfully opened {app_name}."
+            return ready_message
         except Exception as e:
             logger.debug("app_open_s5_failed", error=str(e))
 
@@ -257,13 +258,13 @@ def open_application(app_name: str) -> str:
         try:
             subprocess.Popen([fuzz_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             _APP_CACHE[app_name] = fuzz_path
-            return f"Successfully opened {app_name}."
+            return ready_message
         except Exception as e:
             logger.debug("app_open_s3_failed", error=str(e))
 
     try:
         subprocess.Popen(["cmd", "/c", "start", "", app_name])
-        return f"Attempted to open {app_name} via Windows Shell."
+        return ready_message
     except Exception as e:
         logger.error("app_open_start_failed", app_name=app_name, error=str(e), exc_info=True)
 

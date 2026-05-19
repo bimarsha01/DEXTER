@@ -187,7 +187,10 @@ class HistoryConfig(BaseModel):
 class McpConfig(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
-    enabled: bool = False
+    enabled: bool = True
+    server_script: str = "mcp_server/dexter_mcp_server.py"
+    timeout_seconds: float = 15.0
+    start_delay_seconds: float = 5.0
 
 
 class ProactiveConfig(BaseModel):

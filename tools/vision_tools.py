@@ -1,7 +1,9 @@
+import asyncio
 import base64
 import ctypes
 import io
 import os
+from functools import lru_cache
 from dataclasses import dataclass
 from typing import Optional
 
@@ -26,6 +28,84 @@ class ScreenCaptureResult:
     image_bytes: bytes
     foreground_window: str
     capture_mode: str
+
+
+def _summarize_foreground_window(title: str) -> str:
+    clean_title = (title or "").strip()
+    if not clean_title:
+        return "I can capture the screen, but I can't tell what's open from the window title alone."
+
+    lower_title = clean_title.lower()
+    app_suffixes = {
+        "brave": "Brave",
+        "google chrome": "Chrome",
+        "chrome": "Chrome",
+        "microsoft edge": "Microsoft Edge",
+        "edge": "Microsoft Edge",
+        "firefox": "Firefox",
+        "word": "Word",
+        "excel": "Excel",
+        "powerpoint": "PowerPoint",
+        "notepad": "Notepad",
+        "visual studio code": "Visual Studio Code",
+        "vscode": "Visual Studio Code",
+        "code": "Visual Studio Code",
+    }
+
+    for marker, app_name in app_suffixes.items():
+        if lower_title.endswith(f" - {marker}") or lower_title == marker:
+            content = clean_title[: -(len(marker) + 3)].strip(" -") if lower_title.endswith(f" - {marker}") else ""
+            if content:
+                return f"I can see {app_name} is open on {content}."
+            return f"I can see {app_name} is open."
+
+    if " - " in clean_title:
+        parts = [part.strip() for part in clean_title.split(" - ") if part.strip()]
+        if len(parts) >= 2:
+            page_title = parts[0]
+            app_name = parts[-1]
+            return f"I can see {app_name} is open on {page_title}."
+
+    return f"I can see a window titled {clean_title}."
+
+
+@lru_cache(maxsize=1)
+def _get_local_vision_captioner():
+    try:
+        import torch
+        from transformers import pipeline
+
+        device = 0 if torch.cuda.is_available() else -1
+        return pipeline(
+            "image-to-text",
+            model="Salesforce/blip-image-captioning-base",
+            device=device,
+        )
+    except Exception as e:
+        logger.debug("local_vision_captioner_unavailable", error=str(e), exc_info=True)
+        return None
+
+
+def _caption_screen_locally(capture: ScreenCaptureResult) -> str:
+    captioner = _get_local_vision_captioner()
+    if captioner is None:
+        return ""
+
+    try:
+        image = Image.open(io.BytesIO(capture.image_bytes)).convert("RGB")
+        result = captioner(image)
+        if isinstance(result, list) and result:
+            first_item = result[0]
+            if isinstance(first_item, dict):
+                caption = first_item.get("generated_text") or first_item.get("caption") or ""
+                return str(caption).strip()
+        if isinstance(result, dict):
+            caption = result.get("generated_text") or result.get("caption") or ""
+            return str(caption).strip()
+    except Exception as e:
+        logger.debug("local_screen_caption_failed", error=str(e), exc_info=True)
+
+    return ""
 
 
 def read_workspace_file(relative_path: str, max_chars: int = 4000) -> str:
@@ -259,6 +339,57 @@ def capture_screen(max_dimension: int = 1280) -> str:
     except Exception as e:
         logger.error("screen_capture_base64_failed", error=str(e), exc_info=True)
         return "I was unable to capture the screen."
+
+
+async def describe_screen(user_question: str, gemini_client) -> str:
+    """Capture the screen in memory and describe it with Gemini vision."""
+    try:
+        capture = capture_screen_for_vision()
+
+        from google.genai import types
+
+        response = await gemini_client.aio.models.generate_content(
+            model="gemini-2.0-flash",
+            contents=[
+                types.Content(parts=[
+                    types.Part.from_bytes(data=capture.image_bytes, mime_type="image/png"),
+                    types.Part(text=(
+                        f"The user asked: {user_question}\n\n"
+                        f"The foreground window title is: {capture.foreground_window}\n\n"
+                        "Describe what is on the screen in 2-3 sentences. Be specific about what content is visible — "
+                        "website names, video titles, document content, app names. Do not mention that you received a screenshot. "
+                        "Just describe what you see naturally."
+                    )),
+                ])
+            ],
+        )
+
+        return response.text or ""
+    except Exception as e:
+        logger.error("screen_describe_failed", error=str(e), exc_info=True)
+        if "capture" in locals():
+            summary = _summarize_foreground_window(capture.foreground_window)
+            return f"{summary} I can't inspect the pixels right now because my vision service is rate-limited."
+        return "I can't inspect the screen contents right now because my vision service is rate-limited."
+
+
+def describe_screen_without_vision() -> str:
+    """Return a local fallback description when Gemini vision is unavailable."""
+    try:
+        capture = capture_screen_for_vision()
+        local_caption = _caption_screen_locally(capture)
+        if local_caption:
+            return (
+                f"I can see a screenshot that looks like {local_caption}. "
+                f"{_summarize_foreground_window(capture.foreground_window)}"
+            ).strip()
+        summary = _summarize_foreground_window(capture.foreground_window)
+        if capture.foreground_window.strip():
+            return f"{summary} I can't inspect the pixels without Gemini vision."
+        return "I can capture the screen, but I can't inspect the pixels without Gemini vision."
+    except Exception as e:
+        logger.error("screen_fallback_failed", error=str(e), exc_info=True)
+        return "I can't inspect the screen contents right now."
 
 
 def _resize_image(image: Image.Image, max_dimension: int) -> Image.Image:

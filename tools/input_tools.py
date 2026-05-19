@@ -1,22 +1,111 @@
+import subprocess
+import time
+
 try:
     import pyautogui as _pyautogui
 except Exception:
     _pyautogui = None
-import time
+
+try:
+    import psutil
+except Exception:
+    psutil = None
+
+try:
+    import win32con
+    import win32gui
+    import win32process
+except Exception:
+    win32con = None
+    win32gui = None
+    win32process = None
+
 from utils.logger import get_logger
 
 logger = get_logger("input_tools")
 
-def type_text(text: str) -> str:
+def _foreground_matches_app(app_name: str) -> bool:
+    if win32gui is None:
+        return False
+
+    hwnd = win32gui.GetForegroundWindow()
+    if not hwnd:
+        return False
+
+    title = win32gui.GetWindowText(hwnd).lower()
+    needle = app_name.lower().strip()
+    if needle and needle in title:
+        return True
+
+    if win32process is not None and psutil is not None:
+        try:
+            _, pid = win32process.GetWindowThreadProcessId(hwnd)
+            process_name = psutil.Process(pid).name().lower()
+            if needle and needle in process_name:
+                return True
+        except Exception:
+            pass
+
+    return False
+
+
+def _focus_window_for_app(app_name: str) -> bool:
+    if win32gui is None:
+        return False
+
+    needle = app_name.lower().strip()
+    results: list[int] = []
+
+    def enum_windows_callback(hwnd, window_results):
+        try:
+            title = win32gui.GetWindowText(hwnd).lower()
+            if needle and needle in title:
+                window_results.append(hwnd)
+        except Exception:
+            pass
+
+    try:
+        win32gui.EnumWindows(enum_windows_callback, results)
+    except Exception:
+        return False
+
+    if not results:
+        return False
+
+    hwnd = results[0]
+    try:
+        if win32con is not None:
+            win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+        win32gui.SetForegroundWindow(hwnd)
+        time.sleep(0.5)
+        return True
+    except Exception:
+        return False
+
+
+def type_text(text: str, app_name: str | None = None, wait_seconds: float = 2.0) -> str:
     """
     Simulates keyboard typing to input text into the currently active window.
     """
-    logger.info("keyboard_type_started", text_length=len(text))
+    logger.info("keyboard_type_started", text_length=len(text), app_name=app_name or "")
     if _pyautogui is None:
         return "Keyboard automation is unavailable: missing pyautogui module."
     try:
-        # Give the user a brief second to focus the window if requested via voice
-        time.sleep(1)
+        if app_name:
+            deadline = time.time() + 5.0
+            found = False
+            while time.time() < deadline:
+                if _foreground_matches_app(app_name):
+                    found = True
+                    break
+                time.sleep(0.3)
+
+            if not found:
+                _focus_window_for_app(app_name)
+        else:
+            # Give the opened app time to gain focus before typing.
+            time.sleep(wait_seconds)
+
         _pyautogui.write(text, interval=0.01)
         return "Successfully typed the text into the active application."
     except Exception as e:

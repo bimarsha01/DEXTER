@@ -23,7 +23,7 @@ logger = get_logger("llm_router")
 from tools.registry import load_tools, execute_tool, EXECUTOR
 from tools.schema_registry import get_tool_schema
 from core.brain.intent_router import IntentRouter, PendingAction
-from tools.vision_tools import capture_screen_for_vision
+from tools.vision_tools import describe_screen, describe_screen_without_vision
 from utils.config import DexterConfig, get_config
 from core.event_bus import EventBus
 
@@ -52,6 +52,16 @@ TOOL_GROUPS = {
 }
 
 ALWAYS_INCLUDE = ["get_current_datetime", "get_weather", "open_application"]
+
+SCREEN_AWARENESS_TRIGGERS = [
+    "what am i looking at",
+    "what is on my screen",
+    "what do you see",
+    "describe my screen",
+    "what is on screen",
+    "what am i watching",
+    "what is playing",
+]
 
 
 class ProviderHealth:
@@ -107,6 +117,7 @@ class Brain:
         self.shared_history = []
         self.pending_action = None
         self.max_history_tokens = int(self._cfg.history.max_tokens)
+        self.last_provider: Optional[str] = None
         self._provider_health = ProviderHealth()
         self.provider_state = {
             "gemini": {"failures": 0, "score": 1.0, "cooldown_until": 0.0, "last_error": ""},
@@ -147,6 +158,10 @@ If they name a platform (Spotify, YouTube, Apple Music, etc.) include it.
 If they don't name a platform, omit platform and the tool uses their default.
 Never use open_application just to open a music app — use play_media so content gets searched.
 When asked to open an app: use open_application.
+When the user says to write or type something in a document that was just opened, always call type_text with the exact text they want.
+If the user refers to a previously opened document with words like "that document", "in Word", or "add to it", type into the currently active window without opening anything new.
+After opening any application always wait 2 seconds before typing into it.
+Never open an application that was not explicitly requested in the current message. If the user's message does not mention Notepad do not open Notepad. Only execute actions explicitly requested right now.
 
 Spoken response length depends on the request type:
 - Simple commands (open, close, volume, time, weather): 1 sentence maximum. Short and done.
@@ -154,7 +169,25 @@ Spoken response length depends on the request type:
 - When user asks to summarize, explain, describe, tell me about, or give details: speak naturally for as long as the topic needs. Do not cut yourself short. Cover the key points properly. Aim for 4-8 sentences for summaries.
 - Never pad with filler. Never cut off important information to stay short.
 
-When user asks to play music use play_media with song/artist and platform. Never use open_application for music — use play_media."""
+When user asks to play music use play_media with song/artist and platform. Never use open_application for music — use play_media.
+
+You have access to filesystem and document tools prefixed with mcp_. Use them when the user asks about files, documents, emails, or calendar events.
+
+When to use MCP tools:
+- mcp_read_file: when user asks to read any file
+- mcp_write_file: when user asks to save or create a file
+- mcp_list_directory: when user asks what is in a folder
+- mcp_search_files: when user asks to find a file
+- mcp_read_word_doc: when user asks about a Word document
+- mcp_read_excel: when user asks about a spreadsheet
+- mcp_read_pdf: when user asks about a PDF
+- mcp_list_emails: when user asks about emails
+- mcp_create_email_draft: when user asks to send or draft an email (always creates draft, never auto-sends)
+- mcp_list_calendar_events: when user asks about meetings, appointments, or schedule
+
+When using file tools you do not need the full path. Describe the file or folder naturally and combine with mcp_search_files to find it first if needed.
+
+Never use mcp_write_file to overwrite important system files. Always confirm with the user before writing to existing files."""
 
         # Initialize all three LLM backends
         self._init_gemini()
@@ -411,6 +444,29 @@ When user asks to play music use play_media with song/artist and platform. Never
         self.shared_history.append({"role": role, "content": content})
         self._prune_history_by_tokens()
 
+    def _sanitize_conversation_history(self, messages: list) -> list:
+        """
+        Remove malformed tool call messages from conversation history.
+        These appear when a tool call fails to parse and gets stored as raw text.
+        Keeping them confuses the LLM into repeating or hallucinating tool calls.
+        """
+        sanitized = []
+        for msg in messages or []:
+            content = msg.get("content", "") or ""
+            if isinstance(content, str) and (
+                "<function(" in content
+                or ("function_call" in content.lower() and "{" in content)
+            ):
+                logger.warning(
+                    "conversation_message_sanitized",
+                    role=msg.get("role"),
+                    preview=content[:80],
+                )
+                continue
+            sanitized.append(msg)
+
+        return sanitized
+
     @staticmethod
     def _truncate_rag_for_provider(rag_context: str, provider: str) -> str:
         if not rag_context:
@@ -554,15 +610,16 @@ When user asks to play music use play_media with song/artist and platform. Never
         return "\n\n".join(section for section in sections if section)
 
     def _build_shared_messages(self):
+        sanitized_history = self._sanitize_conversation_history(self.shared_history)
         return [
             {"role": msg["role"], "content": msg["content"]}
-            for msg in self.shared_history
+            for msg in sanitized_history
             if msg.get("content")
         ]
 
     def _build_gemini_contents(self, types):
         contents = []
-        for msg in self.shared_history:
+        for msg in self._sanitize_conversation_history(self.shared_history):
             role = "user" if msg["role"] == "user" else "model"
             contents.append(types.Content(
                 role=role,
@@ -602,6 +659,14 @@ When user asks to play music use play_media with song/artist and platform. Never
         metrics.update_provider_health(name, True, state["score"], state.get("cooldown_until", 0.0), str(error))
 
     def _emit_llm_event(self, event_type: str, **fields: Any) -> None:
+        provider = fields.get("provider")
+        if provider and event_type in {
+            "llm_stream_started",
+            "llm_stream_completed",
+            "llm_call_started",
+            "llm_call_completed",
+        }:
+            self.last_provider = str(provider)
         if self._event_bus:
             self._event_bus.emit(event_type, fields)
 
@@ -613,6 +678,25 @@ When user asks to play music use play_media with song/artist and platform. Never
         if "what day" in q or "day is it" in q or "today" in q:
             return True
         return False
+
+    @staticmethod
+    def _is_screen_awareness_query(command: str) -> bool:
+        cmd_lower = (command or "").lower()
+        return any(trigger in cmd_lower for trigger in SCREEN_AWARENESS_TRIGGERS)
+
+    async def _describe_screen_or_unavailable(self, user_question: str) -> str:
+        if not self._can_use_gemini():
+            logger.info("screen_awareness_unavailable", reason="vision_quota_exhausted")
+            return describe_screen_without_vision()
+
+        try:
+            description = await describe_screen(user_question, self.gemini_client)
+            if description and description.strip():
+                return description.strip()
+        except Exception as e:
+            logger.error("screen_awareness_failed", error=str(e), exc_info=True)
+
+        return describe_screen_without_vision()
 
     def _is_rate_limit_error(self, error: Exception) -> bool:
         # Be defensive: provider SDKs use different exception classes / messages.
@@ -664,7 +748,7 @@ When user asks to play music use play_media with song/artist and platform. Never
             if decision.action == "vision":
                 self.pending_action = None
                 prompt = self._compose_prompt(user_command, long_term_memory, indexed_context, provider="gemini")
-                response_text = await self._handle_vision(decision, prompt)
+                response_text = await self._handle_vision(decision, prompt, user_question=user_command)
                 self._add_history("user", user_command)
                 self._add_history("assistant", response_text)
                 return response_text
@@ -678,6 +762,12 @@ When user asks to play music use play_media with song/artist and platform. Never
                 self._add_history("user", user_command)
                 self._add_history("assistant", response_text)
                 return response_text
+
+        if self._is_screen_awareness_query(user_command):
+            response_text = await self._describe_screen_or_unavailable(user_command)
+            self._add_history("user", user_command)
+            self._add_history("assistant", response_text)
+            return response_text
 
         # Intent routing for high-value tools / vision
         decision = self.intent_router.detect_intent(user_command)
@@ -715,7 +805,7 @@ When user asks to play music use play_media with song/artist and platform. Never
 
         if decision.action == "vision":
             prompt = self._compose_prompt(user_command, long_term_memory, indexed_context, provider="gemini")
-            response_text = await self._handle_vision(decision, prompt)
+            response_text = await self._handle_vision(decision, prompt, user_question=user_command)
             self._add_history("user", user_command)
             self._add_history("assistant", response_text)
             return response_text
@@ -815,6 +905,13 @@ When user asks to play music use play_media with song/artist and platform. Never
     async def process_command_stream(self, user_command: str, long_term_memory: str = "", indexed_context: str = ""):
         if self.pending_action:
             response_text = await self.process_command(user_command, long_term_memory, indexed_context)
+            yield response_text
+            return
+
+        if self._is_screen_awareness_query(user_command):
+            response_text = await self._describe_screen_or_unavailable(user_command)
+            self._add_history("user", user_command)
+            self._add_history("assistant", response_text)
             yield response_text
             return
 
@@ -1011,24 +1108,10 @@ When user asks to play music use play_media with song/artist and platform. Never
             logger.debug("tool_summary_failed", tool=tool_name, error=str(e), exc_info=True)
             return f"[{tool_name}] (unavailable)"
 
-    async def _handle_vision(self, decision, prompt: str) -> str:
+    async def _handle_vision(self, decision, prompt: str, user_question: str | None = None) -> str:
+        question_text = user_question or prompt
         if decision.vision_mode == "screen":
-            try:
-                capture = await asyncio.to_thread(capture_screen_for_vision)
-            except Exception as e:
-                logger.error("vision_capture_failed", error=str(e), exc_info=True)
-                return "I was unable to capture the screen for analysis."
-            if self._can_use_provider("gemini", self.gemini_available):
-                vision_prompt = f"{prompt}\n\nCapture mode: {capture.capture_mode}\n"
-                if capture.foreground_window:
-                    vision_prompt += f"Foreground window (Active App): {capture.foreground_window}\n"
-                vision_prompt += (
-                    "Describe what is visible naturally and directly. Do not mention screenshots or files. "
-                    "If a Foreground window is provided, focus your description primarily on that application's content, as it is what the user is currently interacting with. "
-                    "CRITICAL: If you see a terminal, IDE, or code editor (e.g., VS Code, PyCharm, Command Prompt) running this assistant, COMPLETELY IGNORE IT. Describe the other applications visible on the screen (like web browsers, video players, etc.) instead."
-                )
-                return await self._process_gemini_vision(vision_prompt, capture.image_bytes)
-            return "Vision analysis is only available with Gemini at the moment."
+            return await self._describe_screen_or_unavailable(question_text)
 
         if decision.vision_mode == "file":
             if not decision.file_path:

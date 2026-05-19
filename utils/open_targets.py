@@ -19,6 +19,17 @@ _START_MENU_DIRS = [
 
 _DESKTOP_DIR = os.path.join(os.path.expanduser("~"), "Desktop")
 _DOCUMENTS_DIR = os.path.join(os.path.expanduser("~"), "Documents")
+_WORKSPACE_SKIP_NAMES = {".git", ".venv", "__pycache__", "node_modules"}
+
+_SUPPORTED_WORKSPACE_FILE_EXTS = {
+    ".md",
+    ".txt",
+    ".pdf",
+    ".docx",
+    ".json",
+    ".yaml",
+    ".yml",
+}
 
 _SUPPORTED_START_MENU_EXTS = {".lnk", ".appref-ms", ".url", ".exe"}
 
@@ -93,6 +104,7 @@ class OpenTargetIndex:
 
         self._add_candidates(self._collect_start_menu_entries())
         self._add_candidates(self._collect_desktop_entries())
+        self._add_candidates(self._collect_workspace_entries())
         self._add_candidates(self._collect_documents_entries())
         self._add_candidates(self._collect_process_entries())
 
@@ -142,6 +154,31 @@ class OpenTargetIndex:
             path = os.path.join(_DOCUMENTS_DIR, name)
             if os.path.isdir(path):
                 entries.append(OpenCandidate(name=name, source="documents", path=path, kind="path"))
+        return entries
+
+    def _collect_workspace_entries(self) -> list[OpenCandidate]:
+        entries: list[OpenCandidate] = []
+        try:
+            from utils.config import get_workspace_root
+
+            workspace_root = get_workspace_root()
+        except Exception:
+            workspace_root = ""
+
+        if not workspace_root or not os.path.isdir(workspace_root):
+            return entries
+
+        for name in os.listdir(workspace_root):
+            if name in _WORKSPACE_SKIP_NAMES:
+                continue
+            path = os.path.join(workspace_root, name)
+            if os.path.isdir(path):
+                entries.append(OpenCandidate(name=name, source="documents", path=path, kind="path"))
+                continue
+            ext = os.path.splitext(name)[1].lower()
+            if ext in _SUPPORTED_WORKSPACE_FILE_EXTS:
+                display = os.path.splitext(name)[0]
+                entries.append(OpenCandidate(name=display, source="documents", path=path, kind="path"))
         return entries
 
     def _collect_process_entries(self) -> list[OpenCandidate]:
