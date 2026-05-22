@@ -341,27 +341,8 @@ def summarize_document(path: str, max_bullets: int = 8) -> str:
     return "Summary:\n" + "\n".join(summary)
 
 
-def answer_document_question(path: str, question: str) -> str:
-    """Answer a question about a file or project.
-
-    Accepts a full path or a project name / partial description. If no exact path
-    is given, the tool finds the most relevant file using semantic search.
-    """
-    # Resolve the best document path and a confidence score
-    resolved_path, confidence = _resolve_best_document(path)
-    if not resolved_path:
-        # Try to offer top candidates from the RAG index
-        try:
-            rag = _get_rag_index()
-            candidates = rag.search(path, limit=3) if rag is not None else []
-            if candidates:
-                names = [os.path.basename(c.get('path') or c.get('title') or '') for c in candidates]
-                return f"I wasn't confident which file you meant. Top matches: {', '.join(names)}. Which one should I read?"
-        except Exception:
-            pass
-        return f"I could not find a file matching {path!r}."
-
-    # Read the file as text
+def _answer_from_resolved_document(resolved_path: str, question: str, confidence: float = 1.0, set_session_project: bool = False) -> str:
+    """Build an answer from a resolved file path without performing resolution."""
     text = _read_file_as_text(resolved_path)
     if not text or text.startswith("I could not") or text.startswith("No readable"):
         return text
@@ -369,13 +350,72 @@ def answer_document_question(path: str, question: str) -> str:
     ext = Path(resolved_path).suffix.lower()
     section = _extract_relevant_section(text, question, ext)
 
-    # Confidence-based behavior
-    if confidence < 0.5:
-        # Clarify: list top 3 candidates for user to choose
+    prefix = ""
+    if confidence < 0.7:
+        prefix = f"[Reading from {os.path.basename(resolved_path)} — confirm if that's not right]\n\n"
+
+    if set_session_project and confidence >= 0.65:
+        try:
+            session_state.set_current_project(
+                name=os.path.splitext(os.path.basename(resolved_path))[0],
+                resolved_path=resolved_path,
+                confidence=confidence,
+                # Sentinel: "just set" so pipeline can record a real turn number later.
+                set_at_turn=None,
+            )
+        except Exception:
+            logger.debug("set_current_project_failed", path=resolved_path, confidence=confidence)
+
+    if not section:
+        return prefix + summarize_document(resolved_path)
+
+    code_exts = {".java", ".py", ".js", ".ts", ".cs", ".go", ".cpp", ".kt", ".rb", ".rs"}
+    if ext in code_exts:
+        excerpt = section.strip()
+        preview = "\n".join(excerpt.splitlines()[:10])
+        return prefix + "Relevant code excerpt:\n" + preview
+
+    sentences = _split_sentences(section)
+    if not sentences:
+        return prefix + section[:1000]
+    scores = _score_sentences(sentences)
+    ranked = sorted(range(len(sentences)), key=lambda idx: scores[idx], reverse=True)[:3]
+    ranked.sort()
+    summary = " ".join(sentences[idx].strip() for idx in ranked if sentences[idx].strip())
+    return prefix + "Summary: " + summary
+
+
+def answer_document_file_question(path: str, question: str) -> str:
+    """Answer a question about a specific file path without semantic project lookup."""
+    if not path:
+        return "You must provide a file path."
+
+    resolved_path = str(Path(path).expanduser())
+    if not Path(resolved_path).exists():
+        return f"File not found: {path}"
+
+    return _answer_from_resolved_document(resolved_path, question, confidence=1.0, set_session_project=False)
+
+
+def answer_project_question(path: str, question: str) -> str:
+    """Answer a question about a project name or partial file reference using RAG lookup."""
+    resolved_path, confidence = _resolve_best_document(path)
+    if not resolved_path:
         try:
             rag = _get_rag_index()
             candidates = rag.search(path, limit=3) if rag is not None else []
-            names = [os.path.basename(c.get('path') or c.get('title') or '') for c in candidates]
+            if candidates:
+                names = [os.path.basename(c.get("path") or c.get("title") or "") for c in candidates]
+                return f"I wasn't confident which file you meant. Top matches: {', '.join(names)}. Which one should I read?"
+        except Exception:
+            pass
+        return f"I could not find a file matching {path!r}."
+
+    if confidence < 0.5:
+        try:
+            rag = _get_rag_index()
+            candidates = rag.search(path, limit=3) if rag is not None else []
+            names = [os.path.basename(c.get("path") or c.get("title") or "") for c in candidates]
             return f"I'm not confident which file you mean. Top candidates: {', '.join(names)}. Please confirm which file to read."
         except Exception:
             return "I'm not confident which file you mean. Could you provide the file path or more details?"
@@ -391,45 +431,19 @@ def answer_document_question(path: str, question: str) -> str:
         except Exception:
             logger.debug("project_summary_blend_failed", path=path, question=question, exc_info=True)
 
-    prefix = ""
-    if 0.5 <= confidence < 0.7:
-        prefix = f"[Reading from {os.path.basename(resolved_path)} — confirm if that's not right]\n\n"
+    return _answer_from_resolved_document(resolved_path, question, confidence=confidence, set_session_project=True)
 
-    # If confident enough, set session-scoped current_project (>= 0.65)
-    try:
-        if confidence >= 0.65:
-            session_state.set_current_project(
-                name=os.path.splitext(os.path.basename(resolved_path))[0],
-                resolved_path=resolved_path,
-                confidence=confidence,
-                # Sentinel: "just set" so pipeline can record a real turn number later.
-                set_at_turn=None,
-            )
-    except Exception:
-        logger.debug('set_current_project_failed', path=resolved_path, confidence=confidence)
 
-    # Produce an extractive answer; prefer concise summarization
-    if not section:
-        return prefix + summarize_document(resolved_path)
+def answer_document_question(path: str, question: str) -> str:
+    """Answer a question about a file or project.
 
-    # For code, present the extracted blocks as relevant excerpts
-    code_exts = {".java", ".py", ".js", ".ts", ".cs", ".go", ".cpp", ".kt", ".rb", ".rs"}
-    if ext in code_exts:
-        excerpt = section.strip()
-        # Short spoken preview first, then offer to read more
-        preview = "\n".join(excerpt.splitlines()[:10])
-        return prefix + "Relevant code excerpt:\n" + preview
-
-    # Non-code: summarize the extracted section
-    # Reuse sentence scoring heuristic
-    sentences = _split_sentences(section)
-    if not sentences:
-        return prefix + section[:1000]
-    scores = _score_sentences(sentences)
-    ranked = sorted(range(len(sentences)), key=lambda idx: scores[idx], reverse=True)[:3]
-    ranked.sort()
-    summary = " ".join(sentences[idx].strip() for idx in ranked if sentences[idx].strip())
-    return prefix + "Summary: " + summary
+    If `path` is an existing file, answer directly from that file. Otherwise,
+    treat it as a project or partial name and resolve it through the RAG index.
+    """
+    candidate = Path(path).expanduser()
+    if candidate.exists():
+        return answer_document_file_question(str(candidate), question)
+    return answer_project_question(path, question)
 
 
 def _split_sentences(text: str) -> list[str]:

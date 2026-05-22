@@ -2,6 +2,7 @@ import asyncio
 import os
 import re
 import time
+from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
 from rapidfuzz import fuzz
@@ -21,6 +22,536 @@ from utils.config import DexterConfig
 from core.brain import session_state
 
 logger = get_logger("pipeline")
+
+
+@dataclass
+class TurnContext:
+    cid: str
+    turn_start: float
+    audio_path: str | None = None
+    identified_text: str = ""
+    preprocessed_text: str = ""
+    effective_mode: str = ""
+    bypass_activation: bool = False
+    clean_command: str = ""
+    memory_context: str = ""
+    rag_context: str = ""
+    augmented_command: str = ""
+    response_text: str = ""
+    provider_hint: str = ""
+    turn_timeout_seconds: float = 0.0
+    stop_turn: bool = False
+    stop_reason: str = ""
+
+
+class TurnStageError(RuntimeError):
+    def __init__(self, stage: str, message: str, *, cause: Exception | None = None) -> None:
+        super().__init__(message)
+        self.stage = stage
+        self.cause = cause
+
+
+class TurnController:
+    STAGE_TIMEOUTS = {
+        "transcribe": 10.0,
+        "activate": 5.0,
+        "retrieve_context": 5.0,
+        "execute_tools": 30.0,
+        "generate_response": 45.0,
+        "speak": 45.0,
+    }
+
+    def __init__(self, pipeline: "AsyncPipeline") -> None:
+        self.pipeline = pipeline
+
+    def _effective_stage_timeout(self, stage: str) -> float:
+        configured = float(getattr(self.pipeline.config.providers, "overall_turn_timeout_seconds", 0.0) or 0.0)
+        base = float(self.STAGE_TIMEOUTS.get(stage, 30.0))
+        if configured > 0:
+            return min(base, configured)
+        return base
+
+    def _stage_entry(self, stage: str, ctx: TurnContext) -> None:
+        logger.info(
+            "turn_stage_enter",
+            stage=stage,
+            cid=ctx.cid,
+            state=self.pipeline.state.name,
+        )
+
+    def _stage_exit(self, stage: str, ctx: TurnContext) -> None:
+        logger.info(
+            "turn_stage_exit",
+            stage=stage,
+            cid=ctx.cid,
+            state=self.pipeline.state.name,
+            stop_turn=ctx.stop_turn,
+        )
+
+    async def _run_stage(self, stage: str, ctx: TurnContext, handler, timeout: float) -> TurnContext:
+        self._stage_entry(stage, ctx)
+        try:
+            result = await asyncio.wait_for(handler(ctx), timeout=timeout)
+        except asyncio.TimeoutError as e:
+            raise TurnStageError(stage, f"{stage} stage timed out after {timeout:.1f}s", cause=e) from e
+        except TurnStageError:
+            raise
+        except Exception as e:
+            raise TurnStageError(stage, f"{stage} stage failed", cause=e) from e
+        self._stage_exit(stage, result)
+        return result
+
+    async def run_turn(self) -> None:
+        cid = bind_correlation_id(uuid4().hex)
+        turn_start = time.perf_counter()
+        ctx = TurnContext(cid=cid, turn_start=turn_start)
+
+        try:
+            self.pipeline._set_state(AssistantState.LISTENING)
+            ctx = await self._run_stage("transcribe", ctx, self._stage_transcribe, self._effective_stage_timeout("transcribe"))
+            if ctx.stop_turn:
+                return
+
+            ctx = await self._run_stage("activate", ctx, self._stage_activate, self._effective_stage_timeout("activate"))
+            if ctx.stop_turn:
+                return
+
+            ctx = await self._run_stage("retrieve_context", ctx, self._stage_retrieve_context, self._effective_stage_timeout("retrieve_context"))
+            if ctx.stop_turn:
+                return
+
+            ctx = await self._run_stage("execute_tools", ctx, self._stage_execute_tools, self._effective_stage_timeout("execute_tools"))
+            if ctx.stop_turn:
+                return
+
+            ctx = await self._run_stage("generate_response", ctx, self._stage_generate_response, self._effective_stage_timeout("generate_response"))
+            if ctx.stop_turn:
+                return
+
+            ctx = await self._run_stage("speak", ctx, self._stage_speak, self._effective_stage_timeout("speak"))
+
+            self.pipeline.event_bus.emit("response_generated", {"text": ctx.response_text, "correlation_id": ctx.cid})
+            logger.info("response_complete", response_preview=ctx.response_text[:500])
+            self.pipeline._diag(
+                "turn_complete",
+                command=ctx.clean_command,
+                provider_hint=ctx.provider_hint or self.pipeline._last_llm_provider(),
+                response_preview=ctx.response_text[:200],
+                duration_ms=int((time.perf_counter() - ctx.turn_start) * 1000),
+            )
+
+            try:
+                await asyncio.to_thread(
+                    self.pipeline.memory.remember,
+                    f"User: {ctx.clean_command} | Dexter: {ctx.response_text}",
+                )
+            except Exception as e:
+                logger.error("memory_save_failed", error=str(e), exc_info=True)
+
+            rag_proxy = getattr(self.pipeline.memory, "personal_rag", None)
+            if rag_proxy is not None and hasattr(rag_proxy, "on_voice_activity"):
+                try:
+                    rag_proxy.on_voice_activity()
+                except Exception:
+                    pass
+
+            self.pipeline._set_state(AssistantState.IDLE)
+        except TurnStageError as e:
+            logger.error(
+                "turn_stage_failed",
+                stage=e.stage,
+                error=str(e),
+                exc_info=True,
+            )
+            self.pipeline.event_bus.emit(
+                "error_occurred",
+                {"component": e.stage, "error": str(e)},
+            )
+            if e.stage == "generate_response":
+                try:
+                    await self.pipeline.tts.speak("I didn't get a response in time. Please try again.")
+                except Exception:
+                    pass
+            self.pipeline._set_state(AssistantState.IDLE)
+            await asyncio.sleep(1)
+        finally:
+            try:
+                duration_ms = (time.perf_counter() - turn_start) * 1000
+                metrics.record_latency("turn_ms", duration_ms)
+                self.pipeline.event_bus.emit("turn_completed", {"duration_ms": duration_ms})
+            except Exception:
+                pass
+            clear_correlation_id()
+
+    async def _stage_transcribe(self, ctx: TurnContext) -> TurnContext:
+        pipeline = self.pipeline
+        vad_start = time.perf_counter()
+
+        def _interrupt_handler():
+            logger.debug("interrupt_detected_stopping_tts", cid=ctx.cid)
+            pipeline.tts.stop()
+
+        try:
+            if pipeline.activation_mode == "clap":
+                audio_path = await asyncio.to_thread(
+                    pipeline.vad.listen,
+                    on_speech_start=_interrupt_handler,
+                    on_clap=pipeline._on_clap_detected,
+                    clap_sensitivity=pipeline.clap_sensitivity,
+                )
+            else:
+                audio_path = await asyncio.to_thread(
+                    pipeline.vad.listen,
+                    on_speech_start=_interrupt_handler,
+                )
+            ctx.audio_path = audio_path
+            metrics.record_latency("vad_ms", (time.perf_counter() - vad_start) * 1000)
+
+            if not audio_path:
+                logger.debug("vad_no_audio_captured", cid=ctx.cid)
+                pipeline._set_state(AssistantState.IDLE)
+                ctx.stop_turn = True
+                ctx.stop_reason = "no_audio"
+                return ctx
+
+            pipeline._set_state(AssistantState.TRANSCRIBING)
+            stt_start = time.perf_counter()
+
+            def _on_partial(text: str) -> None:
+                if not text:
+                    return
+                payload = {"text": text}
+                if pipeline._loop is not None:
+                    pipeline._loop.call_soon_threadsafe(pipeline.event_bus.emit, "transcript_partial", payload)
+                else:
+                    pipeline.event_bus.emit("transcript_partial", payload)
+
+            try:
+                identified_text = await asyncio.wait_for(
+                    asyncio.to_thread(pipeline.transcriber.transcribe, audio_path, on_partial=_on_partial),
+                    timeout=self.STAGE_TIMEOUTS["transcribe"],
+                )
+                metrics.record_latency("stt_ms", (time.perf_counter() - stt_start) * 1000)
+            except asyncio.TimeoutError as e:
+                logger.warning("transcription_timeout", cid=ctx.cid)
+                pipeline.event_bus.emit("error_occurred", {"component": "stt", "error": "transcription_timeout"})
+                raise TurnStageError("transcribe", "transcription timed out", cause=e) from e
+            except Exception as e:
+                logger.error("transcription_failed", error=str(e), exc_info=True)
+                pipeline.event_bus.emit("error_occurred", {"component": "stt", "error": str(e)})
+                raise TurnStageError("transcribe", "transcription failed", cause=e) from e
+
+            if not identified_text:
+                logger.debug("transcription_empty", cid=ctx.cid)
+                pipeline._set_state(AssistantState.IDLE)
+                ctx.stop_turn = True
+                ctx.stop_reason = "empty_transcript"
+                return ctx
+
+            privacy_cfg = getattr(pipeline.config, "privacy", None)
+            if privacy_cfg is not None and bool(getattr(privacy_cfg, "debug_log_transcripts", False)):
+                logger.info("utterance_started", cid=ctx.cid, transcript=identified_text)
+            else:
+                logger.debug("utterance_started", cid=ctx.cid, transcript_length=len(identified_text))
+            pipeline.event_bus.emit("transcript_received", {"text": identified_text, "correlation_id": ctx.cid})
+            logger.debug("transcript_final", text=identified_text)
+
+            if not pipeline._transcript_is_usable(identified_text):
+                logger.info("transcript_rejected_low_quality", transcript=identified_text)
+                pipeline._set_state(AssistantState.IDLE)
+                ctx.stop_turn = True
+                ctx.stop_reason = "low_quality_transcript"
+                return ctx
+
+            ctx.identified_text = identified_text
+            ctx.preprocessed_text = apply_wake_word_corrections(identified_text)
+            pipeline._diag("transcript_received", transcript=identified_text, activation_mode=pipeline._effective_activation_mode())
+            return ctx
+        except TurnStageError:
+            raise
+        except Exception as e:
+            raise TurnStageError("transcribe", "unexpected transcription stage failure", cause=e) from e
+
+    async def _stage_activate(self, ctx: TurnContext) -> TurnContext:
+        pipeline = self.pipeline
+        if ctx.stop_turn:
+            return ctx
+
+        effective_mode = pipeline._effective_activation_mode()
+        ctx.effective_mode = effective_mode
+
+        activation_cmd = pipeline._detect_activation_command(ctx.preprocessed_text)
+        if activation_cmd:
+            mode, duration, spoken = activation_cmd
+            pipeline._activation.set_override(mode, duration)  # type: ignore[arg-type]
+            pipeline.event_bus.emit(DexterEvents.ACTIVATION_MODE_CHANGED, {"mode": mode, "reason": "voice_command", "duration": duration})
+            await pipeline.tts.speak(spoken)
+            pipeline._set_state(AssistantState.IDLE)
+            ctx.stop_turn = True
+            ctx.stop_reason = "activation_command"
+            return ctx
+
+        if pipeline.asr_engine and pipeline._last_transcript:
+            intended = pipeline._detect_correction_intent(ctx.preprocessed_text)
+            if intended:
+                pipeline.asr_engine.confirm_correction(pipeline._last_transcript, intended)
+                ctx.preprocessed_text = intended
+                logger.info("user_corrected_asr", wrong=pipeline._last_transcript, right=intended)
+
+        pipeline._last_transcript = ctx.preprocessed_text
+
+        if effective_mode == "wake_word":
+            detection = pipeline.wake_detector.detect(ctx.preprocessed_text) if pipeline.wake_detector else None
+            bypass_activation = False
+
+            if detection and detection.triggered:
+                pipeline.event_bus.emit(DexterEvents.WAKE_WORD_DETECTED, {"transcript": ctx.preprocessed_text[:80]})
+                pipeline._open_wake_window()
+                clean_command = detection.cleaned_text
+                if not clean_command.strip():
+                    logger.info("wake_word_detected", wake_window_seconds=pipeline.command_window_seconds)
+                    pipeline._set_state(AssistantState.IDLE)
+                    ctx.stop_turn = True
+                    ctx.stop_reason = "wake_word_only"
+                    return ctx
+            elif pipeline._is_awake():
+                clean_command = ctx.preprocessed_text
+            else:
+                if pipeline._looks_actionable_utterance(ctx.preprocessed_text):
+                    clean_command = ctx.preprocessed_text
+                    bypass_activation = True
+                    pipeline._open_wake_window()
+                    logger.info("activation_bypassed", mode="wake_word", reason="actionable_utterance")
+                else:
+                    pipeline._activation.record_drop()
+                    pipeline._log_activation_failure(ctx.preprocessed_text, "wake_word_not_found")
+                    pipeline._record_activation_drop(ctx.preprocessed_text, "wake_word_not_detected")
+                    pipeline.event_bus.emit(DexterEvents.COMMAND_DROPPED, {"reason": "wake_word_required", "transcript": ctx.preprocessed_text[:50]})
+                    pipeline._set_state(AssistantState.IDLE)
+                    ctx.stop_turn = True
+                    ctx.stop_reason = "activation_required"
+                    return ctx
+
+            correction = pipeline.corrector.correct(clean_command)
+            ctx.clean_command = correction.corrected
+            ctx.bypass_activation = bypass_activation
+        else:
+            bypass_activation = False
+            if not pipeline._is_awake() and not pipeline.brain.pending_action:
+                if effective_mode == "always_on" or pipeline._looks_actionable_utterance(ctx.preprocessed_text):
+                    bypass_activation = True
+                    pipeline._open_wake_window()
+                    logger.info("activation_bypassed", mode=effective_mode, reason="actionable_utterance")
+                else:
+                    pipeline._log_activation_failure(ctx.preprocessed_text, "activation_not_awake")
+                    pipeline._set_state(AssistantState.IDLE)
+                    ctx.stop_turn = True
+                    ctx.stop_reason = "activation_not_awake"
+                    return ctx
+
+            correction = pipeline.corrector.correct(ctx.preprocessed_text)
+            ctx.clean_command = correction.corrected
+            ctx.bypass_activation = bypass_activation
+            if not bypass_activation and not pipeline.brain.pending_action and len(ctx.clean_command.split()) < pipeline.min_command_words:
+                pipeline._set_state(AssistantState.IDLE)
+                ctx.stop_turn = True
+                ctx.stop_reason = "too_short"
+                return ctx
+
+        pipeline._reset_activation_drop_counter()
+        pipeline._activation.record_interaction()
+        prev_mode = pipeline._activation.current_mode
+        pipeline.event_bus.emit(DexterEvents.ACTIVATION_MODE_CHANGED, {"mode": prev_mode, "reason": "interaction"})
+        logger.info("command_accepted", command=ctx.clean_command)
+        pipeline._diag("command_accepted", command=ctx.clean_command, activation_mode=effective_mode, bypass_activation=ctx.bypass_activation)
+        pipeline._turn_count += 1
+
+        try:
+            session_state.clear_if_stale(pipeline._turn_count)
+        except Exception:
+            pass
+
+        if pipeline.activation_mode == "clap":
+            pipeline._open_wake_window()
+            logger.info("activation_window_extended", seconds=pipeline.command_window_seconds)
+
+        pipeline._set_state(AssistantState.PROCESSING)
+        return ctx
+
+    async def _stage_retrieve_context(self, ctx: TurnContext) -> TurnContext:
+        pipeline = self.pipeline
+        if ctx.stop_turn:
+            return ctx
+
+        ctx.memory_context = await asyncio.to_thread(pipeline.memory.recall_context, ctx.clean_command, 3, False)
+
+        try:
+            proj = session_state.get_current_project()
+        except Exception:
+            proj = None
+
+        if proj:
+            set_at_turn = proj.get("set_at_turn")
+            if set_at_turn is None or int(set_at_turn or 0) == 0:
+                try:
+                    session_state.set_current_project(proj.get("name"), proj.get("resolved_path"), proj.get("confidence", 0.0), pipeline._turn_count)
+                except Exception:
+                    pass
+            rag_query = f"{proj.get('name')} {ctx.clean_command}"
+
+            rag_index = getattr(pipeline.memory, "personal_rag", None)
+            warm_evt = getattr(rag_index, "warm_up_complete", None) if rag_index is not None else None
+            try:
+                if (
+                    rag_index is not None
+                    and warm_evt is not None
+                    and hasattr(rag_index, "is_ready")
+                    and not rag_index.is_ready
+                    and pipeline._turn_count == 1
+                ):
+                    await asyncio.wait_for(warm_evt.wait(), timeout=1.5)
+            except asyncio.TimeoutError:
+                pass
+
+            ctx.rag_context = (
+                await pipeline._get_rag_context(rag_query, provider=pipeline._active_llm_provider())
+                if pipeline._should_use_rag(ctx.clean_command)
+                else ""
+            )
+            if ctx.rag_context:
+                ctx.rag_context = f"[Context: user is currently asking about {proj.get('name')}]\n" + ctx.rag_context
+        else:
+            ctx.rag_context = (
+                await pipeline._get_rag_context(ctx.clean_command, provider=pipeline._active_llm_provider())
+                if pipeline._should_use_rag(ctx.clean_command)
+                else ""
+            )
+
+        logger.debug("rag_context_result", has_context=bool(ctx.rag_context), context_length=len(ctx.rag_context) if ctx.rag_context else 0, preview=ctx.rag_context[:100] if ctx.rag_context else "EMPTY")
+        rag_source_count = ctx.rag_context.count("\n[") if ctx.rag_context else 0
+        pipeline._diag("rag_context", sources=rag_source_count, context_chars=len(ctx.rag_context) if ctx.rag_context else 0)
+        return ctx
+
+    async def _stage_execute_tools(self, ctx: TurnContext) -> TurnContext:
+        pipeline = self.pipeline
+        if ctx.stop_turn:
+            return ctx
+
+        ctx.provider_hint = pipeline._active_llm_provider()
+        ctx.augmented_command = ctx.clean_command
+        if ctx.rag_context:
+            ctx.augmented_command = f"{ctx.rag_context}\nUser question: {ctx.clean_command}"
+            ctx.augmented_command += "\nAnswer questions about files in maximum 4 sentences. User is listening not reading."
+
+        configured_timeout = float(getattr(pipeline.config.providers, "overall_turn_timeout_seconds", 30.0))
+        default_timeout = 45.0 if (ctx.rag_context and len(ctx.rag_context) > 100) else 20.0
+        ctx.turn_timeout_seconds = min(configured_timeout, default_timeout)
+        return ctx
+
+    async def _stage_generate_response(self, ctx: TurnContext) -> TurnContext:
+        pipeline = self.pipeline
+        if ctx.stop_turn:
+            return ctx
+
+        response_text = ""
+        async for chunk in pipeline.brain.process_command_stream(
+            ctx.augmented_command,
+            long_term_memory=ctx.memory_context,
+            indexed_context=ctx.rag_context,
+        ):
+            if not chunk:
+                continue
+            response_text += chunk
+            pipeline.event_bus.emit("response_chunk", {"text": chunk})
+
+        ctx.response_text = response_text.strip()
+        return ctx
+
+    async def _stage_speak(self, ctx: TurnContext) -> TurnContext:
+        pipeline = self.pipeline
+        if ctx.stop_turn:
+            return ctx
+
+        sentence_buffer = ""
+        speaking_started = False
+        sentences_queue: list[tuple[str, bool]] = []
+        sentence_buffer += ctx.response_text
+
+        sentences, sentence_buffer = pipeline._split_sentences(sentence_buffer)
+        for sentence in sentences:
+            if not speaking_started:
+                pipeline._set_state(AssistantState.SPEAKING)
+                speaking_started = True
+                interrupt = True
+            else:
+                interrupt = False
+            sentences_queue.append((sentence, interrupt))
+
+        if sentence_buffer.strip():
+            if not speaking_started:
+                pipeline._set_state(AssistantState.SPEAKING)
+                speaking_started = True
+                interrupt = True
+            else:
+                interrupt = False
+            sentences_queue.append((sentence_buffer.strip(), interrupt))
+
+        chunk_buffer = ""
+        first_chunk = True
+        for sentence, _interrupt in sentences_queue:
+            try:
+                flush = True
+                try:
+                    if hasattr(pipeline.tts, "should_flush_sentence_buffer"):
+                        flush = pipeline.tts.should_flush_sentence_buffer(chunk_buffer, sentence)
+                except Exception:
+                    flush = True
+
+                if flush and chunk_buffer.strip():
+                    try:
+                        words = len(chunk_buffer.split())
+                        est_seconds = max(0.5, (words / 2.5) + 0.5)
+                    except Exception:
+                        est_seconds = 2.0
+                    try:
+                        if hasattr(pipeline.vad, "suppress_for"):
+                            await asyncio.to_thread(pipeline.vad.suppress_for, est_seconds + 1.5)
+                    except Exception:
+                        pass
+                    try:
+                        await pipeline.tts.speak(chunk_buffer.strip(), interrupt=first_chunk)
+                    except Exception as e:
+                        logger.error("tts_speak_failed", error=str(e), exc_info=True)
+                        pipeline.event_bus.emit("error_occurred", {"component": "tts", "error": str(e)})
+                    chunk_buffer = ""
+                    first_chunk = False
+
+                if chunk_buffer:
+                    chunk_buffer += " " + sentence
+                else:
+                    chunk_buffer = sentence
+            except Exception as e:
+                logger.error("tts_chunking_failed", error=str(e), exc_info=True)
+
+        if chunk_buffer.strip():
+            try:
+                words = len(chunk_buffer.split())
+                est_seconds = max(0.5, (words / 2.5) + 0.5)
+            except Exception:
+                est_seconds = 2.0
+            try:
+                if hasattr(pipeline.vad, "suppress_for"):
+                    await asyncio.to_thread(pipeline.vad.suppress_for, est_seconds + 1.5)
+            except Exception:
+                pass
+            try:
+                await pipeline.tts.speak(chunk_buffer.strip(), interrupt=first_chunk)
+            except Exception as e:
+                logger.error("tts_speak_failed", error=str(e), exc_info=True)
+                pipeline.event_bus.emit("error_occurred", {"component": "tts", "error": str(e)})
+
+        pipeline.event_bus.emit("response_completed", {"text": ctx.response_text})
+        return ctx
 
 
 class AsyncPipeline:
@@ -80,6 +611,7 @@ class AsyncPipeline:
         self._consecutive_activation_drops = 0
         self._always_on_until = 0.0
         self._diag_enabled = os.environ.get("DEXTER_DIAGNOSTIC", "0") == "1"
+        self.turn_controller = TurnController(self)
 
         act = config.activation
         smart_mode = (act.mode or "smart").strip().lower()
@@ -791,341 +1323,4 @@ class AsyncPipeline:
             watchdog.cancel()
 
     async def _handle_once(self) -> None:
-        cid = bind_correlation_id(uuid4().hex)
-        turn_start = time.perf_counter()
-        self._set_state(AssistantState.LISTENING)
-        logger.debug("pipeline_listening_started", cid=cid)
-        
-        try:
-            vad_start = time.perf_counter()
-            
-            # Define a safe wrapper for the interrupt callback
-            def _interrupt_handler():
-                """Called when user starts speaking during TTS playback."""
-                logger.debug("interrupt_detected_stopping_tts", cid=cid)
-                self.tts.stop()
-            
-            if self.activation_mode == "clap":
-                audio_path = await asyncio.to_thread(
-                    self.vad.listen,
-                    on_speech_start=_interrupt_handler,
-                    on_clap=self._on_clap_detected,
-                    clap_sensitivity=self.clap_sensitivity,
-                )
-            else:
-                audio_path = await asyncio.to_thread(
-                    self.vad.listen, on_speech_start=_interrupt_handler
-                )
-            metrics.record_latency("vad_ms", (time.perf_counter() - vad_start) * 1000)
-
-            if not audio_path:
-                logger.debug("vad_no_audio_captured", cid=cid)
-                self._set_state(AssistantState.IDLE)
-                await asyncio.sleep(1)
-                return
-
-            self._set_state(AssistantState.TRANSCRIBING)
-            stt_start = time.perf_counter()
-
-            def _on_partial(text: str) -> None:
-                if not text:
-                    return
-                payload = {"text": text}
-                # Callback is invoked from a worker thread (transcription runs in to_thread).
-                # Marshal back to the asyncio event loop for thread safety.
-                if self._loop is not None:
-                    self._loop.call_soon_threadsafe(self.event_bus.emit, "transcript_partial", payload)
-                else:
-                    self.event_bus.emit("transcript_partial", payload)
-
-            try:
-                identified_text = await asyncio.wait_for(
-                    asyncio.to_thread(self.transcriber.transcribe, audio_path, on_partial=_on_partial),
-                    timeout=10.0,
-                )
-                metrics.record_latency("stt_ms", (time.perf_counter() - stt_start) * 1000)
-            except asyncio.TimeoutError:
-                logger.warning("transcription_timeout", cid=cid)
-                self.event_bus.emit(
-                    "error_occurred",
-                    {"component": "stt", "error": "transcription_timeout"},
-                )
-                self._set_state(AssistantState.IDLE)
-                return
-            except Exception as e:
-                logger.error("transcription_failed", error=str(e), exc_info=True)
-                self.event_bus.emit(
-                    "error_occurred",
-                    {"component": "stt", "error": str(e)},
-                )
-                self._set_state(AssistantState.IDLE)
-                return
-
-            if not identified_text:
-                logger.debug("transcription_empty", cid=cid)
-                self._set_state(AssistantState.IDLE)
-                return
-
-            privacy_cfg = getattr(self.config, "privacy", None)
-            if privacy_cfg is not None and bool(getattr(privacy_cfg, "debug_log_transcripts", False)):
-                logger.info(
-                    "utterance_started",
-                    cid=cid,
-                    transcript=identified_text,
-                )
-            else:
-                logger.debug(
-                    "utterance_started",
-                    cid=cid,
-                    transcript_length=len(identified_text),
-                )
-            self.event_bus.emit("transcript_received", {"text": identified_text, "correlation_id": cid})
-            logger.debug("transcript_final", text=identified_text)
-
-            if not self._transcript_is_usable(identified_text):
-                logger.info(
-                    "transcript_rejected_low_quality",
-                    transcript=identified_text,
-                )
-                self._set_state(AssistantState.IDLE)
-                return
-
-            effective_mode = self._effective_activation_mode()
-            preprocessed_text = apply_wake_word_corrections(identified_text)
-            self._diag(
-                "transcript_received",
-                transcript=identified_text,
-                activation_mode=effective_mode,
-            )
-
-            activation_cmd = self._detect_activation_command(preprocessed_text)
-            if activation_cmd:
-                mode, duration, spoken = activation_cmd
-                self._activation.set_override(mode, duration)  # type: ignore[arg-type]
-                self.event_bus.emit(
-                    DexterEvents.ACTIVATION_MODE_CHANGED,
-                    {"mode": mode, "reason": "voice_command", "duration": duration},
-                )
-                await self.tts.speak(spoken)
-                self._set_state(AssistantState.IDLE)
-                return
-
-            # Detect explicit correction ("I meant X") and train ASR engine
-            if self.asr_engine and self._last_transcript:
-                intended = self._detect_correction_intent(preprocessed_text)
-                if intended:
-                    self.asr_engine.confirm_correction(self._last_transcript, intended)
-                    preprocessed_text = intended
-                    logger.info("user_corrected_asr", wrong=self._last_transcript, right=intended)
-
-            self._last_transcript = preprocessed_text
-
-            if effective_mode == "wake_word":
-                detection = self.wake_detector.detect(preprocessed_text) if self.wake_detector else None
-                bypass_activation = False
-
-                if detection and detection.triggered:
-                    self.event_bus.emit(
-                        DexterEvents.WAKE_WORD_DETECTED,
-                        {"transcript": preprocessed_text[:80]},
-                    )
-                    self._open_wake_window()
-                    clean_command = detection.cleaned_text
-                    if not clean_command.strip():
-                        logger.info(
-                            "wake_word_detected",
-                            wake_window_seconds=self.command_window_seconds,
-                        )
-                        self._set_state(AssistantState.IDLE)
-                        return
-                elif self._is_awake():
-                    clean_command = preprocessed_text
-                else:
-                    if self._looks_actionable_utterance(preprocessed_text):
-                        clean_command = preprocessed_text
-                        bypass_activation = True
-                        self._open_wake_window()
-                        logger.info("activation_bypassed", mode="wake_word", reason="actionable_utterance")
-                    else:
-                        self._activation.record_drop()
-                        self._log_activation_failure(preprocessed_text, "wake_word_not_found")
-                        self._record_activation_drop(preprocessed_text, "wake_word_not_detected")
-                        self.event_bus.emit(
-                            DexterEvents.COMMAND_DROPPED,
-                            {"reason": "wake_word_required", "transcript": preprocessed_text[:50]},
-                        )
-                        self._set_state(AssistantState.IDLE)
-                        return
-
-                correction = self.corrector.correct(clean_command)
-                clean_command = correction.corrected
-            else:
-                bypass_activation = False
-                if not self._is_awake() and not self.brain.pending_action:
-                    if effective_mode == "always_on" or self._looks_actionable_utterance(preprocessed_text):
-                        bypass_activation = True
-                        self._open_wake_window()
-                        logger.info("activation_bypassed", mode=effective_mode, reason="actionable_utterance")
-                    else:
-                        self._log_activation_failure(preprocessed_text, "activation_not_awake")
-                        self._set_state(AssistantState.IDLE)
-                        return
-
-                correction = self.corrector.correct(preprocessed_text)
-                clean_command = correction.corrected
-                if (
-                    not bypass_activation
-                    and not self.brain.pending_action
-                    and len(clean_command.split()) < self.min_command_words
-                ):
-                    self._set_state(AssistantState.IDLE)
-                    return
-
-            self._reset_activation_drop_counter()
-            self._activation.record_interaction()
-            prev_mode = self._activation.current_mode
-            self.event_bus.emit(
-                DexterEvents.ACTIVATION_MODE_CHANGED,
-                {"mode": prev_mode, "reason": "interaction"},
-            )
-            logger.info("command_accepted", command=clean_command)
-            self._diag(
-                "command_accepted",
-                command=clean_command,
-                activation_mode=effective_mode,
-                bypass_activation=bypass_activation,
-            )
-            # Advance turn counter for this accepted command
-            self._turn_count += 1
-
-            # Clear stale project slot if needed
-            try:
-                session_state.clear_if_stale(self._turn_count)
-            except Exception:
-                pass
-            if self.activation_mode == "clap":
-                self._open_wake_window()
-                logger.info("activation_window_extended", seconds=self.command_window_seconds)
-            self._set_state(AssistantState.PROCESSING)
-            memory_context = await asyncio.to_thread(self.memory.recall_context, clean_command, 3, False)
-
-            # If a current_project session slot exists, prepend its name to the RAG query
-            try:
-                proj = session_state.get_current_project()
-            except Exception:
-                proj = None
-
-            if proj:
-                # Tools may set a sentinel (None) for "just set"; record the real turn now.
-                set_at_turn = proj.get("set_at_turn")
-                if set_at_turn is None or int(set_at_turn or 0) == 0:
-                    try:
-                        session_state.set_current_project(proj.get("name"), proj.get("resolved_path"), proj.get("confidence", 0.0), self._turn_count)
-                    except Exception:
-                        pass
-                rag_query = f"{proj.get('name')} {clean_command}"
-
-                # If this is the earliest project context and the RAG index is still warming,
-                # optionally wait briefly so we don't miss the first project turn.
-                rag_index = getattr(self.memory, "personal_rag", None)
-                warm_evt = getattr(rag_index, "warm_up_complete", None) if rag_index is not None else None
-                try:
-                    if (
-                        rag_index is not None
-                        and warm_evt is not None
-                        and hasattr(rag_index, "is_ready")
-                        and not rag_index.is_ready
-                        and self._turn_count == 1
-                    ):
-                        await asyncio.wait_for(warm_evt.wait(), timeout=1.5)
-                except asyncio.TimeoutError:
-                    pass
-
-                rag_context = (
-                    await self._get_rag_context(rag_query, provider=self._active_llm_provider())
-                    if self._should_use_rag(clean_command)
-                    else ""
-                )
-                if rag_context:
-                    rag_context = f"[Context: user is currently asking about {proj.get('name')}]\n" + rag_context
-            else:
-                rag_context = (
-                    await self._get_rag_context(clean_command, provider=self._active_llm_provider())
-                    if self._should_use_rag(clean_command)
-                    else ""
-                )
-            logger.debug(
-                "rag_context_result",
-                has_context=bool(rag_context),
-                context_length=len(rag_context) if rag_context else 0,
-                preview=rag_context[:100] if rag_context else "EMPTY",
-            )
-            rag_source_count = 0
-            if rag_context:
-                rag_source_count = rag_context.count("\n[")
-            self._diag(
-                "rag_context",
-                sources=rag_source_count,
-                context_chars=len(rag_context) if rag_context else 0,
-            )
-            augmented_command = clean_command
-            if rag_context:
-                augmented_command = f"{rag_context}\nUser question: {clean_command}"
-                augmented_command += "\nAnswer questions about files in maximum 4 sentences. User is listening not reading."
-
-            configured_timeout = float(getattr(self.config.providers, "overall_turn_timeout_seconds", 30.0))
-            default_timeout = 45.0 if (rag_context and len(rag_context) > 100) else 20.0
-            turn_timeout_seconds = min(configured_timeout, default_timeout)
-            try:
-                response_text = await asyncio.wait_for(
-                    self._stream_response(augmented_command, memory_context, rag_context),
-                    timeout=turn_timeout_seconds,
-                )
-            except asyncio.TimeoutError:
-                logger.error("pipeline_llm_timeout", turn_id=cid)
-                self.event_bus.emit(
-                    "error_occurred",
-                    {"component": "llm", "error": "pipeline_llm_timeout"},
-                )
-                await self.tts.speak("I didn't get a response in time. Please try again.")
-                self._set_state(AssistantState.IDLE)
-                return
-
-            if self.activation_mode == "clap" and self.brain.pending_action:
-                self._open_wake_window()
-                logger.info("activation_window_extended", seconds=self.command_window_seconds)
-
-            self.event_bus.emit("response_generated", {"text": response_text, "correlation_id": cid})
-            logger.info("response_complete", response_preview=response_text[:500])
-            self._diag(
-                "turn_complete",
-                command=clean_command,
-                provider_hint=self._last_llm_provider(),
-                response_preview=response_text[:200],
-                duration_ms=int((time.perf_counter() - turn_start) * 1000),
-            )
-
-            try:
-                await asyncio.to_thread(
-                    self.memory.remember,
-                    f"User: {clean_command} | Dexter: {response_text}",
-                )
-            except Exception as e:
-                logger.error("memory_save_failed", error=str(e), exc_info=True)
-
-            rag_proxy = getattr(self.memory, "personal_rag", None)
-            if rag_proxy is not None and hasattr(rag_proxy, "on_voice_activity"):
-                try:
-                    rag_proxy.on_voice_activity()
-                except Exception:
-                    pass
-
-            self._set_state(AssistantState.IDLE)
-        finally:
-            try:
-                duration_ms = (time.perf_counter() - turn_start) * 1000
-                metrics.record_latency("turn_ms", duration_ms)
-                self.event_bus.emit("turn_completed", {"duration_ms": duration_ms})
-            except Exception:
-                pass
-            clear_correlation_id()
+        await self.turn_controller.run_turn()
