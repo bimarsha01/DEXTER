@@ -372,17 +372,50 @@ class EmbeddingProfile:
         )
 
 
-_EMBEDDING_FN_CACHE: Dict[str, SentenceTransformerEmbeddingFunction] = {}
+_EMBEDDING_FN_CACHE: Dict[tuple[str, str], SentenceTransformerEmbeddingFunction] = {}
 _EMBEDDING_FN_LOCK = threading.Lock()
 
 
-def _get_embedding_fn(model_name: str) -> SentenceTransformerEmbeddingFunction:
+def _resolve_embedding_device(device: str | None) -> str:
+    requested = (device or "").strip()
+    if not requested or requested.lower() in {"auto", "default"}:
+        try:
+            import torch
+
+            return "cuda" if torch.cuda.is_available() else "cpu"
+        except Exception:
+            return "cpu"
+    return requested
+
+
+def _get_embedding_fn(model_name: str, device: str | None) -> SentenceTransformerEmbeddingFunction:
+    resolved_device = _resolve_embedding_device(device)
+    cache_key = (model_name, resolved_device)
     with _EMBEDDING_FN_LOCK:
-        if model_name not in _EMBEDDING_FN_CACHE:
-            logger.info("loading_embedding_model", model=model_name)
-            _EMBEDDING_FN_CACHE[model_name] = SentenceTransformerEmbeddingFunction(model_name=model_name)
-            logger.info("embedding_model_loaded", model=model_name)
-        return _EMBEDDING_FN_CACHE[model_name]
+        if cache_key not in _EMBEDDING_FN_CACHE:
+            logger.info("loading_embedding_model", model=model_name, device=resolved_device)
+            try:
+                _EMBEDDING_FN_CACHE[cache_key] = SentenceTransformerEmbeddingFunction(
+                    model_name=model_name,
+                    device=resolved_device,
+                )
+            except Exception as e:
+                if resolved_device != "cpu":
+                    logger.warning(
+                        "embedding_device_fallback",
+                        model=model_name,
+                        requested_device=resolved_device,
+                        error=str(e),
+                    )
+                    cache_key = (model_name, "cpu")
+                    _EMBEDDING_FN_CACHE[cache_key] = SentenceTransformerEmbeddingFunction(
+                        model_name=model_name,
+                        device="cpu",
+                    )
+                else:
+                    raise
+            logger.info("embedding_model_loaded", model=model_name, device=cache_key[1])
+        return _EMBEDDING_FN_CACHE[cache_key]
 
 
 
@@ -401,6 +434,7 @@ class PersonalRAGIndex:
         exclude_patterns: Optional[list[str]] = None,
         collection_name: str = "dexter_personal_rag",
         embedding_model: str = "BAAI/bge-base-en-v1.5",
+        embedding_device: str | None = None,
         index_schema_version: int = INDEX_SCHEMA_VERSION,
         max_context_chars: int = 3000,
         batch_size: int = 256,
@@ -416,6 +450,7 @@ class PersonalRAGIndex:
             f"{collection_name}_idxv{self._index_schema_version}_"
             f"{self._embedding_profile.collection_key}_{self.user_id}"
         )
+        self._embedding_device = embedding_device
         self._max_context_chars = max_context_chars
         self._batch_size = max(10, int(batch_size))
         self._max_embedding_threads = max(0, int(max_embedding_threads))
@@ -441,7 +476,7 @@ class PersonalRAGIndex:
         )
         # Preload embedding function (cached) for manual encoding
         if self._embedding_profile.provider != "chromadb-default":
-            self._ef = _get_embedding_fn(self._embedding_profile.model_name)
+            self._ef = _get_embedding_fn(self._embedding_profile.model_name, self._embedding_device)
         else:
             self._ef = None
 
@@ -455,6 +490,7 @@ class PersonalRAGIndex:
         self._last_snapshot: Dict[str, Dict[str, Any]] = {}
         self._snapshot_path = os.path.join(user_path, "snapshot.json")
         self._load_snapshot()
+        self._maybe_reset_snapshot_if_empty_index()
 
         self._index_lock = threading.RLock()
         self._poller: Optional[threading.Thread] = None
@@ -499,6 +535,7 @@ class PersonalRAGIndex:
             roots=self._roots,
             collection_name=self._collection_name,
             embedding_model=self._embedding_profile.model_name,
+            embedding_device=_resolve_embedding_device(self._embedding_device),
             index_schema_version=self._index_schema_version,
             chunk_size=self._chunk_size,
             batch_size=self._batch_size,
@@ -556,6 +593,17 @@ class PersonalRAGIndex:
             logger.info("rag_snapshot_loaded", path=self._snapshot_path, files=len(self._last_snapshot))
         except Exception as e:
             logger.warning("rag_snapshot_load_failed", error=str(e))
+
+    def _maybe_reset_snapshot_if_empty_index(self) -> None:
+        if not self._last_snapshot:
+            return
+        try:
+            if self._collection.count() == 0:
+                self._last_snapshot = {}
+                self._last_refresh = 0.0
+                logger.info("rag_snapshot_reset_empty_index", user=self.user_id)
+        except Exception as e:
+            logger.debug("rag_snapshot_count_failed", error=str(e))
 
     def _save_snapshot(self) -> None:
         """Save the file snapshot to disk."""
@@ -1711,6 +1759,7 @@ class MultiUserRAGManager:
             refresh_seconds=int(self._cfg.get("refresh_seconds", 600)),
             exclude_patterns=self._cfg.get("exclude_patterns", []),
             embedding_model=self._cfg.get("embedding_model", "BAAI/bge-base-en-v1.5"),
+            embedding_device=self._cfg.get("embedding_device"),
             index_schema_version=int(self._cfg.get("index_schema_version", INDEX_SCHEMA_VERSION)),
             max_context_chars=int(self._cfg.get("max_context_chars", 3000)),
             batch_size=int(self._cfg.get("batch_size", 256)),

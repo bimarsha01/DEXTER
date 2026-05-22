@@ -63,6 +63,7 @@ class RagConfig(BaseModel):
     persist_directory: str = "./memory_db"
     multi_user_enabled: bool = True
     embedding_model: str = "BAAI/bge-base-en-v1.5"
+    embedding_device: str = "auto"
     index_schema_version: int = 2
     max_context_chars: int = 3000
     batch_size: int = 256

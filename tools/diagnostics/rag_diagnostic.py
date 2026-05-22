@@ -25,15 +25,52 @@ print("="*70)
 try:
     cfg = get_config()
     memory = DexterMemory()
-    
+
     # Get RAG index state
-    rag = memory.personal_rag
+    rag_proxy = memory.personal_rag
+    if rag_proxy is None:
+        print("\n✗ ERROR in index state: personal_rag is disabled or unavailable")
+        raise SystemExit(1)
+
+    def _resolve_rag_index(proxy, timeout_seconds: float = 30.0):
+        index = getattr(proxy, "_index", None)
+        if index is not None:
+            return index
+        ready_event = getattr(proxy, "_ready", None)
+        if ready_event is not None:
+            try:
+                ready_event.wait(timeout_seconds)
+                index = getattr(proxy, "_index", None)
+                if index is not None:
+                    return index
+            except Exception:
+                pass
+        if hasattr(proxy, "is_ready"):
+            start = time.time()
+            while time.time() - start < timeout_seconds:
+                if getattr(proxy, "is_ready", False):
+                    return getattr(proxy, "_index", None) or proxy
+                time.sleep(0.5)
+        return getattr(proxy, "_index", None) or proxy
+
+    rag = _resolve_rag_index(rag_proxy)
+    if rag is None or not hasattr(rag, "_collection"):
+        print("\n✗ ERROR in index state: personal_rag is not ready")
+        raise SystemExit(1)
+
     collection = rag._collection
     collection_name = rag._collection_name
     embedding_model = rag._embedding_profile.model_name
     
     # Document count
     doc_count = collection.count()
+    if doc_count == 0:
+        print("\n! Collection is empty. Running an immediate refresh...")
+        try:
+            rag.refresh_incremental()
+        except Exception as e:
+            print(f"✗ Refresh failed: {e}")
+        doc_count = collection.count()
     print(f"\n✓ Collection name: {collection_name}")
     print(f"✓ Documents in collection: {doc_count}")
     print(f"✓ Embedding model: {embedding_model}")
@@ -208,6 +245,8 @@ print("\n" + "="*70)
 print("STEP 4 — CHUNK QUALITY ANALYSIS")
 print("="*70)
 
+ends_with_punct = False
+
 # Get Query 1 result (async pipeline state machine)
 query1_result = all_results[0]  # First query in DEXTER PROJECT set
 if query1_result["results"] and not query1_result["error"]:
@@ -268,6 +307,8 @@ if query2_result["results"] and not query2_result["error"]:
 print("\n" + "="*70)
 print("STEP 5 — SCORING ACCURACY ANALYSIS")
 print("="*70)
+
+gap = 0.0
 
 query1_result = all_results[0]
 if query1_result["results"] and not query1_result["error"]:
@@ -372,7 +413,10 @@ else:
 print(f"  Query speed: {speed_rating} (avg {avg_query_time:.0f}ms)")
 
 # Chunk quality: assess completeness
-chunk_complete_rating = "Good" if (query1_result["results"] and ends_with_punct) else "Acceptable"
+if query1_result["results"]:
+    chunk_complete_rating = "Good" if ends_with_punct else "Acceptable"
+else:
+    chunk_complete_rating = "Unknown"
 print(f"  Chunk quality: {chunk_complete_rating}")
 
 # Score discrimination

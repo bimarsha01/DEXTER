@@ -68,6 +68,7 @@ rag:
   chunk_overlap: 100         # Reduced from 120 for speed (still sufficient overlap)
   refresh_seconds: 1800
   embedding_model: "BAAI/bge-base-en-v1.5"   # High-quality BGE embeddings (keep for quality)
+  embedding_device: "cuda"                  # auto|cpu|cuda|cuda:0
   index_schema_version: 3    # Bump when collection layout or metadata changes
   max_context_chars: 3000    # Cap context injected into LLM prompts
   batch_size: 256            # Larger batches to reduce embedding round-trips

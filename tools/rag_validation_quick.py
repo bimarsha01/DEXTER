@@ -35,6 +35,7 @@ idx = PersonalRAGIndex(
     refresh_seconds=test_cfg.refresh_seconds,
     exclude_patterns=test_cfg.exclude_patterns,
     embedding_model=cfg.rag.embedding_model,
+    embedding_device=cfg.rag.embedding_device,
     index_schema_version=cfg.rag.index_schema_version,
     batch_size=cfg.rag.batch_size,
     max_embedding_threads=cfg.rag.max_embedding_threads,

@@ -142,6 +142,7 @@ class DexterMemory:
                     "exclude_patterns": cfg.rag.exclude_patterns,
                     "roots": cfg.rag.personal_roots,
                     "embedding_model": cfg.rag.embedding_model,
+                    "embedding_device": cfg.rag.embedding_device,
                     "index_schema_version": cfg.rag.index_schema_version,
                     "max_context_chars": cfg.rag.max_context_chars,
                     "batch_size": cfg.rag.batch_size,

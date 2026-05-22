@@ -173,6 +173,9 @@ class IntentRouter:
                 },
             )
 
+        if self._is_sound_test(normalized):
+            return IntentDecision(action="tool", tool_name="play_test_sound", args={})
+
         if self._is_temperature_request(normalized):
             city = self._extract_city(text)
             if not city and self.default_city:
@@ -408,6 +411,15 @@ class IntentRouter:
         if any(word in normalized for word in ["timer", "timesheet"]):
             return False
         return True
+
+    def _is_sound_test(self, normalized: str) -> bool:
+        return bool(
+            re.search(
+                r"\b(test|check)\s+(sound|audio|speaker)s?\b",
+                normalized,
+            )
+            or "sound test" in normalized
+        )
 
     def _infer_content_type(self, action: str, query: str, platform: str = "") -> str:
         text = f"{action} {query} {platform}".lower()

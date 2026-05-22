@@ -180,6 +180,11 @@
         ],
         "additionalProperties": false
     },
+    "play_test_sound": {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": false
+    },
     "play_youtube": {
         "type": "object",
         "properties": {

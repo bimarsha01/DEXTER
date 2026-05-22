@@ -35,6 +35,7 @@ _TOOL_MODULES: dict[str, list[str]] = {
     "tools.media_tool": [
         "play_media",
         "play_music",
+        "play_test_sound",
         "pause_music",
         "next_track",
     ],
