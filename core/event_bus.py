@@ -12,6 +12,7 @@ class DexterEvents:
     """Event names for GUI/MCP subscribers."""
 
     STATE_CHANGED = "state_changed"
+    TURN_STAGE = "turn_stage"
     TRANSCRIPT_READY = "transcript_ready"
     RAG_CONTEXT_USED = "rag_context_used"
     RAG_CONTEXT_EMPTY = "rag_context_empty"

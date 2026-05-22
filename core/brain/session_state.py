@@ -1,20 +1,286 @@
-"""In-memory session-scoped state for project context.
+"""Persistent session-scoped context storage for project and conversation state.
 
-This module provides a simple per-process, per-user session store for the
-`current_project` slot used by the Project & Document Q&A path. It is
-intentionally in-memory (no disk persistence) so it does not survive process
-restarts and remains session-scoped.
+The module exposes compatibility helpers for the existing current-project API
+while storing session state in SQLite so it survives restarts.
 """
-from typing import Optional, Dict, Any
-import threading
-import getpass
+from __future__ import annotations
 
-_lock = threading.RLock()
-_sessions: Dict[str, Dict[str, Any]] = {}
+import getpass
+import json
+import os
+import sqlite3
+import tempfile
+import threading
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Optional
+
+from utils.config import get_config
+from utils.logger import get_logger
+
+logger = get_logger("session_state")
 
 
 def _user_key(user: str | None = None) -> str:
     return (user or getpass.getuser() or "default").lower()
+
+
+@dataclass
+class ProjectContext:
+    name: str
+    source_path: str
+    confidence: float
+    last_confirmed_ts: float
+    user_scope: str
+
+    def to_row(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "source_path": self.source_path,
+            "confidence": float(self.confidence),
+            "last_confirmed_ts": float(self.last_confirmed_ts),
+            "user_scope": self.user_scope,
+        }
+
+    @classmethod
+    def from_row(cls, row: sqlite3.Row, user_scope: str) -> "ProjectContext | None":
+        if row is None:
+            return None
+        name = row["project_name"]
+        source_path = row["project_source_path"]
+        if not name and not source_path:
+            return None
+        return cls(
+            name=str(name or ""),
+            source_path=str(source_path or ""),
+            confidence=float(row["project_confidence"] or 0.0),
+            last_confirmed_ts=float(row["project_last_confirmed_ts"] or 0.0),
+            user_scope=user_scope,
+        )
+
+
+@dataclass
+class SessionContext:
+    project: ProjectContext | None = None
+    recent_turn_summaries: list[str] = field(default_factory=list)
+    user_preferences: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        self.recent_turn_summaries = [str(item) for item in self.recent_turn_summaries][-20:]
+        self.user_preferences = dict(self.user_preferences or {})
+
+
+class ContextStore:
+    """SQLite-backed persistent store for per-user session context."""
+
+    def __init__(self, db_path: str | None = None) -> None:
+        self._explicit_db_path = os.path.abspath(db_path) if db_path else None
+        self._lock = threading.RLock()
+
+    def _resolve_db_path(self) -> str:
+        if self._explicit_db_path:
+            return self._explicit_db_path
+        cfg = get_config()
+        base_dir = os.path.abspath(os.path.expandvars(os.path.expanduser(cfg.rag.persist_directory)))
+        return os.path.join(base_dir, "session_context.sqlite3")
+
+    def _ensure_parent_dir(self, db_path: str) -> None:
+        Path(db_path).parent.mkdir(parents=True, exist_ok=True)
+
+    @staticmethod
+    def _serialize_value(value: Any) -> str:
+        return json.dumps(value, ensure_ascii=False)
+
+    @staticmethod
+    def _deserialize_value(value: str | None) -> Any:
+        if value is None:
+            return None
+        try:
+            return json.loads(value)
+        except Exception:
+            return value
+
+    @staticmethod
+    def _init_schema(connection: sqlite3.Connection) -> None:
+        connection.execute("PRAGMA foreign_keys = ON")
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS session_context (
+                user_scope TEXT PRIMARY KEY,
+                project_name TEXT,
+                project_source_path TEXT,
+                project_confidence REAL,
+                project_last_confirmed_ts REAL,
+                updated_at REAL NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS recent_turn_summaries (
+                user_scope TEXT NOT NULL,
+                position INTEGER NOT NULL,
+                summary TEXT NOT NULL,
+                PRIMARY KEY (user_scope, position)
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS user_preferences (
+                user_scope TEXT NOT NULL,
+                pref_key TEXT NOT NULL,
+                pref_value TEXT NOT NULL,
+                PRIMARY KEY (user_scope, pref_key)
+            )
+            """
+        )
+
+    def save(self, session_context: SessionContext, user_scope: str | None = None) -> None:
+        scope = _user_key(user_scope or (session_context.project.user_scope if session_context.project else None))
+        payload = SessionContext(
+            project=session_context.project,
+            recent_turn_summaries=list(session_context.recent_turn_summaries)[-20:],
+            user_preferences=dict(session_context.user_preferences or {}),
+        )
+        if payload.project is not None and payload.project.user_scope != scope:
+            payload.project.user_scope = scope
+
+        db_path = self._resolve_db_path()
+        self._ensure_parent_dir(db_path)
+        db_parent = str(Path(db_path).parent)
+        temp_handle = tempfile.NamedTemporaryFile(
+            delete=False,
+            dir=db_parent,
+            prefix=f"{Path(db_path).stem}.",
+            suffix=".tmp",
+        )
+        temp_handle.close()
+        temp_path = temp_handle.name
+
+        try:
+            with sqlite3.connect(temp_path) as connection:
+                connection.row_factory = sqlite3.Row
+                self._init_schema(connection)
+                now = time.time()
+                connection.execute("DELETE FROM session_context WHERE user_scope = ?", (scope,))
+                connection.execute("DELETE FROM recent_turn_summaries WHERE user_scope = ?", (scope,))
+                connection.execute("DELETE FROM user_preferences WHERE user_scope = ?", (scope,))
+                connection.execute(
+                    """
+                    INSERT INTO session_context (
+                        user_scope,
+                        project_name,
+                        project_source_path,
+                        project_confidence,
+                        project_last_confirmed_ts,
+                        updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        scope,
+                        payload.project.name if payload.project else None,
+                        payload.project.source_path if payload.project else None,
+                        payload.project.confidence if payload.project else None,
+                        payload.project.last_confirmed_ts if payload.project else None,
+                        now,
+                    ),
+                )
+                for position, summary in enumerate(payload.recent_turn_summaries[-20:]):
+                    connection.execute(
+                        "INSERT INTO recent_turn_summaries (user_scope, position, summary) VALUES (?, ?, ?)",
+                        (scope, position, str(summary)),
+                    )
+                for pref_key, pref_value in payload.user_preferences.items():
+                    connection.execute(
+                        "INSERT INTO user_preferences (user_scope, pref_key, pref_value) VALUES (?, ?, ?)",
+                        (scope, str(pref_key), self._serialize_value(pref_value)),
+                    )
+                connection.commit()
+            os.replace(temp_path, db_path)
+        except Exception:
+            try:
+                os.remove(temp_path)
+            except Exception:
+                pass
+            raise
+
+    def load(self, user_scope: str | None = None) -> SessionContext:
+        scope = _user_key(user_scope)
+        db_path = self._resolve_db_path()
+        if not os.path.exists(db_path):
+            logger.warning("session_context_db_missing", path=db_path, user_scope=scope)
+            return SessionContext()
+
+        try:
+            with sqlite3.connect(db_path) as connection:
+                connection.row_factory = sqlite3.Row
+                self._init_schema(connection)
+                row = connection.execute(
+                    "SELECT * FROM session_context WHERE user_scope = ?",
+                    (scope,),
+                ).fetchone()
+                project = ProjectContext.from_row(row, scope) if row is not None else None
+                summaries_rows = connection.execute(
+                    "SELECT summary FROM recent_turn_summaries WHERE user_scope = ? ORDER BY position ASC",
+                    (scope,),
+                ).fetchall()
+                preference_rows = connection.execute(
+                    "SELECT pref_key, pref_value FROM user_preferences WHERE user_scope = ?",
+                    (scope,),
+                ).fetchall()
+                recent_turn_summaries = [str(item["summary"]) for item in summaries_rows]
+                user_preferences = {
+                    str(item["pref_key"]): self._deserialize_value(item["pref_value"])
+                    for item in preference_rows
+                }
+                return SessionContext(
+                    project=project,
+                    recent_turn_summaries=recent_turn_summaries,
+                    user_preferences=user_preferences,
+                )
+        except Exception as exc:
+            logger.warning("session_context_load_failed", path=db_path, user_scope=scope, error=str(exc), exc_info=True)
+            return SessionContext()
+
+    def clear(self) -> None:
+        db_path = self._resolve_db_path()
+        with self._lock:
+            try:
+                if os.path.exists(db_path):
+                    os.remove(db_path)
+            except Exception:
+                logger.warning("session_context_clear_failed", path=db_path, exc_info=True)
+            try:
+                db_parent = Path(db_path).parent
+                base_name = Path(db_path).name
+                for temp_path in db_parent.glob(f"{base_name}*.tmp"):
+                    try:
+                        temp_path.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+
+_STORE = ContextStore()
+_PROJECT_TURN_MARKERS: dict[str, int] = {}
+_CACHE_LOCK = threading.RLock()
+
+
+def get_session_context(user: str | None = None) -> SessionContext:
+    return _STORE.load(user_scope=user)
+
+
+def set_session_context(context: SessionContext, user: str | None = None) -> None:
+    _STORE.save(context, user_scope=user)
+
+
+def clear() -> None:
+    with _CACHE_LOCK:
+        _PROJECT_TURN_MARKERS.clear()
+    _STORE.clear()
 
 
 def set_current_project(
@@ -25,30 +291,48 @@ def set_current_project(
     user: str | None = None,
 ) -> None:
     """Set the current project slot for the session/user."""
-    key = _user_key(user)
-    with _lock:
-        s = _sessions.setdefault(key, {})
-        s["current_project"] = {
-            "name": name,
-            "resolved_path": resolved_path,
-            "confidence": float(confidence),
-            "set_at_turn": set_at_turn,
-        }
+    scope = _user_key(user)
+    context = _STORE.load(scope)
+    context.project = ProjectContext(
+        name=name,
+        source_path=resolved_path,
+        confidence=float(confidence),
+        last_confirmed_ts=time.time(),
+        user_scope=scope,
+    )
+    with _CACHE_LOCK:
+        if set_at_turn is not None:
+            _PROJECT_TURN_MARKERS[scope] = int(set_at_turn)
+    _STORE.save(context, scope)
 
 
 def get_current_project(user: str | None = None) -> Optional[Dict[str, Any]]:
     """Return the current project slot for the session/user or None."""
-    key = _user_key(user)
-    with _lock:
-        return _sessions.get(key, {}).get("current_project")
+    scope = _user_key(user)
+    context = _STORE.load(scope)
+    if context.project is None:
+        return None
+    with _CACHE_LOCK:
+        set_at_turn = _PROJECT_TURN_MARKERS.get(scope)
+    return {
+        "name": context.project.name,
+        "source_path": context.project.source_path,
+        "resolved_path": context.project.source_path,
+        "confidence": context.project.confidence,
+        "last_confirmed_ts": context.project.last_confirmed_ts,
+        "user_scope": context.project.user_scope,
+        "set_at_turn": set_at_turn,
+    }
 
 
 def clear_current_project(user: str | None = None) -> None:
     """Clear the current project slot for the session/user."""
-    key = _user_key(user)
-    with _lock:
-        if key in _sessions and "current_project" in _sessions[key]:
-            del _sessions[key]["current_project"]
+    scope = _user_key(user)
+    context = _STORE.load(scope)
+    context.project = None
+    with _CACHE_LOCK:
+        _PROJECT_TURN_MARKERS.pop(scope, None)
+    _STORE.save(context, scope)
 
 
 def clear_if_stale(current_turn: int, max_turns: int = 4, user: str | None = None) -> None:
@@ -57,12 +341,13 @@ def clear_if_stale(current_turn: int, max_turns: int = 4, user: str | None = Non
     if not slot:
         return
     set_at = slot.get("set_at_turn", 0)
+    scope = _user_key(user)
     if set_at is None:
+        threshold = max(1, int(max_turns))
+        if current_turn >= threshold:
+            clear_current_project(user)
         return
     set_at = int(set_at)
-    # `set_at_turn` is recorded when the project context was last "refreshed".
-    # Clearing is intended to happen after a fixed number of subsequent turns
-    # (counting the refresh turn as part of the window), so we subtract 1.
     threshold = max(0, int(max_turns) - 1)
     if current_turn - set_at >= threshold:
         clear_current_project(user)

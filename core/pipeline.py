@@ -71,34 +71,116 @@ class TurnController:
             return min(base, configured)
         return base
 
+    def _emit_stage_event(self, stage: str, status: str, ctx: TurnContext, **fields) -> None:
+        payload = {
+            "stage": stage,
+            "status": status,
+            "turn_id": ctx.cid,
+            "ts": time.time(),
+            **fields,
+        }
+        self.pipeline.event_bus.emit(DexterEvents.TURN_STAGE, payload)
+
+    def _record_stage_timing(self, stage: str, duration_ms: float) -> None:
+        if self.pipeline.health_monitor is None:
+            return
+        try:
+            self.pipeline.health_monitor.record_turn_stage(stage, duration_ms)
+        except Exception:
+            pass
+
     def _stage_entry(self, stage: str, ctx: TurnContext) -> None:
         logger.info(
             "turn_stage_enter",
             stage=stage,
-            cid=ctx.cid,
+            turn_id=ctx.cid,
             state=self.pipeline.state.name,
         )
+        self._emit_stage_event(stage, "start", ctx)
 
-    def _stage_exit(self, stage: str, ctx: TurnContext) -> None:
+    def _stage_exit(self, stage: str, ctx: TurnContext, duration_ms: float) -> None:
         logger.info(
             "turn_stage_exit",
             stage=stage,
-            cid=ctx.cid,
+            turn_id=ctx.cid,
             state=self.pipeline.state.name,
             stop_turn=ctx.stop_turn,
+            duration_ms=round(duration_ms, 2),
         )
+        self._emit_stage_event(stage, "done", ctx, duration_ms=round(duration_ms, 2))
 
     async def _run_stage(self, stage: str, ctx: TurnContext, handler, timeout: float) -> TurnContext:
         self._stage_entry(stage, ctx)
+        stage_start = time.perf_counter()
         try:
             result = await asyncio.wait_for(handler(ctx), timeout=timeout)
         except asyncio.TimeoutError as e:
+            duration_ms = (time.perf_counter() - stage_start) * 1000
+            self._record_stage_timing(stage, duration_ms)
+            logger.warning(
+                "turn_stage_time_budget_exceeded",
+                stage=stage,
+                turn_id=ctx.cid,
+                duration_ms=round(duration_ms, 2),
+                budget_ms=round(timeout * 1000, 2),
+            )
+            self._emit_stage_event(
+                stage,
+                "error",
+                ctx,
+                error=f"{stage} stage timed out after {timeout:.1f}s",
+                duration_ms=round(duration_ms, 2),
+            )
             raise TurnStageError(stage, f"{stage} stage timed out after {timeout:.1f}s", cause=e) from e
-        except TurnStageError:
+        except TurnStageError as e:
+            duration_ms = (time.perf_counter() - stage_start) * 1000
+            self._record_stage_timing(stage, duration_ms)
+            if duration_ms > timeout * 1000:
+                logger.warning(
+                    "turn_stage_time_budget_exceeded",
+                    stage=stage,
+                    turn_id=ctx.cid,
+                    duration_ms=round(duration_ms, 2),
+                    budget_ms=round(timeout * 1000, 2),
+                )
+            self._emit_stage_event(
+                stage,
+                "error",
+                ctx,
+                error=str(e),
+                duration_ms=round(duration_ms, 2),
+            )
             raise
         except Exception as e:
+            duration_ms = (time.perf_counter() - stage_start) * 1000
+            self._record_stage_timing(stage, duration_ms)
+            if duration_ms > timeout * 1000:
+                logger.warning(
+                    "turn_stage_time_budget_exceeded",
+                    stage=stage,
+                    turn_id=ctx.cid,
+                    duration_ms=round(duration_ms, 2),
+                    budget_ms=round(timeout * 1000, 2),
+                )
+            self._emit_stage_event(
+                stage,
+                "error",
+                ctx,
+                error=f"{stage} stage failed",
+                duration_ms=round(duration_ms, 2),
+            )
             raise TurnStageError(stage, f"{stage} stage failed", cause=e) from e
-        self._stage_exit(stage, result)
+        duration_ms = (time.perf_counter() - stage_start) * 1000
+        self._record_stage_timing(stage, duration_ms)
+        if duration_ms > timeout * 1000:
+            logger.warning(
+                "turn_stage_time_budget_exceeded",
+                stage=stage,
+                turn_id=ctx.cid,
+                duration_ms=round(duration_ms, 2),
+                budget_ms=round(timeout * 1000, 2),
+            )
+        self._stage_exit(stage, result, duration_ms)
         return result
 
     async def run_turn(self) -> None:
@@ -179,6 +261,13 @@ class TurnController:
                 duration_ms = (time.perf_counter() - turn_start) * 1000
                 metrics.record_latency("turn_ms", duration_ms)
                 self.pipeline.event_bus.emit("turn_completed", {"duration_ms": duration_ms})
+                if duration_ms > 60000:
+                    logger.error(
+                        "turn_total_time_budget_exceeded",
+                        turn_id=ctx.cid,
+                        duration_ms=round(duration_ms, 2),
+                        budget_ms=60000,
+                    )
             except Exception:
                 pass
             clear_correlation_id()

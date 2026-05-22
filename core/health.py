@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -28,6 +29,7 @@ class HealthMonitor:
         self.service_name = service_name
         self._lock = threading.RLock()
         self._checks: dict[str, HealthCheck] = {}
+        self._turn_stage_timings_ms: dict[str, deque[float]] = {}
         logger.info("health_monitor_initialized", service_name=service_name)
 
     def update(
@@ -57,6 +59,21 @@ class HealthMonitor:
     def unhealthy(self, name: str, details: str = "", latency_ms: float | None = None) -> None:
         self.update(name, "unhealthy", details=details, latency_ms=latency_ms, recoverable=False)
 
+    def record_turn_stage(self, stage: str, duration_ms: float) -> None:
+        with self._lock:
+            timings = self._turn_stage_timings_ms.setdefault(stage, deque(maxlen=10))
+            timings.append(float(duration_ms))
+
+    def turn_stage_averages(self) -> dict[str, dict[str, float | int]]:
+        with self._lock:
+            return {
+                stage: {
+                    "average_ms": (sum(values) / len(values)) if values else 0.0,
+                    "sample_count": len(values),
+                }
+                for stage, values in self._turn_stage_timings_ms.items()
+            }
+
     def snapshot(self) -> dict[str, Any]:
         with self._lock:
             now = time.time()
@@ -85,6 +102,7 @@ class HealthMonitor:
                 "service_name": self.service_name,
                 "healthy": healthy,
                 "checks": checks,
+                "turn_stage_averages_ms": self.turn_stage_averages(),
                 "updated_at": now,
             }
 
@@ -98,6 +116,13 @@ class HealthMonitor:
             latency = f", latency {check['latency_ms']:.0f}ms" if check["latency_ms"] is not None else ""
             detail = f", {check['details']}" if check["details"] else ""
             lines.append(f"- {name}: {check['status']}{latency}{detail}")
+        stage_avgs = snapshot.get("turn_stage_averages_ms") or {}
+        if stage_avgs:
+            lines.append("- turn stage averages (last 10 turns):")
+            for stage, values in stage_avgs.items():
+                lines.append(
+                    f"  - {stage}: {values['average_ms']:.0f}ms over {values['sample_count']} samples"
+                )
         return "\n".join(lines)
 
     @staticmethod
