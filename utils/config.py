@@ -79,12 +79,21 @@ class RagConfig(BaseModel):
         ]
     )
     # New user-tunable RAG settings
-    minimum_relevance_score: float = 45.0
+    minimum_relevance_score: float = Field(
+        default=45.0,
+        description="Minimum final score required for a RAG result to be kept after filtering.",
+    )
     max_results: int = 5
     excerpt_max_chars: int = 450
-    boost_cap: float = 30.0
+    boost_cap: float = Field(
+        default=30.0,
+        description="Maximum bonus score that filename and path boosting may add to a RAG hit.",
+    )
     refresh_only_when_idle: bool = True
-    refresh_idle_threshold_seconds: float = 30.0
+    refresh_idle_threshold_seconds: float = Field(
+        default=30.0,
+        description="Minimum idle window, in seconds, before background RAG refresh is allowed.",
+    )
     reranker_enabled: bool = True
     reranker_model: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"
     retrieval_candidates: int = 12
@@ -93,6 +102,62 @@ class RagConfig(BaseModel):
     background_batch_sleep_seconds: float = 2.0
     background_embedding_threads: int = 2
     cpu_throttle_threshold_percent: int = 65
+    reranker_startup_wait_seconds: float = Field(
+        default=30.0,
+        description="Minimum runtime before the reranker is allowed to initialize.",
+    )
+    filename_partial_ratio_threshold: float = Field(
+        default=70.0,
+        description="Minimum fuzzy partial-ratio score required to award a filename match bonus.",
+    )
+    filename_fuzzy_match_threshold: float = Field(
+        default=75.0,
+        description="Minimum fuzzy token-set score required to accept a filename-only project match.",
+    )
+    filename_parent_match_threshold: float = Field(
+        default=65.0,
+        description="Minimum fuzzy score required to boost a parent-folder or path-component match.",
+    )
+    filename_score_spread_threshold: float = Field(
+        default=5.0,
+        description="Allowed score spread between top matching blocks before document excerpts are blended.",
+    )
+    result_score_vector_weight: float = Field(
+        default=0.65,
+        description="Weight applied to vector similarity when composing the final RAG score.",
+    )
+    result_score_text_weight: float = Field(
+        default=0.30,
+        description="Weight applied to text similarity when composing the final RAG score.",
+    )
+    result_score_importance_weight: float = Field(
+        default=0.05,
+        description="Weight applied to metadata importance when composing the final RAG score.",
+    )
+    source_penalty_factor: float = Field(
+        default=0.55,
+        description="Multiplier applied to deprioritized files such as tests and diagnostics.",
+    )
+    feedback_penalty: float = Field(
+        default=0.15,
+        description="Fraction of score removed when a source has repeated negative retrieval feedback.",
+    )
+    project_confidence_threshold: float = Field(
+        default=0.7,
+        description="Minimum persisted project confidence required before using the project as a retrieval hint.",
+    )
+    document_confidence_low_threshold: float = Field(
+        default=0.5,
+        description="Below this confidence, document answers should ask for clarification.",
+    )
+    document_confidence_session_threshold: float = Field(
+        default=0.65,
+        description="At or above this confidence, a resolved document should be stored as the active project.",
+    )
+    document_confidence_summary_threshold: float = Field(
+        default=0.95,
+        description="Below this confidence, summary requests may blend multiple matching files.",
+    )
 
 
 class WakeBehaviorConfig(BaseModel):

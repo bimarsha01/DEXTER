@@ -13,6 +13,7 @@ class DexterEvents:
 
     STATE_CHANGED = "state_changed"
     TURN_STAGE = "turn_stage"
+    RETRIEVAL_EVENT = "retrieval_event"
     TRANSCRIPT_READY = "transcript_ready"
     RAG_CONTEXT_USED = "rag_context_used"
     RAG_CONTEXT_EMPTY = "rag_context_empty"

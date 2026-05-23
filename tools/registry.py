@@ -5,6 +5,7 @@ Handles tool loading and dynamic execution for any LLM backend.
 import importlib
 import json
 import os
+from dataclasses import asdict, is_dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Optional
@@ -163,9 +164,13 @@ def load_tools():
 def _format_tool_result(result: ToolResult):
     if result.success:
         data = result.data
+        if is_dataclass(data):
+            data = asdict(data)
         if isinstance(data, (dict, list)):
             return json.dumps(data)
-        return data
+        if isinstance(data, str):
+            return data
+        return str(data)
     return result.error or f"Execution of {result.tool_name} failed."
 
 
@@ -248,6 +253,14 @@ async def execute_tool(func_name: str, arguments: dict, event_bus=None):
     """
     if not _TOOLS_LOADED:
         load_tools()
+
+    if event_bus is not None and func_name in {"read_document", "summarize_document", "answer_document_question"}:
+        try:
+            from tools import document_tools
+
+            document_tools.set_event_bus(event_bus)
+        except Exception:
+            pass
 
     if func_name.startswith("mcp_"):
         if _mcp_ready and _mcp_client is not None:

@@ -20,12 +20,13 @@ from rapidfuzz import fuzz
 from utils.logger import get_logger
 from utils.config import get_config
 from core.session_activity import session_activity
+from core.feedback import FeedbackStore
+from core.brain import session_state
 
 logger = get_logger("personal_rag")
 
 # PRE-FIX AUDIT (read before changes):
-# 1. Minimum score: config.yaml rag.minimum_relevance_score (45.0);
-#    fallback MINIMUM_RELEVANCE_SCORE (55.0) in search() via get_config().
+# 1. Minimum score and related RAG thresholds now come from config.rag.
 # 2. _boost_filename_matches: called in PersonalRAGIndex.search() after vector scoring.
 # 3. RAG injection: pipeline._get_rag_context -> augmented_command + llm_router indexed_context.
 # 4. Reranking: none before this pass (vector + fuzz boost + threshold only).
@@ -157,7 +158,6 @@ class _LRUCache:
 
 
 INDEX_SCHEMA_VERSION = 3
-MINIMUM_RELEVANCE_SCORE = 55.0
 
 
 class StructureAwareChunker:
@@ -501,21 +501,25 @@ class PersonalRAGIndex:
 
         cfg = get_config()
         rag_cfg = cfg.rag
-        self._min_score = float(getattr(rag_cfg, "minimum_relevance_score", MINIMUM_RELEVANCE_SCORE))
-        self._retrieval_candidates = int(getattr(rag_cfg, "retrieval_candidates", 12))
-        self._final_results = int(getattr(rag_cfg, "final_results", 5))
-        self._reranker_enabled = bool(getattr(rag_cfg, "reranker_enabled", True))
-        self._reranker_model = str(getattr(rag_cfg, "reranker_model", RERANKER_MODEL_DEFAULT))
-        self._background_batch_size = int(getattr(rag_cfg, "background_batch_size", 64))
-        self._background_batch_sleep_seconds = float(
-            getattr(rag_cfg, "background_batch_sleep_seconds", 2.0)
-        )
-        self._background_embedding_threads = int(
-            getattr(rag_cfg, "background_embedding_threads", 2)
-        )
-        self._cpu_throttle_threshold_percent = int(
-            getattr(rag_cfg, "cpu_throttle_threshold_percent", 65)
-        )
+        self._min_score = float(rag_cfg.minimum_relevance_score)
+        self._retrieval_candidates = int(rag_cfg.retrieval_candidates)
+        self._final_results = int(rag_cfg.final_results)
+        self._reranker_enabled = bool(rag_cfg.reranker_enabled)
+        self._reranker_model = str(rag_cfg.reranker_model)
+        self._background_batch_size = int(rag_cfg.background_batch_size)
+        self._background_batch_sleep_seconds = float(rag_cfg.background_batch_sleep_seconds)
+        self._background_embedding_threads = int(rag_cfg.background_embedding_threads)
+        self._cpu_throttle_threshold_percent = int(rag_cfg.cpu_throttle_threshold_percent)
+        self._vector_score_weight = float(rag_cfg.result_score_vector_weight)
+        self._text_score_weight = float(rag_cfg.result_score_text_weight)
+        self._importance_score_weight = float(rag_cfg.result_score_importance_weight)
+        self._source_penalty_factor = float(rag_cfg.source_penalty_factor)
+        self._feedback_penalty = float(rag_cfg.feedback_penalty)
+        self._project_confidence_threshold = float(rag_cfg.project_confidence_threshold)
+        self._filename_partial_ratio_threshold = float(rag_cfg.filename_partial_ratio_threshold)
+        self._filename_fuzzy_match_threshold = float(rag_cfg.filename_fuzzy_match_threshold)
+        self._filename_parent_match_threshold = float(rag_cfg.filename_parent_match_threshold)
+        self._feedback_store = FeedbackStore()
 
         self._embed_lock = threading.Lock()
         self._indexing_active = False
@@ -539,6 +543,22 @@ class PersonalRAGIndex:
             index_schema_version=self._index_schema_version,
             chunk_size=self._chunk_size,
             batch_size=self._batch_size,
+        )
+        logger.info(
+            "rag_thresholds_active",
+            user=self.user_id,
+            minimum_relevance_score=self._min_score,
+            result_score_vector_weight=self._vector_score_weight,
+            result_score_text_weight=self._text_score_weight,
+            result_score_importance_weight=self._importance_score_weight,
+            source_penalty_factor=self._source_penalty_factor,
+            feedback_penalty=self._feedback_penalty,
+            filename_partial_ratio_threshold=self._filename_partial_ratio_threshold,
+            filename_fuzzy_match_threshold=self._filename_fuzzy_match_threshold,
+            filename_parent_match_threshold=self._filename_parent_match_threshold,
+            project_confidence_threshold=self._project_confidence_threshold,
+            boost_cap=float(rag_cfg.boost_cap),
+            refresh_idle_threshold_seconds=float(rag_cfg.refresh_idle_threshold_seconds),
         )
 
     # ── Polling ─────────────────────────────────────────────────────
@@ -667,7 +687,7 @@ class PersonalRAGIndex:
 
         cfg = get_config()
         if bool(getattr(cfg.rag, "refresh_only_when_idle", True)):
-            idle_threshold = float(getattr(cfg.rag, "refresh_idle_threshold_seconds", 30.0))
+            idle_threshold = float(cfg.rag.refresh_idle_threshold_seconds)
             if not session_activity.is_session_idle(idle_threshold):
                 return False
 
@@ -826,7 +846,7 @@ class PersonalRAGIndex:
             return
         cfg = get_config()
         if bool(getattr(cfg.rag, "refresh_only_when_idle", True)) and self._last_snapshot:
-            idle_threshold = float(getattr(cfg.rag, "refresh_idle_threshold_seconds", 30.0))
+            idle_threshold = float(cfg.rag.refresh_idle_threshold_seconds)
             if not session_activity.is_session_idle(idle_threshold):
                 self._next_poll_delay_seconds = 60.0
                 logger.info(
@@ -1089,11 +1109,12 @@ class PersonalRAGIndex:
             return None
         if not self._reranker_ready:
             elapsed = time.time() - getattr(self, "_startup_time", time.time())
-            if elapsed < 30.0:
+            reranker_wait = float(get_config().rag.reranker_startup_wait_seconds)
+            if elapsed < reranker_wait:
                 if not self._reranker_init_scheduled:
                     logger.debug(
                         "rag_reranker_deferred_startup",
-                        wait_seconds=round(30.0 - elapsed, 2),
+                        wait_seconds=round(reranker_wait - elapsed, 2),
                     )
                     self._reranker_init_scheduled = True
                 return None
@@ -1116,13 +1137,16 @@ class PersonalRAGIndex:
         return [h.to_dict() for h in hits]
 
     def _apply_source_quality_penalties(self, hits: list[RagSearchHit]) -> list[RagSearchHit]:
+        source_penalty_factor = float(
+            getattr(self, "_source_penalty_factor", get_config().rag.source_penalty_factor)
+        )
         for hit in hits:
             filename_lower = os.path.basename(hit.filename).lower()
             path_lower = hit.filename.lower()
             for pattern in DEPRIORITIZED_FILE_PATTERNS:
                 if pattern in filename_lower or pattern in path_lower:
                     original = hit.score
-                    hit.score = hit.score * 0.55
+                    hit.score = hit.score * source_penalty_factor
                     logger.debug(
                         "rag_source_penalized",
                         filename=hit.filename,
@@ -1131,6 +1155,35 @@ class PersonalRAGIndex:
                         penalized_score=round(hit.score, 2),
                     )
                     break
+        hits.sort(key=lambda h: h.score, reverse=True)
+        return hits
+
+    def _apply_feedback_penalties(self, hits: list[RagSearchHit], query: str) -> list[RagSearchHit]:
+        feedback_store = getattr(self, "_feedback_store", None) or FeedbackStore()
+        feedback_penalty = float(getattr(self, "_feedback_penalty", get_config().rag.feedback_penalty))
+        try:
+            penalized_paths = feedback_store.get_penalized_paths(query, user_scope=self.user_id)
+        except Exception:
+            penalized_paths = {}
+
+        if not penalized_paths:
+            return hits
+
+        normalized_penalties = {os.path.abspath(path).lower(): count for path, count in penalized_paths.items()}
+        for hit in hits:
+            hit_path = os.path.abspath(hit.filename).lower() if hit.filename else ""
+            if hit_path not in normalized_penalties:
+                continue
+            original = hit.score
+            hit.score = hit.score * max(0.0, 1.0 - feedback_penalty)
+            logger.debug(
+                "rag_feedback_penalized",
+                filename=hit.filename,
+                feedback_count=normalized_penalties[hit_path],
+                original_score=round(original, 2),
+                penalized_score=round(hit.score, 2),
+            )
+
         hits.sort(key=lambda h: h.score, reverse=True)
         return hits
 
@@ -1225,6 +1278,22 @@ class PersonalRAGIndex:
         return "\n".join(lines).strip()
 
     def search(self, query: str, limit: int = 4, use_cache: bool = True) -> List[Dict[str, Any]]:
+        try:
+            session_context = session_state.get_session_context()
+            project = session_context.project
+            if project and project.confidence > self._project_confidence_threshold and project.source_path:
+                logger.info(
+                    "session_context_loaded",
+                    source="rag",
+                    has_project=True,
+                    confidence=round(project.confidence, 2),
+                )
+                project_hint = f"{project.name} {Path(project.source_path).stem}".strip()
+                if project_hint and project_hint.lower() not in (query or "").lower():
+                    query = f"{project_hint} {query}".strip()
+        except Exception:
+            pass
+
         query_key = f"{self.user_id}:{query}:{limit}"
         now = time.time()
 
@@ -1276,7 +1345,11 @@ class PersonalRAGIndex:
                 vector_score = self._distance_to_score(distance)
                 text_sim = float(fuzz.partial_ratio(query, document or meta.get("title", "")))
                 importance = float(meta.get("importance") or 0)
-                final_score = (0.65 * vector_score) + (0.30 * text_sim) + (0.05 * importance)
+                final_score = (
+                    (self._vector_score_weight * vector_score)
+                    + (self._text_score_weight * text_sim)
+                    + (self._importance_score_weight * importance)
+                )
                 path = meta.get("path", "") or meta.get("filepath", "")
                 payload.append({
                     "text": document,
@@ -1302,6 +1375,7 @@ class PersonalRAGIndex:
             payload = self._boost_filename_matches(payload, query)
             hits = self._hits_from_payload(payload)
             hits = self._apply_source_quality_penalties(hits)
+            hits = self._apply_feedback_penalties(hits, query)
 
             min_score = self._min_score
             filtered_hits = [h for h in hits if h.score >= min_score]
@@ -1341,7 +1415,7 @@ class PersonalRAGIndex:
         skipped and a warning is logged.
         """
         cfg = get_config()
-        boost_cap = float(getattr(cfg.rag, 'boost_cap', 30.0))
+        boost_cap = float(cfg.rag.boost_cap)
 
         def split_filename_words(text: str) -> list[str]:
             """
@@ -1393,7 +1467,7 @@ class PersonalRAGIndex:
                 pr = fuzz.partial_ratio(q, filename_no_ext)
             except Exception:
                 pr = 0
-            if pr >= 70:
+            if pr >= cfg.rag.filename_partial_ratio_threshold:
                 total_bonus += 15
 
             # Abbreviation of filename (e.g., ORS -> office-reporting-system)
@@ -1413,11 +1487,11 @@ class PersonalRAGIndex:
                     best = 0
                     for comp in path_components:
                         best = max(best, fuzz.partial_ratio(q, comp))
-                    if best >= 65:
+                    if best >= cfg.rag.filename_parent_match_threshold:
                         total_bonus += 10
                 else:
                     parent_score = fuzz.partial_ratio(q, parent) if parent else 0
-                    if parent_score >= 65:
+                    if parent_score >= cfg.rag.filename_parent_match_threshold:
                         total_bonus += 10
             except Exception:
                 pass
@@ -1460,7 +1534,7 @@ class PersonalRAGIndex:
             return ""
 
         cfg = get_config()
-        excerpt_max = int(getattr(cfg.rag, "excerpt_max_chars", 450))
+        excerpt_max = int(cfg.rag.excerpt_max_chars)
         lines = [
             "PERSONAL FILE CONTEXT",
             f"(These are actual excerpts from the user's files, retrieved for query: '{query}')",

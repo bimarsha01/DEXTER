@@ -61,14 +61,55 @@ class ProjectContext:
 
 
 @dataclass
+class UserPreferences:
+    verbosity: str = "normal"
+    tone: str = "neutral"
+    correction_count: int = 0
+    last_updated_ts: float = 0.0
+
+    def __post_init__(self) -> None:
+        verbosity = str(self.verbosity or "normal").strip().lower()
+        tone = str(self.tone or "neutral").strip().lower()
+        if verbosity not in {"brief", "normal", "detailed"}:
+            verbosity = "normal"
+        if tone not in {"casual", "neutral"}:
+            tone = "neutral"
+        self.verbosity = verbosity
+        self.tone = tone
+        self.correction_count = max(0, int(self.correction_count or 0))
+        self.last_updated_ts = float(self.last_updated_ts or 0.0)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "verbosity": self.verbosity,
+            "tone": self.tone,
+            "correction_count": int(self.correction_count),
+            "last_updated_ts": float(self.last_updated_ts),
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> "UserPreferences":
+        payload = data or {}
+        return cls(
+            verbosity=str(payload.get("verbosity", "normal") or "normal"),
+            tone=str(payload.get("tone", "neutral") or "neutral"),
+            correction_count=int(payload.get("correction_count", 0) or 0),
+            last_updated_ts=float(payload.get("last_updated_ts", 0.0) or 0.0),
+        )
+
+
+@dataclass
 class SessionContext:
     project: ProjectContext | None = None
     recent_turn_summaries: list[str] = field(default_factory=list)
-    user_preferences: dict[str, Any] = field(default_factory=dict)
+    user_preferences: UserPreferences | dict[str, Any] = field(default_factory=UserPreferences)
 
     def __post_init__(self) -> None:
         self.recent_turn_summaries = [str(item) for item in self.recent_turn_summaries][-20:]
-        self.user_preferences = dict(self.user_preferences or {})
+        if isinstance(self.user_preferences, UserPreferences):
+            self.user_preferences = UserPreferences.from_dict(self.user_preferences.to_dict())
+        else:
+            self.user_preferences = UserPreferences.from_dict(dict(self.user_preferences or {}))
 
 
 class ContextStore:
@@ -87,6 +128,9 @@ class ContextStore:
 
     def _ensure_parent_dir(self, db_path: str) -> None:
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
+
+    def get_db_path(self) -> str:
+        return self._resolve_db_path()
 
     @staticmethod
     def _serialize_value(value: Any) -> str:
@@ -139,29 +183,24 @@ class ContextStore:
 
     def save(self, session_context: SessionContext, user_scope: str | None = None) -> None:
         scope = _user_key(user_scope or (session_context.project.user_scope if session_context.project else None))
+        user_preferences = session_context.user_preferences
+        if not isinstance(user_preferences, UserPreferences):
+            user_preferences = UserPreferences.from_dict(dict(user_preferences or {}))
         payload = SessionContext(
             project=session_context.project,
             recent_turn_summaries=list(session_context.recent_turn_summaries)[-20:],
-            user_preferences=dict(session_context.user_preferences or {}),
+            user_preferences=user_preferences,
         )
         if payload.project is not None and payload.project.user_scope != scope:
             payload.project.user_scope = scope
 
         db_path = self._resolve_db_path()
         self._ensure_parent_dir(db_path)
-        db_parent = str(Path(db_path).parent)
-        temp_handle = tempfile.NamedTemporaryFile(
-            delete=False,
-            dir=db_parent,
-            prefix=f"{Path(db_path).stem}.",
-            suffix=".tmp",
-        )
-        temp_handle.close()
-        temp_path = temp_handle.name
-
         try:
-            with sqlite3.connect(temp_path) as connection:
+            connection = sqlite3.connect(db_path)
+            try:
                 connection.row_factory = sqlite3.Row
+                connection.execute("BEGIN IMMEDIATE")
                 self._init_schema(connection)
                 now = time.time()
                 connection.execute("DELETE FROM session_context WHERE user_scope = ?", (scope,))
@@ -192,18 +231,15 @@ class ContextStore:
                         "INSERT INTO recent_turn_summaries (user_scope, position, summary) VALUES (?, ?, ?)",
                         (scope, position, str(summary)),
                     )
-                for pref_key, pref_value in payload.user_preferences.items():
+                for pref_key, pref_value in payload.user_preferences.to_dict().items():
                     connection.execute(
                         "INSERT INTO user_preferences (user_scope, pref_key, pref_value) VALUES (?, ?, ?)",
                         (scope, str(pref_key), self._serialize_value(pref_value)),
                     )
                 connection.commit()
-            os.replace(temp_path, db_path)
+            finally:
+                connection.close()
         except Exception:
-            try:
-                os.remove(temp_path)
-            except Exception:
-                pass
             raise
 
     def load(self, user_scope: str | None = None) -> SessionContext:
@@ -214,7 +250,8 @@ class ContextStore:
             return SessionContext()
 
         try:
-            with sqlite3.connect(db_path) as connection:
+            connection = sqlite3.connect(db_path)
+            try:
                 connection.row_factory = sqlite3.Row
                 self._init_schema(connection)
                 row = connection.execute(
@@ -231,15 +268,17 @@ class ContextStore:
                     (scope,),
                 ).fetchall()
                 recent_turn_summaries = [str(item["summary"]) for item in summaries_rows]
-                user_preferences = {
+                user_preferences_raw = {
                     str(item["pref_key"]): self._deserialize_value(item["pref_value"])
                     for item in preference_rows
                 }
                 return SessionContext(
                     project=project,
                     recent_turn_summaries=recent_turn_summaries,
-                    user_preferences=user_preferences,
+                    user_preferences=UserPreferences.from_dict(user_preferences_raw),
                 )
+            finally:
+                connection.close()
         except Exception as exc:
             logger.warning("session_context_load_failed", path=db_path, user_scope=scope, error=str(exc), exc_info=True)
             return SessionContext()
@@ -248,20 +287,19 @@ class ContextStore:
         db_path = self._resolve_db_path()
         with self._lock:
             try:
-                if os.path.exists(db_path):
-                    os.remove(db_path)
-            except Exception:
-                logger.warning("session_context_clear_failed", path=db_path, exc_info=True)
-            try:
-                db_parent = Path(db_path).parent
-                base_name = Path(db_path).name
-                for temp_path in db_parent.glob(f"{base_name}*.tmp"):
-                    try:
-                        temp_path.unlink(missing_ok=True)
-                    except Exception:
-                        pass
-            except Exception:
-                pass
+                if not os.path.exists(db_path):
+                    return
+                connection = sqlite3.connect(db_path)
+                try:
+                    self._init_schema(connection)
+                    connection.execute("DELETE FROM session_context")
+                    connection.execute("DELETE FROM recent_turn_summaries")
+                    connection.execute("DELETE FROM user_preferences")
+                    connection.commit()
+                finally:
+                    connection.close()
+            except Exception as exc:
+                logger.warning("session_context_clear_failed", path=db_path, error=str(exc), exc_info=True)
 
 
 _STORE = ContextStore()
@@ -281,6 +319,10 @@ def clear() -> None:
     with _CACHE_LOCK:
         _PROJECT_TURN_MARKERS.clear()
     _STORE.clear()
+
+
+def get_context_db_path() -> str:
+    return _STORE.get_db_path()
 
 
 def set_current_project(

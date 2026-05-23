@@ -26,9 +26,19 @@ from core.brain.intent_router import IntentRouter, PendingAction
 from tools.vision_tools import describe_screen, describe_screen_without_vision
 from utils.config import DexterConfig, get_config
 from core.event_bus import EventBus
+from core.brain.session_state import SessionContext, UserPreferences
+from core.health import update_provider_health
 
 
 class _StreamingFallback(Exception):
+    pass
+
+
+class RateLimitError(Exception):
+    pass
+
+
+class QuotaExhaustedError(Exception):
     pass
 
 
@@ -106,11 +116,12 @@ class Brain:
     GEMINI_QUOTA_DISABLE_SECONDS = 86400.0
     _gemini_disabled_until_global: float = 0.0
 
-    def __init__(self, event_bus: Optional[EventBus] = None, asr_engine=None):
+    def __init__(self, event_bus: Optional[EventBus] = None, asr_engine=None, session_context: SessionContext | None = None):
         logger.info("brain_initializing")
 
         self._cfg: DexterConfig = get_config()
         self._event_bus: Optional[EventBus] = event_bus
+        self.session_context = session_context or SessionContext()
 
         self.tools_list = load_tools()
         self.intent_router = IntentRouter(self._cfg, asr_engine=asr_engine)
@@ -125,7 +136,7 @@ class Brain:
             "ollama": {"failures": 0, "score": 1.0, "cooldown_until": 0.0, "last_error": ""},
         }
 
-        self.system_instruction = """You are Dexter, a personal AI assistant running on this Windows PC.
+        self.base_system_instruction = """You are Dexter, a personal AI assistant running on this Windows PC.
 
 You are smart, direct, and warm. You talk like a capable friend — not a butler, not a support agent, not a robot.
 
@@ -134,7 +145,6 @@ Rules:
 - Never repeat the question back.
 - Never say what you're about to do before doing it. Just do it.
 - Use contractions: I'll, it's, that's, you're, I've. They sound natural spoken aloud.
-- Keep answers to 1-3 sentences unless the user asked for detail.
 - For PC actions, confirm in one word or phrase: "Done." "Opened." "Locked." "Volume's at 50."
 - When wrong: "You're right, let me fix that." Never a paragraph of apology.
 - When unsure: "Not sure about that one." That's enough.
@@ -196,6 +206,7 @@ Never use mcp_write_file to overwrite important system files. Always confirm wit
 
         # Report status
         available = []
+        
         if self.gemini_available:
             available.append(f"Gemini ({self._cfg.models.primary_llm})")
         if self.groq_available:
@@ -211,6 +222,36 @@ Never use mcp_write_file to overwrite important system files. Always confirm wit
         metrics.update_provider_health("gemini", self.gemini_available, 1.0 if self.gemini_available else 0.0)
         metrics.update_provider_health("groq", self.groq_available, 1.0 if self.groq_available else 0.0)
         metrics.update_provider_health("ollama", self.ollama_available, 1.0 if self.ollama_available else 0.0)
+        update_provider_health("gemini", "healthy" if self.gemini_available else "unavailable", success=bool(self.gemini_available))
+        update_provider_health("groq", "healthy" if self.groq_available else "unavailable", success=bool(self.groq_available))
+        update_provider_health("ollama", "healthy" if self.ollama_available else "unavailable", success=bool(self.ollama_available))
+
+    def _current_user_preferences(self) -> UserPreferences:
+        prefs = getattr(self.session_context, "user_preferences", None)
+        if isinstance(prefs, UserPreferences):
+            return prefs
+        if isinstance(prefs, dict):
+            return UserPreferences.from_dict(prefs)
+        return UserPreferences()
+
+    def _preference_system_instruction(self) -> str:
+        prefs = self._current_user_preferences()
+        hints: list[str] = []
+        if prefs.verbosity == "brief":
+            hints.append("Keep all responses under 2 sentences unless asked to explain.")
+        elif prefs.verbosity == "detailed":
+            hints.append("Provide fuller explanations when the user asks for more detail.")
+
+        if prefs.tone == "casual":
+            hints.append("Use a casual, conversational tone.")
+        else:
+            hints.append("Use a neutral, straightforward tone.")
+
+        return self.base_system_instruction + "\n\nCurrent user preferences:\n- " + "\n- ".join(hints) if hints else self.base_system_instruction
+
+    @property
+    def system_instruction(self) -> str:
+        return self._preference_system_instruction()
 
     def _gemini_cooldown_seconds(self, error: Exception) -> float:
         msg = str(error)
@@ -554,6 +595,13 @@ Never use mcp_write_file to overwrite important system files. Always confirm wit
 
     def _compose_prompt(self, user_command: str, long_term_memory: str = "", indexed_context: str = "", provider: str = "gemini") -> str:
         sections: list[str] = []
+        if self.session_context.recent_turn_summaries:
+            summaries = self.session_context.recent_turn_summaries[-3:]
+            context_lines = ["SESSION CONTEXT:"]
+            for index, summary in enumerate(summaries, start=1):
+                context_lines.append(f"[{index}] {summary}")
+            sections.append("\n".join(context_lines))
+
         if long_term_memory:
             sections.append(long_term_memory.strip())
 
@@ -642,8 +690,15 @@ Never use mcp_write_file to overwrite important system files. Always confirm wit
         state["last_error"] = ""
         self.provider_state[name] = state
         metrics.update_provider_health(name, True, state["score"], 0.0, "")
+        update_provider_health(name, "healthy", success=True, cooldown_until=0.0, last_error="")
 
-    def _record_provider_failure(self, name: str, error: Exception, rate_limited: bool = False) -> None:
+    def _record_provider_failure(
+        self,
+        name: str,
+        error: Exception,
+        rate_limited: bool = False,
+        current_status: str | None = None,
+    ) -> None:
         state = self.provider_state.get(name, {})
         failures = state.get("failures", 0) + 1
         state["failures"] = failures
@@ -657,6 +712,127 @@ Never use mcp_write_file to overwrite important system files. Always confirm wit
 
         self.provider_state[name] = state
         metrics.update_provider_health(name, True, state["score"], state.get("cooldown_until", 0.0), str(error))
+        update_provider_health(
+            name,
+            current_status or ("rate_limited" if rate_limited else "error"),
+            success=False,
+            cooldown_until=state.get("cooldown_until", 0.0),
+            last_error=str(error),
+        )
+
+    def _classify_provider_error(self, error: Exception) -> str:
+        msg = str(error).lower()
+        if isinstance(error, QuotaExhaustedError):
+            return "quota"
+        if isinstance(error, RateLimitError):
+            return "rate_limit"
+        if "perday" in msg or "daily quota" in msg or "limit: 0" in msg or "quota exhausted" in msg:
+            return "quota"
+        if "perminute" in msg or "rate limit" in msg or "resource_exhausted" in msg or "429" in msg:
+            return "rate_limit"
+        if self._is_rate_limit_error(error):
+            return "rate_limit"
+        return "error"
+
+    def _emit_provider_fallback(self, provider: str, reason: str, fallback_to: str) -> None:
+        logger.warning(
+            "provider_fallback",
+            provider=provider,
+            reason=reason,
+            fallback_to=fallback_to,
+        )
+        self._emit_llm_event(
+            "provider_fallback",
+            provider=provider,
+            reason=reason,
+            fallback_to=fallback_to,
+        )
+
+    def _provider_backoff_delay(self, retry_index: int) -> float:
+        return float(min(8, self.RATE_LIMIT_BACKOFF_BASE ** (retry_index + 1)))
+
+    async def _run_provider_text_with_retry(
+        self,
+        provider: str,
+        fallback_to: str,
+        invoke,
+    ) -> str:
+        retries = 0
+        while True:
+            try:
+                response_text = await invoke()
+                self._record_provider_success(provider)
+                return response_text
+            except Exception as e:
+                failure_kind = self._classify_provider_error(e)
+                if failure_kind == "rate_limit":
+                    if retries < 3:
+                        delay = self._provider_backoff_delay(retries)
+                        self._record_provider_failure(provider, e, True, current_status="rate_limited")
+                        logger.warning(
+                            "provider_rate_limited_retry",
+                            provider=provider,
+                            retry=retries + 1,
+                            delay_seconds=delay,
+                            error=str(e),
+                        )
+                        await asyncio.sleep(delay)
+                        retries += 1
+                        continue
+                    self._record_provider_failure(provider, e, True, current_status="rate_limited_exhausted")
+                    self._emit_provider_fallback(provider, "rate_limit", fallback_to)
+                    raise RateLimitError(str(e)) from e
+
+                if failure_kind == "quota":
+                    self._record_provider_failure(provider, e, False, current_status="quota_exhausted")
+                    self._emit_provider_fallback(provider, "quota", fallback_to)
+                    raise QuotaExhaustedError(str(e)) from e
+
+                self._record_provider_failure(provider, e, False, current_status="error")
+                self._emit_provider_fallback(provider, "error", fallback_to)
+                raise
+
+    async def _run_provider_stream_with_retry(
+        self,
+        provider: str,
+        fallback_to: str,
+        stream_factory,
+    ):
+        retries = 0
+        while True:
+            try:
+                async for chunk in stream_factory():
+                    yield chunk
+                self._record_provider_success(provider)
+                return
+            except Exception as e:
+                failure_kind = self._classify_provider_error(e)
+                if failure_kind == "rate_limit":
+                    if retries < 3:
+                        delay = self._provider_backoff_delay(retries)
+                        self._record_provider_failure(provider, e, True, current_status="rate_limited")
+                        logger.warning(
+                            "provider_rate_limited_retry",
+                            provider=provider,
+                            retry=retries + 1,
+                            delay_seconds=delay,
+                            error=str(e),
+                        )
+                        await asyncio.sleep(delay)
+                        retries += 1
+                        continue
+                    self._record_provider_failure(provider, e, True, current_status="rate_limited_exhausted")
+                    self._emit_provider_fallback(provider, "rate_limit", fallback_to)
+                    raise RateLimitError(str(e)) from e
+
+                if failure_kind == "quota":
+                    self._record_provider_failure(provider, e, False, current_status="quota_exhausted")
+                    self._emit_provider_fallback(provider, "quota", fallback_to)
+                    raise QuotaExhaustedError(str(e)) from e
+
+                self._record_provider_failure(provider, e, False, current_status="error")
+                self._emit_provider_fallback(provider, "error", fallback_to)
+                raise
 
     def _emit_llm_event(self, event_type: str, **fields: Any) -> None:
         provider = fields.get("provider")
@@ -811,92 +987,89 @@ Never use mcp_write_file to overwrite important system files. Always confirm wit
             return response_text
 
         fallback_note = ""
-        # ── Try Gemini (Primary) ──
-        if self.gemini_available and not self._provider_health.is_gemini_available():
-            logger.info(
-                "router_gemini_unavailable",
-                disabled_until=self._provider_health.gemini_disabled_until,
-                target_provider="groq",
-            )
-        elif self._can_use_gemini():
-            try:
-                self._emit_llm_event("llm_call_started", provider="gemini")
-                _t0 = time.perf_counter()
-                prompt = self._compose_prompt(user_command, long_term_memory, indexed_context, provider="gemini")
-                response_text = await self._process_gemini(prompt)
-                _ms = (time.perf_counter() - _t0) * 1000
-                logger.info("llm_call_completed", provider="gemini", duration_ms=_ms)
-                self._emit_llm_event("llm_call_completed", provider="gemini", duration_ms=_ms)
-                self._record_provider_success("gemini")
-                self._add_history("user", user_command)
-                self._add_history("assistant", response_text)
-                return response_text
-            except Exception as e:
-                rate_limited = self._is_rate_limit_error(e)
-                self._record_provider_failure("gemini", e, rate_limited)
-                rate_msg = str(e)
-                cooldown = self._gemini_cooldown_seconds(e)
-                if cooldown > 0:
-                    self._provider_health.disable_gemini(cooldown)
-                    if "perday" in rate_msg.lower() or "limit: 0" in rate_msg.lower():
-                        self._disable_gemini_globally(cooldown)
-                logger.warning("gemini_request_failed", error=rate_msg, exc_info=True)
-                logger.info("llm_fallback", from_provider="gemini", to_provider="groq")
-                self._emit_llm_event("llm_call_failed", provider="gemini", error=rate_msg)
-                self._emit_llm_event("llm_fallback", from_provider="gemini", to_provider="groq")
-                # On quota/rate-limit, wait briefly and annotate the next prompt to encourage brevity
-                if rate_limited:
-                    try:
-                        await asyncio.sleep(1.5)
-                    except Exception:
-                        pass
-                    logger.warning("gemini_rate_limited", error=rate_msg)
-                    fallback_note = "[Note: fallback provider — keep response concise]\n"
 
-        # ── Try Groq (Fallback) ──
+        gemini_prompt = self._compose_prompt(user_command, long_term_memory, indexed_context, provider="gemini")
+        if self.gemini_available:
+            if not self._provider_health.is_gemini_available():
+                reason = "quota" if self._provider_health.gemini_disabled_until else "cooldown"
+                logger.warning(
+                    "provider_skipped",
+                    provider="gemini",
+                    reason=reason,
+                    fallback_to="groq",
+                )
+                self._emit_provider_fallback("gemini", reason, "groq")
+                fallback_note = "[Note: fallback provider — keep response concise]\n"
+            elif self._can_use_gemini():
+                try:
+                    self._emit_llm_event("llm_call_started", provider="gemini")
+                    _t0 = time.perf_counter()
+                    response_text = await self._run_provider_text_with_retry(
+                        "gemini",
+                        "groq",
+                        lambda: self._process_gemini(gemini_prompt),
+                    )
+                    _ms = (time.perf_counter() - _t0) * 1000
+                    logger.info("llm_call_completed", provider="gemini", duration_ms=_ms)
+                    self._emit_llm_event("llm_call_completed", provider="gemini", duration_ms=_ms)
+                    self._add_history("user", user_command)
+                    self._add_history("assistant", response_text)
+                    return response_text
+                except (RateLimitError, QuotaExhaustedError):
+                    fallback_note = "[Note: fallback provider — keep response concise]\n"
+                    pass
+        else:
+            self._emit_provider_fallback("gemini", "unavailable", "groq")
+            fallback_note = "[Note: fallback provider — keep response concise]\n"
+        groq_prompt = self._compose_prompt(user_command, long_term_memory, indexed_context, provider="groq")
+        if fallback_note:
+            groq_prompt = fallback_note + groq_prompt
         if self._can_use_provider("groq", self.groq_available):
             try:
                 self._emit_llm_event("llm_call_started", provider="groq")
                 _t0 = time.perf_counter()
-                prompt = self._compose_prompt(user_command, long_term_memory, indexed_context, provider="groq")
-                if fallback_note:
-                    prompt = fallback_note + prompt
-                response_text = await self._process_groq(prompt, query_hint=user_command)
+                response_text = await self._run_provider_text_with_retry(
+                    "groq",
+                    "ollama",
+                    lambda: self._process_groq(groq_prompt, query_hint=user_command),
+                )
                 _ms = (time.perf_counter() - _t0) * 1000
                 logger.info("llm_call_completed", provider="groq", duration_ms=_ms)
                 self._emit_llm_event("llm_call_completed", provider="groq", duration_ms=_ms)
-                self._record_provider_success("groq")
                 self._add_history("user", user_command)
                 self._add_history("assistant", response_text)
                 return response_text
-            except Exception as e:
-                rate_limited = self._is_rate_limit_error(e)
-                self._record_provider_failure("groq", e, rate_limited)
-                self._provider_health.record_groq_failure()
-                logger.warning("groq_request_failed", error=str(e), exc_info=True)
-                logger.info("llm_fallback", from_provider="groq", to_provider="ollama")
-                self._emit_llm_event("llm_call_failed", provider="groq", error=str(e))
-                self._emit_llm_event("llm_fallback", from_provider="groq", to_provider="ollama")
+            except (RateLimitError, QuotaExhaustedError):
+                pass
+        else:
+            self._emit_provider_fallback("groq", "unavailable", "ollama")
 
-        # ── Try Ollama (Local Offline) ──
+        ollama_prompt = self._compose_prompt(user_command, long_term_memory, indexed_context, provider="ollama")
         if self._can_use_provider("ollama", self.ollama_available):
             try:
                 self._emit_llm_event("llm_call_started", provider="ollama")
                 _t0 = time.perf_counter()
-                prompt = self._compose_prompt(user_command, long_term_memory, indexed_context, provider="ollama")
-                response_text = await self._process_ollama(prompt)
+                response_text = await self._run_provider_text_with_retry(
+                    "ollama",
+                    "",
+                    lambda: self._process_ollama(ollama_prompt),
+                )
                 _ms = (time.perf_counter() - _t0) * 1000
                 logger.info("llm_call_completed", provider="ollama", duration_ms=_ms)
                 self._emit_llm_event("llm_call_completed", provider="ollama", duration_ms=_ms)
-                self._record_provider_success("ollama")
                 self._add_history("user", user_command)
                 self._add_history("assistant", response_text)
                 return response_text
-            except Exception as e:
-                self._record_provider_failure("ollama", e, False)
-                logger.error("ollama_request_failed", error=str(e), exc_info=True)
-                self._emit_llm_event("llm_call_failed", provider="ollama", error=str(e))
+            except (RateLimitError, QuotaExhaustedError):
+                pass
+        else:
+            self._emit_provider_fallback("ollama", "unavailable", "none")
 
+        logger.error(
+            "llm_providers_exhausted",
+            providers=["gemini", "groq", "ollama"],
+            command_preview=user_command[:120],
+        )
         return (
             "All my providers are unreachable right now. "
             "Check your API keys in config.yaml and your internet connection."
@@ -924,102 +1097,105 @@ Never use mcp_write_file to overwrite important system files. Always confirm wit
             yield response_text
             return
 
-        if self.gemini_available and not self._provider_health.is_gemini_available():
-            logger.info(
-                "router_gemini_unavailable",
-                disabled_until=self._provider_health.gemini_disabled_until,
-                target_provider="groq",
-            )
-        elif self._can_use_gemini():
-            fallback_note = ""
-            try:
-                response_text = ""
-                self._emit_llm_event("llm_stream_started", provider="gemini")
-                _t0 = time.perf_counter()
-                prompt = self._compose_prompt(user_command, long_term_memory, indexed_context, provider="gemini")
-                async for chunk in self._stream_gemini(prompt):
-                    response_text += chunk
-                    yield chunk
-                if response_text:
-                    _ms = (time.perf_counter() - _t0) * 1000
-                    logger.info("llm_stream_completed", provider="gemini", duration_ms=_ms)
-                    self._emit_llm_event("llm_stream_completed", provider="gemini", duration_ms=_ms)
-                    self._record_provider_success("gemini")
-                    self._add_history("user", user_command)
-                    self._add_history("assistant", response_text)
-                    return
-            except Exception as e:
-                rate_limited = self._is_rate_limit_error(e)
-                self._record_provider_failure("gemini", e, rate_limited)
-                cooldown = self._gemini_cooldown_seconds(e)
-                if cooldown > 0:
-                    self._provider_health.disable_gemini(cooldown)
-                    if "perday" in str(e).lower() or "limit: 0" in str(e).lower():
-                        ProviderHealth.disable_gemini_daily()
-                        self._disable_gemini_globally(cooldown)
-                logger.warning("gemini_stream_failed", error=str(e), exc_info=True)
-                self._emit_llm_event("llm_stream_failed", provider="gemini", error=str(e))
-                if rate_limited:
-                    rate_msg = str(e)
-                    try:
-                        await asyncio.sleep(1.5)
-                    except Exception:
-                        pass
-                    logger.warning("gemini_rate_limited", error=rate_msg)
-                    fallback_note = "[Note: fallback provider — keep response concise]\n"
+        fallback_note = ""
 
+        gemini_prompt = self._compose_prompt(user_command, long_term_memory, indexed_context, provider="gemini")
+        if self.gemini_available:
+            if not self._provider_health.is_gemini_available():
+                reason = "quota" if self._provider_health.gemini_disabled_until else "cooldown"
+                logger.warning(
+                    "provider_skipped",
+                    provider="gemini",
+                    reason=reason,
+                    fallback_to="groq",
+                )
+                self._emit_provider_fallback("gemini", reason, "groq")
+                fallback_note = "[Note: fallback provider — keep response concise]\n"
+            elif self._can_use_gemini():
+                try:
+                    response_text = ""
+                    self._emit_llm_event("llm_stream_started", provider="gemini")
+                    _t0 = time.perf_counter()
+                    async for chunk in self._run_provider_stream_with_retry(
+                        "gemini",
+                        "groq",
+                        lambda: self._stream_gemini(gemini_prompt),
+                    ):
+                        response_text += chunk
+                        yield chunk
+                    if response_text:
+                        _ms = (time.perf_counter() - _t0) * 1000
+                        logger.info("llm_stream_completed", provider="gemini", duration_ms=_ms)
+                        self._emit_llm_event("llm_stream_completed", provider="gemini", duration_ms=_ms)
+                        self._add_history("user", user_command)
+                        self._add_history("assistant", response_text)
+                        return
+                except (RateLimitError, QuotaExhaustedError):
+                    fallback_note = "[Note: fallback provider — keep response concise]\n"
+                    pass
+        else:
+            self._emit_provider_fallback("gemini", "unavailable", "groq")
+            fallback_note = "[Note: fallback provider — keep response concise]\n"
+
+        groq_prompt = self._compose_prompt(user_command, long_term_memory, indexed_context, provider="groq")
+        if fallback_note:
+            groq_prompt = fallback_note + groq_prompt
         if self._can_use_provider("groq", self.groq_available):
             try:
                 response_text = ""
                 self._emit_llm_event("llm_stream_started", provider="groq")
                 _t0 = time.perf_counter()
-                prompt = self._compose_prompt(user_command, long_term_memory, indexed_context, provider="groq")
-                if "fallback_note" in locals() and fallback_note:
-                    prompt = fallback_note + prompt
-                async for chunk in self._stream_groq_with_tools(prompt, query_hint=user_command, allow_tools=True):
+                async for chunk in self._run_provider_stream_with_retry(
+                    "groq",
+                    "ollama",
+                    lambda: self._stream_groq_with_tools(groq_prompt, query_hint=user_command, allow_tools=True),
+                ):
                     response_text += chunk
                     yield chunk
                 if response_text:
                     _ms = (time.perf_counter() - _t0) * 1000
                     logger.info("llm_stream_completed", provider="groq", duration_ms=_ms)
                     self._emit_llm_event("llm_stream_completed", provider="groq", duration_ms=_ms)
-                    self._record_provider_success("groq")
                     self._add_history("user", user_command)
                     self._add_history("assistant", response_text)
                     return
+            except (RateLimitError, QuotaExhaustedError):
+                pass
             except Exception as e:
-                rate_limited = self._is_rate_limit_error(e)
-                self._record_provider_failure("groq", e, rate_limited)
-                self._provider_health.record_groq_failure()
-                logger.warning("groq_stream_failed", error=str(e), exc_info=True)
-                self._emit_llm_event("llm_stream_failed", provider="groq", error=str(e))
-
                 decision = self.intent_router.detect_intent(user_command)
                 if decision.action in {"tool", "ask", "vision"}:
                     response_text = await self.process_command(user_command, long_term_memory, indexed_context)
                     yield response_text
                     return
+        else:
+            self._emit_provider_fallback("groq", "unavailable", "ollama")
 
+        ollama_prompt = self._compose_prompt(user_command, long_term_memory, indexed_context, provider="ollama")
         if self._can_use_provider("ollama", self.ollama_available):
             try:
                 self._emit_llm_event("llm_stream_started", provider="ollama")
                 _t0 = time.perf_counter()
-                prompt = self._compose_prompt(user_command, long_term_memory, indexed_context, provider="ollama")
-                response_text = await self._process_ollama(prompt)
+                response_text = await self._process_ollama(ollama_prompt)
                 if response_text:
                     _ms = (time.perf_counter() - _t0) * 1000
                     logger.info("llm_stream_completed", provider="ollama", duration_ms=_ms)
                     self._emit_llm_event("llm_stream_completed", provider="ollama", duration_ms=_ms)
-                    self._record_provider_success("ollama")
                     self._add_history("user", user_command)
                     self._add_history("assistant", response_text)
                     yield response_text
                     return
             except Exception as e:
-                self._record_provider_failure("ollama", e, False)
+                self._record_provider_failure("ollama", e, False, current_status="error")
                 logger.warning("ollama_stream_failed", error=str(e), exc_info=True)
                 self._emit_llm_event("llm_stream_failed", provider="ollama", error=str(e))
+        else:
+            self._emit_provider_fallback("ollama", "unavailable", "none")
 
+        logger.error(
+            "llm_providers_exhausted",
+            providers=["gemini", "groq", "ollama"],
+            command_preview=user_command[:120],
+        )
         response_text = await self.process_command(user_command, long_term_memory, indexed_context)
         yield response_text
 
@@ -1123,46 +1299,36 @@ Never use mcp_write_file to overwrite important system files. Always confirm wit
         return "I need either a screen capture or a file path to proceed."
 
     async def _process_text_fallback(self, prompt: str) -> str:
-        if self.gemini_available and not self._provider_health.is_gemini_available():
-            logger.info(
-                "router_gemini_unavailable",
-                disabled_until=self._provider_health.gemini_disabled_until,
-                target_provider="groq",
-            )
-        elif self._can_use_gemini():
-            try:
-                response_text = await self._process_gemini(prompt)
-                self._record_provider_success("gemini")
-                return response_text
-            except Exception as e:
-                rate_limited = self._is_rate_limit_error(e)
-                self._record_provider_failure("gemini", e, rate_limited)
-                cooldown = self._gemini_cooldown_seconds(e)
-                if cooldown > 0:
-                    self._provider_health.disable_gemini(cooldown)
-                    if "perday" in str(e).lower() or "limit: 0" in str(e).lower():
-                        self._disable_gemini_globally(cooldown)
-                logger.warning("text_fallback_gemini_failed", error=str(e), exc_info=True)
+        if self.gemini_available:
+            if not self._provider_health.is_gemini_available():
+                reason = "quota" if self._provider_health.gemini_disabled_until else "cooldown"
+                logger.warning("provider_skipped", provider="gemini", reason=reason, fallback_to="groq")
+                self._emit_provider_fallback("gemini", reason, "groq")
+            elif self._can_use_gemini():
+                try:
+                    return await self._run_provider_text_with_retry("gemini", "groq", lambda: self._process_gemini(prompt))
+                except (RateLimitError, QuotaExhaustedError):
+                    pass
+        else:
+            self._emit_provider_fallback("gemini", "unavailable", "groq")
 
         if self._can_use_provider("groq", self.groq_available):
             try:
-                response_text = await self._process_groq(prompt)
-                self._record_provider_success("groq")
-                return response_text
-            except Exception as e:
-                rate_limited = self._is_rate_limit_error(e)
-                self._record_provider_failure("groq", e, rate_limited)
-                logger.warning("text_fallback_groq_failed", error=str(e), exc_info=True)
+                return await self._run_provider_text_with_retry("groq", "ollama", lambda: self._process_groq(prompt))
+            except (RateLimitError, QuotaExhaustedError):
+                pass
+        else:
+            self._emit_provider_fallback("groq", "unavailable", "ollama")
 
         if self._can_use_provider("ollama", self.ollama_available):
             try:
-                response_text = await self._process_ollama(prompt)
-                self._record_provider_success("ollama")
-                return response_text
-            except Exception as e:
-                self._record_provider_failure("ollama", e, False)
-                logger.warning("text_fallback_ollama_failed", error=str(e), exc_info=True)
+                return await self._run_provider_text_with_retry("ollama", "", lambda: self._process_ollama(prompt))
+            except (RateLimitError, QuotaExhaustedError):
+                pass
+        else:
+            self._emit_provider_fallback("ollama", "unavailable", "none")
 
+        logger.error("llm_providers_exhausted", providers=["gemini", "groq", "ollama"], prompt_preview=prompt[:120])
         return "Can't reach any LLM providers right now."
 
     async def check_provider_status(self) -> tuple[dict[str, str], str]:
@@ -1183,6 +1349,7 @@ Never use mcp_write_file to overwrite important system files. Always confirm wit
                     config=types.GenerateContentConfig(max_output_tokens=1),
                 )
                 status["Gemini"] = "OK"
+                update_provider_health("gemini", "healthy", success=True)
             except Exception as e:
                 msg = str(e).lower()
                 if "perday" in msg or "limit: 0" in msg:
@@ -1190,15 +1357,20 @@ Never use mcp_write_file to overwrite important system files. Always confirm wit
                     self._provider_health.disable_gemini(
                         float(self._cfg.providers.gemini_daily_quota_cooldown_hours) * 3600.0
                     )
+                    update_provider_health("gemini", "quota_exhausted", success=False, last_error=str(e))
                 elif "perminute" in msg or "429" in msg:
                     status["Gemini"] = "RATE_LIMITED"
                     self._provider_health.disable_gemini(65.0)
+                    update_provider_health("gemini", "rate_limited", success=False, cooldown_until=time.time() + 65.0, last_error=str(e))
                 else:
                     status["Gemini"] = "ERROR"
+                    update_provider_health("gemini", "error", success=False, last_error=str(e))
         elif self._cfg.gemini_api_key:
             status["Gemini"] = "INIT_FAILED"
+            update_provider_health("gemini", "init_failed", success=False)
         else:
             status["Gemini"] = "NO_KEY"
+            update_provider_health("gemini", "no_key", success=False)
 
         if self.groq_available:
             try:
@@ -1208,21 +1380,28 @@ Never use mcp_write_file to overwrite important system files. Always confirm wit
                     max_tokens=1,
                 )
                 status["Groq"] = "OK"
+                update_provider_health("groq", "healthy", success=True)
             except Exception:
                 status["Groq"] = "ERROR"
+                update_provider_health("groq", "error", success=False)
         elif self._cfg.groq_api_key:
             status["Groq"] = "INIT_FAILED"
+            update_provider_health("groq", "init_failed", success=False)
         else:
             status["Groq"] = "NO_KEY"
+            update_provider_health("groq", "no_key", success=False)
 
         if self.ollama_available:
             try:
                 await asyncio.wait_for(asyncio.to_thread(self.ollama.list), timeout=3.0)
                 status["Ollama"] = "REACHABLE"
+                update_provider_health("ollama", "healthy", success=True)
             except Exception:
                 status["Ollama"] = "UNREACHABLE"
+                update_provider_health("ollama", "unreachable", success=False)
         else:
             status["Ollama"] = "UNAVAILABLE"
+            update_provider_health("ollama", "unavailable", success=False)
 
         primary = "None"
         if status["Gemini"] == "OK" and self._provider_health.is_gemini_available():

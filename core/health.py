@@ -13,6 +13,9 @@ logger = get_logger("health")
 # Checks not updated within this window are auto-degraded to "stale".
 STALENESS_THRESHOLD_SECONDS: float = 300.0  # 5 minutes
 
+provider_health: dict[str, dict[str, Any]] = {}
+_PROVIDER_HEALTH_LOCK = threading.RLock()
+
 
 @dataclass
 class HealthCheck:
@@ -103,6 +106,7 @@ class HealthMonitor:
                 "healthy": healthy,
                 "checks": checks,
                 "turn_stage_averages_ms": self.turn_stage_averages(),
+                "provider_health": get_provider_health(),
                 "updated_at": now,
             }
 
@@ -122,6 +126,13 @@ class HealthMonitor:
             for stage, values in stage_avgs.items():
                 lines.append(
                     f"  - {stage}: {values['average_ms']:.0f}ms over {values['sample_count']} samples"
+                )
+        providers = snapshot.get("provider_health") or {}
+        if providers:
+            lines.append("- provider health:")
+            for name, info in providers.items():
+                lines.append(
+                    f"  - {name}: {info.get('current_status', 'unknown')}, failures {info.get('failure_count', 0)}"
                 )
         return "\n".join(lines)
 
@@ -147,3 +158,43 @@ def set_global_health_monitor(monitor: HealthMonitor | None) -> None:
 
 def get_global_health_monitor() -> HealthMonitor | None:
     return _GLOBAL_HEALTH_MONITOR
+
+
+def update_provider_health(
+    name: str,
+    current_status: str,
+    *,
+    success: bool = False,
+    cooldown_until: float = 0.0,
+    last_error: str = "",
+) -> dict[str, Any]:
+    now = time.time()
+    key = (name or "unknown").lower()
+    with _PROVIDER_HEALTH_LOCK:
+        entry = provider_health.get(
+            key,
+            {
+                "last_success_ts": 0.0,
+                "last_failure_ts": 0.0,
+                "failure_count": 0,
+                "current_status": "unknown",
+                "cooldown_until": 0.0,
+                "last_error": "",
+            },
+        )
+        entry["current_status"] = str(current_status or "unknown")
+        entry["cooldown_until"] = float(cooldown_until or 0.0)
+        entry["last_error"] = (last_error or "")[:120]
+        if success:
+            entry["last_success_ts"] = now
+            entry["failure_count"] = 0
+        else:
+            entry["last_failure_ts"] = now
+            entry["failure_count"] = int(entry.get("failure_count", 0)) + 1
+        provider_health[key] = entry
+        return dict(entry)
+
+
+def get_provider_health() -> dict[str, dict[str, Any]]:
+    with _PROVIDER_HEALTH_LOCK:
+        return {name: dict(info) for name, info in provider_health.items()}

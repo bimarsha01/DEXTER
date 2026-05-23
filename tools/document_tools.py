@@ -5,8 +5,11 @@ import os
 import re
 import threading
 from collections import Counter
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
+from core.event_bus import DexterEvents
 from core.brain.rag import MultiUserRAGManager
 from core.brain import session_state
 from utils.config import get_config
@@ -19,6 +22,66 @@ SUPPORTED_TEXT_EXTENSIONS = {".txt", ".md", ".py", ".json", ".yaml", ".yml", ".c
 
 _RAG_MANAGER: MultiUserRAGManager | None = None
 _RAG_MANAGER_LOCK = threading.Lock()
+_EVENT_BUS = None
+
+
+@dataclass
+class DocumentResult:
+    text: str
+    returned_path: str = ""
+    query: str = ""
+    confidence: float = 0.0
+    source_kind: str = "document"
+    user_note: str | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        self.text = str(self.text or "")
+        self.returned_path = str(self.returned_path or "")
+        self.query = str(self.query or "")
+        self.confidence = float(self.confidence or 0.0)
+        self.source_kind = str(self.source_kind or "document")
+        self.metadata = dict(self.metadata or {})
+        if self.user_note is not None:
+            self.user_note = str(self.user_note)
+
+    def __str__(self) -> str:
+        return self.text
+
+    def __contains__(self, item: object) -> bool:
+        return item in self.text
+
+    def __getattr__(self, name: str):
+        return getattr(self.text, name)
+
+    def __bool__(self) -> bool:
+        return bool(self.text)
+
+    def to_event_payload(self) -> dict[str, Any]:
+        payload = {
+            "query": self.query,
+            "returned_path": self.returned_path,
+            "confidence": self.confidence,
+            "source_kind": self.source_kind,
+            "metadata": dict(self.metadata),
+        }
+        if self.user_note is not None:
+            payload["user_note"] = self.user_note
+        return payload
+
+
+def set_event_bus(event_bus) -> None:
+    global _EVENT_BUS
+    _EVENT_BUS = event_bus
+
+
+def _emit_retrieval_event(result: DocumentResult) -> None:
+    if _EVENT_BUS is None:
+        return
+    try:
+        _EVENT_BUS.emit(DexterEvents.RETRIEVAL_EVENT, result.to_event_payload())
+    except Exception:
+        logger.debug("retrieval_event_emit_failed", path=result.returned_path, query=result.query, exc_info=True)
 
 
 def _get_rag_index():
@@ -136,7 +199,7 @@ def _extract_relevant_section(content: str, question: str, ext: str) -> str:
         # This prevents returning multiple "top-level" structures when the query
         # clearly targets a single class/function.
         best_score = scored[0][0] if scored else 0.0
-        score_threshold = max(0.0, best_score - 5.0)
+        score_threshold = max(0.0, best_score - float(get_config().rag.filename_score_spread_threshold))
         chosen = []
         total = 0
         filtered = [item for item in scored[:3] if item[0] >= score_threshold]
@@ -207,7 +270,7 @@ def _extract_relevant_section(content: str, question: str, ext: str) -> str:
     return cleaned[:2000] if cleaned else content[:2000]
 
 
-def _resolve_best_document(query: str) -> tuple[str | None, float]:
+def _resolve_best_document(query: str, seed_path: str | None = None) -> tuple[str | None, float]:
     """Resolve `query` to a file path and confidence score using multiple strategies.
 
     Returns (path, confidence).
@@ -216,6 +279,15 @@ def _resolve_best_document(query: str) -> tuple[str | None, float]:
     candidate = Path(query).expanduser()
     if candidate.exists():
         return (str(candidate), 1.0)
+
+    if seed_path:
+        seeded = Path(seed_path).expanduser()
+        if seeded.exists():
+            seed_candidate = str(seeded)
+        else:
+            seed_candidate = None
+    else:
+        seed_candidate = None
 
     # 2) Boosted RAG search
     try:
@@ -247,6 +319,9 @@ def _resolve_best_document(query: str) -> tuple[str | None, float]:
             except Exception:
                 filenames = []
 
+            if seed_candidate and seed_candidate not in filenames:
+                filenames.insert(0, seed_candidate)
+
             if not filenames:
                 return (None, 0.0)
 
@@ -260,7 +335,7 @@ def _resolve_best_document(query: str) -> tuple[str | None, float]:
                     best_r = r
                     best_path = path
 
-            if best_path and best_r >= 75:
+            if best_path and best_r >= float(get_config().rag.filename_fuzzy_match_threshold):
                 return (best_path, best_r / 100.0)
     except Exception:
         pass
@@ -341,20 +416,23 @@ def summarize_document(path: str, max_bullets: int = 8) -> str:
     return "Summary:\n" + "\n".join(summary)
 
 
-def _answer_from_resolved_document(resolved_path: str, question: str, confidence: float = 1.0, set_session_project: bool = False) -> str:
+def _answer_from_resolved_document(resolved_path: str, question: str, confidence: float = 1.0, set_session_project: bool = False) -> DocumentResult:
     """Build an answer from a resolved file path without performing resolution."""
     text = _read_file_as_text(resolved_path)
     if not text or text.startswith("I could not") or text.startswith("No readable"):
-        return text
+        result = DocumentResult(text=text, returned_path=resolved_path, query=question, confidence=confidence)
+        _emit_retrieval_event(result)
+        return result
 
     ext = Path(resolved_path).suffix.lower()
     section = _extract_relevant_section(text, question, ext)
+    rag_cfg = get_config().rag
 
     prefix = ""
-    if confidence < 0.7:
+    if confidence < float(rag_cfg.project_confidence_threshold):
         prefix = f"[Reading from {os.path.basename(resolved_path)} — confirm if that's not right]\n\n"
 
-    if set_session_project and confidence >= 0.65:
+    if set_session_project and confidence >= float(rag_cfg.document_confidence_session_threshold):
         try:
             session_state.set_current_project(
                 name=os.path.splitext(os.path.basename(resolved_path))[0],
@@ -367,37 +445,73 @@ def _answer_from_resolved_document(resolved_path: str, question: str, confidence
             logger.debug("set_current_project_failed", path=resolved_path, confidence=confidence)
 
     if not section:
-        return prefix + summarize_document(resolved_path)
+        result = DocumentResult(
+            text=prefix + summarize_document(resolved_path),
+            returned_path=resolved_path,
+            query=question,
+            confidence=confidence,
+            metadata={"kind": "summary"},
+        )
+        _emit_retrieval_event(result)
+        return result
 
     code_exts = {".java", ".py", ".js", ".ts", ".cs", ".go", ".cpp", ".kt", ".rb", ".rs"}
     if ext in code_exts:
         excerpt = section.strip()
         preview = "\n".join(excerpt.splitlines()[:10])
-        return prefix + "Relevant code excerpt:\n" + preview
+        result = DocumentResult(
+            text=prefix + "Relevant code excerpt:\n" + preview,
+            returned_path=resolved_path,
+            query=question,
+            confidence=confidence,
+            metadata={"kind": "code_excerpt"},
+        )
+        _emit_retrieval_event(result)
+        return result
 
     sentences = _split_sentences(section)
     if not sentences:
-        return prefix + section[:1000]
+        result = DocumentResult(
+            text=prefix + section[:1000],
+            returned_path=resolved_path,
+            query=question,
+            confidence=confidence,
+            metadata={"kind": "excerpt"},
+        )
+        _emit_retrieval_event(result)
+        return result
     scores = _score_sentences(sentences)
     ranked = sorted(range(len(sentences)), key=lambda idx: scores[idx], reverse=True)[:3]
     ranked.sort()
     summary = " ".join(sentences[idx].strip() for idx in ranked if sentences[idx].strip())
-    return prefix + "Summary: " + summary
+    result = DocumentResult(
+        text=prefix + "Summary: " + summary,
+        returned_path=resolved_path,
+        query=question,
+        confidence=confidence,
+        metadata={"kind": "summary"},
+    )
+    _emit_retrieval_event(result)
+    return result
 
 
-def answer_document_file_question(path: str, question: str) -> str:
+def answer_document_file_question(path: str, question: str) -> DocumentResult:
     """Answer a question about a specific file path without semantic project lookup."""
     if not path:
-        return "You must provide a file path."
+        result = DocumentResult(text="You must provide a file path.", query=question)
+        _emit_retrieval_event(result)
+        return result
 
     resolved_path = str(Path(path).expanduser())
     if not Path(resolved_path).exists():
-        return f"File not found: {path}"
+        result = DocumentResult(text=f"File not found: {path}", query=question)
+        _emit_retrieval_event(result)
+        return result
 
     return _answer_from_resolved_document(resolved_path, question, confidence=1.0, set_session_project=False)
 
 
-def answer_project_question(path: str, question: str) -> str:
+def answer_project_question(path: str, question: str, seed_path: str | None = None) -> DocumentResult:
     """Answer a question about a project name or partial file reference using RAG lookup."""
     resolved_path, confidence = _resolve_best_document(path)
     if not resolved_path:
@@ -406,44 +520,89 @@ def answer_project_question(path: str, question: str) -> str:
             candidates = rag.search(path, limit=3) if rag is not None else []
             if candidates:
                 names = [os.path.basename(c.get("path") or c.get("title") or "") for c in candidates]
-                return f"I wasn't confident which file you meant. Top matches: {', '.join(names)}. Which one should I read?"
+                result = DocumentResult(
+                    text=f"I wasn't confident which file you meant. Top matches: {', '.join(names)}. Which one should I read?",
+                    query=path,
+                    confidence=0.0,
+                    metadata={"top_matches": names},
+                )
+                _emit_retrieval_event(result)
+                return result
         except Exception:
             pass
-        return f"I could not find a file matching {path!r}."
+        result = DocumentResult(text=f"I could not find a file matching {path!r}.", query=path, confidence=0.0)
+        _emit_retrieval_event(result)
+        return result
 
-    if confidence < 0.5:
+    rag_cfg = get_config().rag
+
+    if confidence < float(rag_cfg.document_confidence_low_threshold):
         try:
             rag = _get_rag_index()
             candidates = rag.search(path, limit=3) if rag is not None else []
             names = [os.path.basename(c.get("path") or c.get("title") or "") for c in candidates]
-            return f"I'm not confident which file you mean. Top candidates: {', '.join(names)}. Please confirm which file to read."
+            result = DocumentResult(
+                text=f"I'm not confident which file you mean. Top candidates: {', '.join(names)}. Please confirm which file to read.",
+                returned_path=resolved_path,
+                query=path,
+                confidence=confidence,
+                metadata={"top_candidates": names},
+            )
+            _emit_retrieval_event(result)
+            return result
         except Exception:
-            return "I'm not confident which file you mean. Could you provide the file path or more details?"
+            result = DocumentResult(
+                text="I'm not confident which file you mean. Could you provide the file path or more details?",
+                returned_path=resolved_path,
+                query=path,
+                confidence=confidence,
+            )
+            _emit_retrieval_event(result)
+            return result
 
-    if _looks_like_summary_request(question) and confidence < 0.95:
+    if _looks_like_summary_request(question) and confidence < float(rag_cfg.document_confidence_summary_threshold):
         try:
             rag = _get_rag_index()
             candidates = rag.search(path, limit=3) if rag is not None else []
             if len(candidates) > 1:
                 blended = _build_multi_file_summary(candidates, question)
                 if blended:
-                    return blended
+                    result = DocumentResult(
+                        text=blended,
+                        returned_path=resolved_path,
+                        query=path,
+                        confidence=confidence,
+                        metadata={"kind": "multi_file_summary"},
+                    )
+                    _emit_retrieval_event(result)
+                    return result
         except Exception:
             logger.debug("project_summary_blend_failed", path=path, question=question, exc_info=True)
 
     return _answer_from_resolved_document(resolved_path, question, confidence=confidence, set_session_project=True)
 
 
-def answer_document_question(path: str, question: str) -> str:
+def answer_document_question(path: str, question: str) -> DocumentResult:
     """Answer a question about a file or project.
 
     If `path` is an existing file, answer directly from that file. Otherwise,
     treat it as a project or partial name and resolve it through the RAG index.
     """
+    session_context = session_state.get_session_context()
+    seed_path = None
+    if session_context.project and session_context.project.confidence > float(get_config().rag.project_confidence_threshold):
+        seed_path = session_context.project.source_path
+        logger.info(
+            "session_context_loaded",
+            source="document_tools",
+            has_project=True,
+            confidence=round(session_context.project.confidence, 2),
+        )
+
     candidate = Path(path).expanduser()
     if candidate.exists():
         return answer_document_file_question(str(candidate), question)
-    return answer_project_question(path, question)
+    return answer_project_question(path, question, seed_path=seed_path)
 
 
 def _split_sentences(text: str) -> list[str]:

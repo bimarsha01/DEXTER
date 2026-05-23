@@ -24,6 +24,8 @@ from utils.user_profile import UserProfile
 from utils.asr_corrections import ASRCorrectionEngine
 from utils.vocabulary_builder import VocabularyBuilder
 import threading
+from core.brain.session_state import ContextStore, SessionContext
+from core.feedback import FeedbackStore
 
 logger = get_logger("main")
 
@@ -154,6 +156,16 @@ async def main():
 
         # 3. Initialize fast synchronous components
         logger.info("initializing_stage", stage="fast_components")
+
+        context_store = ContextStore()
+        session_context = context_store.load()
+        feedback_store = FeedbackStore()
+        logger.info(
+            "session_context_loaded",
+            source="boot",
+            has_project=bool(session_context.project),
+            turn_summaries=len(session_context.recent_turn_summaries),
+        )
         
         # TTS manager with cancellation support.
         if not safe_mode:
@@ -187,9 +199,11 @@ async def main():
         # Connect to LLM backends (Gemini → Groq → Ollama)
         from core.brain.llm_router import Brain
         from core.event_bus import EventBus
+        from tools import document_tools
 
         event_bus = EventBus()
-        brain = Brain(event_bus=event_bus, asr_engine=asr_engine)
+        document_tools.set_event_bus(event_bus)
+        brain = Brain(event_bus=event_bus, asr_engine=asr_engine, session_context=session_context)
         health_monitor.healthy("brain", "llm router ready")
 
         provider_status, primary_provider = await brain.check_provider_status()
@@ -259,6 +273,9 @@ async def main():
             event_bus=event_bus,
             health_monitor=health_monitor,
             asr_engine=asr_engine,
+            context_store=context_store,
+            session_context=session_context,
+            feedback_store=feedback_store,
         )
         proactive_task = None
         if proactive is not None:

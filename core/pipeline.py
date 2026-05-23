@@ -20,6 +20,8 @@ from utils.logger import get_logger, bind_correlation_id, clear_correlation_id
 from utils.metrics import metrics
 from utils.config import DexterConfig
 from core.brain import session_state
+from core.brain.session_state import ContextStore, SessionContext, UserPreferences
+from core.feedback import FeedbackStore, RetrievalFeedback
 
 logger = get_logger("pipeline")
 
@@ -188,6 +190,16 @@ class TurnController:
         turn_start = time.perf_counter()
         ctx = TurnContext(cid=cid, turn_start=turn_start)
 
+        loaded_context = self.pipeline.context_store.load()
+        self.pipeline._sync_session_context(loaded_context)
+        logger.info(
+            "session_context_loaded",
+            source="turn_start",
+            turn_id=ctx.cid,
+            has_project=bool(self.pipeline.session_context.project),
+            turn_summaries=len(self.pipeline.session_context.recent_turn_summaries),
+        )
+
         try:
             self.pipeline._set_state(AssistantState.LISTENING)
             ctx = await self._run_stage("transcribe", ctx, self._stage_transcribe, self._effective_stage_timeout("transcribe"))
@@ -237,6 +249,20 @@ class TurnController:
                 except Exception:
                     pass
 
+            summary = f"{ctx.clean_command} -> {ctx.response_text[:240]}".strip()
+            if summary:
+                self.pipeline.session_context.recent_turn_summaries.append(summary)
+                self.pipeline.session_context.recent_turn_summaries = self.pipeline.session_context.recent_turn_summaries[-20:]
+            if self.pipeline.session_context.project is not None:
+                self.pipeline.session_context.project.last_confirmed_ts = time.time()
+            self.pipeline.context_store.save(self.pipeline.session_context)
+            logger.info(
+                "session_context_saved",
+                turn_id=ctx.cid,
+                summaries=len(self.pipeline.session_context.recent_turn_summaries),
+                has_project=bool(self.pipeline.session_context.project),
+            )
+
             self.pipeline._set_state(AssistantState.IDLE)
         except TurnStageError as e:
             logger.error(
@@ -249,9 +275,15 @@ class TurnController:
                 "error_occurred",
                 {"component": e.stage, "error": str(e)},
             )
+            # Speak a short error for non-response stage failures so the turn does not end silently.
             if e.stage == "generate_response":
                 try:
                     await self.pipeline.tts.speak("I didn't get a response in time. Please try again.")
+                except Exception:
+                    pass
+            else:
+                try:
+                    await self.pipeline.tts.speak("I hit a problem handling that request. Please try again.")
                 except Exception:
                     pass
             self.pipeline._set_state(AssistantState.IDLE)
@@ -270,6 +302,11 @@ class TurnController:
                     )
             except Exception:
                 pass
+            try:
+                latest_retrieval_event = self._drain_retrieval_events()
+                self._latest_retrieval_event = latest_retrieval_event
+            except Exception:
+                self._latest_retrieval_event = None
             clear_correlation_id()
 
     async def _stage_transcribe(self, ctx: TurnContext) -> TurnContext:
@@ -278,6 +315,8 @@ class TurnController:
 
         def _interrupt_handler():
             logger.debug("interrupt_detected_stopping_tts", cid=ctx.cid)
+            if pipeline.state == AssistantState.SPEAKING:
+                pipeline._mark_response_interrupted()
             pipeline.tts.stop()
 
         try:
@@ -354,6 +393,14 @@ class TurnController:
 
             ctx.identified_text = identified_text
             ctx.preprocessed_text = apply_wake_word_corrections(identified_text)
+            if pipeline._consume_response_interrupted():
+                pipeline._apply_preference_updates(
+                    {"verbosity": "brief"},
+                    source="barge_in",
+                    reason="user interrupted Dexter mid-response",
+                    turn_id=ctx.cid,
+                    trigger_text=identified_text,
+                )
             pipeline._diag("transcript_received", transcript=identified_text, activation_mode=pipeline._effective_activation_mode())
             return ctx
         except TurnStageError:
@@ -378,6 +425,14 @@ class TurnController:
             pipeline._set_state(AssistantState.IDLE)
             ctx.stop_turn = True
             ctx.stop_reason = "activation_command"
+            return ctx
+
+        pipeline._drain_retrieval_events()
+        if pipeline._looks_like_retrieval_correction(ctx.preprocessed_text):
+            pipeline._record_retrieval_feedback(ctx.cid, ctx.preprocessed_text)
+            pipeline._set_state(AssistantState.IDLE)
+            ctx.stop_turn = True
+            ctx.stop_reason = "retrieval_feedback"
             return ctx
 
         if pipeline.asr_engine and pipeline._last_transcript:
@@ -441,6 +496,12 @@ class TurnController:
             correction = pipeline.corrector.correct(ctx.preprocessed_text)
             ctx.clean_command = correction.corrected
             ctx.bypass_activation = bypass_activation
+            pipeline._apply_preference_signals(
+                ctx.clean_command,
+                source="explicit_command",
+                reason="explicit preference request",
+                turn_id=ctx.cid,
+            )
             if not bypass_activation and not pipeline.brain.pending_action and len(ctx.clean_command.split()) < pipeline.min_command_words:
                 pipeline._set_state(AssistantState.IDLE)
                 ctx.stop_turn = True
@@ -459,6 +520,7 @@ class TurnController:
             session_state.clear_if_stale(pipeline._turn_count)
         except Exception:
             pass
+        pipeline._sync_session_context(pipeline.context_store.load())
 
         if pipeline.activation_mode == "clap":
             pipeline._open_wake_window()
@@ -474,18 +536,18 @@ class TurnController:
 
         ctx.memory_context = await asyncio.to_thread(pipeline.memory.recall_context, ctx.clean_command, 3, False)
 
-        try:
-            proj = session_state.get_current_project()
-        except Exception:
-            proj = None
+        proj_ctx = pipeline.session_context.project
+        proj = None
+        if proj_ctx is not None:
+            proj = {
+                "name": proj_ctx.name,
+                "resolved_path": proj_ctx.source_path,
+                "confidence": proj_ctx.confidence,
+                "last_confirmed_ts": proj_ctx.last_confirmed_ts,
+                "user_scope": proj_ctx.user_scope,
+            }
 
         if proj:
-            set_at_turn = proj.get("set_at_turn")
-            if set_at_turn is None or int(set_at_turn or 0) == 0:
-                try:
-                    session_state.set_current_project(proj.get("name"), proj.get("resolved_path"), proj.get("confidence", 0.0), pipeline._turn_count)
-                except Exception:
-                    pass
             rag_query = f"{proj.get('name')} {ctx.clean_command}"
 
             rag_index = getattr(pipeline.memory, "personal_rag", None)
@@ -655,6 +717,9 @@ class AsyncPipeline:
         event_bus: Optional[EventBus] = None,
         health_monitor: Optional[HealthMonitor] = None,
         asr_engine=None,
+        context_store: ContextStore | None = None,
+        session_context: SessionContext | None = None,
+        feedback_store: FeedbackStore | None = None,
     ) -> None:
         self.config = config
         self.transcriber = transcriber
@@ -665,7 +730,13 @@ class AsyncPipeline:
         self.event_bus = event_bus or EventBus()
         self.health_monitor = health_monitor
         self.asr_engine = asr_engine
+        self.context_store = context_store or ContextStore()
+        self.session_context = session_context or SessionContext()
+        self.feedback_store = feedback_store or FeedbackStore()
         self._last_transcript = ""
+        self._retrieval_event_queue = self.event_bus.subscribe(maxsize=0) if hasattr(self.event_bus, "subscribe") else None
+        self._latest_retrieval_event: dict | None = None
+        self._response_interrupted = False
 
         self.state = AssistantState.IDLE
         self._state_changed_at = time.time()
@@ -724,6 +795,221 @@ class AsyncPipeline:
                 ),
             )
         )
+
+    def _current_user_preferences(self) -> UserPreferences:
+        prefs = self.session_context.user_preferences
+        if isinstance(prefs, UserPreferences):
+            return prefs
+        coerced = UserPreferences.from_dict(dict(prefs or {}))
+        self.session_context.user_preferences = coerced
+        return coerced
+
+    @staticmethod
+    def _normalize_preference_text(text: str) -> str:
+        return re.sub(r"\s+", " ", (text or "").lower()).strip()
+
+    def _detect_preference_updates(self, text: str) -> dict[str, str]:
+        normalized = self._normalize_preference_text(text)
+        if not normalized:
+            return {}
+
+        brief_patterns = (
+            r"\bkeep (?:it|this)? ?short\b",
+            r"\bbe brief\b",
+            r"\bbriefly\b",
+            r"\bshort answer\b",
+            r"\bmore concise\b",
+            r"\bdon't be verbose\b",
+            r"\bless verbose\b",
+        )
+        detailed_patterns = (
+            r"\bexplain more\b",
+            r"\bmore detail\b",
+            r"\bgo into more detail\b",
+            r"\bbe detailed\b",
+            r"\btell me more\b",
+            r"\bexpand on that\b",
+        )
+        casual_patterns = (
+            r"\bstop being so formal\b",
+            r"\bbe less formal\b",
+            r"\bmore casual\b",
+            r"\btalk casually\b",
+            r"\bfriendlier\b",
+            r"\bless stiff\b",
+        )
+        neutral_patterns = (
+            r"\bbe neutral\b",
+            r"\bkeep it neutral\b",
+            r"\bmore professional\b",
+            r"\bless casual\b",
+        )
+
+        updates: dict[str, str] = {}
+        if any(re.search(pattern, normalized) for pattern in brief_patterns):
+            updates["verbosity"] = "brief"
+        elif any(re.search(pattern, normalized) for pattern in detailed_patterns):
+            updates["verbosity"] = "detailed"
+
+        if any(re.search(pattern, normalized) for pattern in casual_patterns):
+            updates["tone"] = "casual"
+        elif any(re.search(pattern, normalized) for pattern in neutral_patterns):
+            updates["tone"] = "neutral"
+
+        return updates
+
+    def _apply_preference_updates(
+        self,
+        updates: dict[str, str],
+        *,
+        source: str,
+        reason: str,
+        turn_id: str | None,
+        trigger_text: str,
+    ) -> bool:
+        if not updates:
+            return False
+
+        prefs = self._current_user_preferences()
+        before = prefs.to_dict()
+        changed = False
+
+        verbosity = updates.get("verbosity")
+        if verbosity and verbosity != prefs.verbosity:
+            prefs.verbosity = verbosity
+            changed = True
+
+        tone = updates.get("tone")
+        if tone and tone != prefs.tone:
+            prefs.tone = tone
+            changed = True
+
+        if not changed:
+            return False
+
+        prefs.correction_count = int(prefs.correction_count or 0) + 1
+        prefs.last_updated_ts = time.time()
+        self.session_context.user_preferences = prefs
+        self.context_store.save(self.session_context)
+        logger.info(
+            "preference_update",
+            source=source,
+            reason=reason,
+            turn_id=turn_id,
+            trigger_text=trigger_text[:120],
+            previous=before,
+            updated=prefs.to_dict(),
+        )
+        return True
+
+    def _apply_preference_signals(self, text: str, *, source: str, reason: str, turn_id: str | None) -> bool:
+        return self._apply_preference_updates(
+            self._detect_preference_updates(text),
+            source=source,
+            reason=reason,
+            turn_id=turn_id,
+            trigger_text=text,
+        )
+
+    def _mark_response_interrupted(self) -> None:
+        self._response_interrupted = True
+
+    def _consume_response_interrupted(self) -> bool:
+        interrupted = self._response_interrupted
+        self._response_interrupted = False
+        return interrupted
+
+    def _sync_session_context(self, loaded_context: SessionContext) -> None:
+        self.session_context.project = loaded_context.project
+        self.session_context.recent_turn_summaries = list(loaded_context.recent_turn_summaries)[-20:]
+        self.session_context.user_preferences = UserPreferences.from_dict(loaded_context.user_preferences.to_dict())
+
+    def _drain_retrieval_events(self) -> dict | None:
+        if self._retrieval_event_queue is None:
+            return None
+        latest_event = None
+        while True:
+            try:
+                event = self._retrieval_event_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            except Exception:
+                break
+
+            if not isinstance(event, dict):
+                continue
+            if event.get("type") != DexterEvents.RETRIEVAL_EVENT:
+                continue
+            payload = event.get("payload") or {}
+            if isinstance(payload, dict) and payload.get("returned_path"):
+                latest_event = dict(payload)
+
+        return latest_event
+
+    @staticmethod
+    def _looks_like_retrieval_correction(text: str) -> bool:
+        normalized = re.sub(r"\s+", " ", (text or "").lower().strip())
+        if not normalized:
+            return False
+        patterns = (
+            r"\bthat's the wrong file\b",
+            r"\bthat is the wrong file\b",
+            r"\bwrong file\b",
+            r"\bwrong document\b",
+            r"\buse the other document\b",
+            r"\buse the other file\b",
+            r"\bnot that one\b",
+            r"\bnot this one\b",
+            r"\bnot the right file\b",
+            r"\bnot the right document\b",
+            r"\bthat's not the right file\b",
+            r"\bthat's not the right document\b",
+        )
+        return any(re.search(pattern, normalized) for pattern in patterns)
+
+    def _record_retrieval_feedback(self, turn_id: str, user_note: str) -> bool:
+        latest = self._latest_retrieval_event or {}
+        returned_path = str(latest.get("returned_path") or "")
+        query = str(latest.get("query") or "")
+        if not returned_path or not query:
+            return False
+
+        feedback = RetrievalFeedback(
+            turn_id=turn_id,
+            query=query,
+            returned_path=returned_path,
+            was_correct=False,
+            user_note=user_note,
+        )
+        try:
+            self.feedback_store.record(feedback)
+            logger.info(
+                "retrieval_feedback_recorded",
+                turn_id=turn_id,
+                query=query,
+                returned_path=returned_path,
+                user_note=user_note[:120],
+            )
+            self.event_bus.emit(
+                "retrieval_feedback_recorded",
+                {
+                    "turn_id": turn_id,
+                    "query": query,
+                    "returned_path": returned_path,
+                    "user_note": user_note,
+                },
+            )
+            return True
+        except Exception as exc:
+            logger.warning(
+                "retrieval_feedback_record_failed",
+                turn_id=turn_id,
+                query=query,
+                returned_path=returned_path,
+                error=str(exc),
+                exc_info=True,
+            )
+            return False
 
     def _contains_wake_word(self, text: str) -> bool:
         if self.wake_detector is None:
