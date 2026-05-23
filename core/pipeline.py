@@ -2,7 +2,7 @@ import asyncio
 import os
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import partial
 from pathlib import Path
 from rapidfuzz import fuzz
@@ -44,6 +44,14 @@ class TurnContext:
     turn_timeout_seconds: float = 0.0
     stop_turn: bool = False
     stop_reason: str = ""
+
+
+@dataclass
+class PreferenceDetection:
+    updates: dict[str, str] = field(default_factory=dict)
+    confidence: float = 0.0
+    matched_phrases: list[str] = field(default_factory=list)
+    ambiguous: bool = False
 
 
 class TurnStageError(RuntimeError):
@@ -508,6 +516,7 @@ class TurnController:
                 ctx.stop_reason = "too_short"
                 return ctx
 
+        pipeline._record_explicit_correction(ctx.clean_command, ctx.cid)
         pipeline._reset_activation_drop_counter()
         pipeline._activation.record_interaction()
         prev_mode = pipeline._activation.current_mode
@@ -805,81 +814,131 @@ class AsyncPipeline:
         return coerced
 
     @staticmethod
-    def _normalize_preference_text(text: str) -> str:
-        return re.sub(r"\s+", " ", (text or "").lower()).strip()
+    def _preference_phrase_table() -> dict[str, dict[str, tuple[str, ...]]]:
+        return {
+            "verbosity": {
+                "brief": (
+                    "keep it short",
+                    "be brief",
+                    "shorter please",
+                    "shorter answers",
+                    "don't need all that",
+                    "just the short version",
+                    "quick answer",
+                    "less detail",
+                    "no need to explain",
+                    "got it move on",
+                    "i know just tell me",
+                    "skip the explanation",
+                ),
+                "detailed": (
+                    "explain more",
+                    "tell me more",
+                    "go into detail",
+                    "more detail please",
+                    "can you elaborate",
+                    "walk me through it",
+                    "break it down",
+                    "give me the full picture",
+                    "i want to understand why",
+                ),
+            },
+            "tone": {
+                "casual": (
+                    "stop being so formal",
+                    "be more casual",
+                    "relax a bit",
+                    "you don't have to be so stiff",
+                    "talk normally",
+                    "talk like a person",
+                ),
+                "neutral": (
+                    "be more professional",
+                    "keep it professional",
+                    "formal please",
+                ),
+            },
+        }
 
-    def _detect_preference_updates(self, text: str) -> dict[str, str]:
+    @staticmethod
+    def _normalize_preference_text(text: str) -> str:
+        return re.sub(r"[^a-z0-9']+", " ", (text or "").lower()).strip()
+
+    @staticmethod
+    def _preference_word_count(text: str) -> int:
+        return len([word for word in (text or "").split() if word])
+
+    @staticmethod
+    def _phrase_in_text(phrase: str, normalized_text: str) -> bool:
+        return bool(re.search(rf"(?<!\w){re.escape(phrase)}(?!\w)", normalized_text))
+
+    @staticmethod
+    def _has_both_brevity_and_detail_clauses(normalized_text: str) -> bool:
+        brevity_keywords = ("short", "shorter", "brief", "concise", "skip", "less detail")
+        detail_keywords = ("detail", "details", "explain", "elaborate", "why", "full picture", "walk me through")
+        # Mixed brevity and detail cues are treated as contradictory and ignored.
+        return any(keyword in normalized_text for keyword in brevity_keywords) and any(
+            keyword in normalized_text for keyword in detail_keywords
+        )
+
+    def _detect_preference_updates(self, text: str) -> PreferenceDetection:
         normalized = self._normalize_preference_text(text)
         if not normalized:
-            return {}
+            return PreferenceDetection()
 
-        brief_patterns = (
-            r"\bkeep (?:it|this)? ?short\b",
-            r"\bbe brief\b",
-            r"\bbriefly\b",
-            r"\bshort answer\b",
-            r"\bmore concise\b",
-            r"\bdon't be verbose\b",
-            r"\bless verbose\b",
-        )
-        detailed_patterns = (
-            r"\bexplain more\b",
-            r"\bmore detail\b",
-            r"\bgo into more detail\b",
-            r"\bbe detailed\b",
-            r"\btell me more\b",
-            r"\bexpand on that\b",
-        )
-        casual_patterns = (
-            r"\bstop being so formal\b",
-            r"\bbe less formal\b",
-            r"\bmore casual\b",
-            r"\btalk casually\b",
-            r"\bfriendlier\b",
-            r"\bless stiff\b",
-        )
-        neutral_patterns = (
-            r"\bbe neutral\b",
-            r"\bkeep it neutral\b",
-            r"\bmore professional\b",
-            r"\bless casual\b",
-        )
+        words = self._preference_word_count(normalized)
+        if self._has_both_brevity_and_detail_clauses(normalized):
+            # Ambiguous mixed signals should not mutate preferences.
+            logger.debug("Ambiguous preference signal, ignoring", text_preview=normalized[:120])
+            return PreferenceDetection(confidence=0.4, ambiguous=True)
 
         updates: dict[str, str] = {}
-        if any(re.search(pattern, normalized) for pattern in brief_patterns):
-            updates["verbosity"] = "brief"
-        elif any(re.search(pattern, normalized) for pattern in detailed_patterns):
-            updates["verbosity"] = "detailed"
+        matched_phrases: list[str] = []
+        confidence = 0.0
 
-        if any(re.search(pattern, normalized) for pattern in casual_patterns):
-            updates["tone"] = "casual"
-        elif any(re.search(pattern, normalized) for pattern in neutral_patterns):
-            updates["tone"] = "neutral"
+        for field_name, value_map in self._preference_phrase_table().items():
+            for target_value, phrases in value_map.items():
+                for phrase in phrases:
+                    if not self._phrase_in_text(phrase, normalized):
+                        continue
+                    matched_phrases.append(phrase)
+                    updates[field_name] = target_value
+                    phrase_confidence = 1.0 if words <= 8 and normalized == phrase else 0.7
+                    confidence = max(confidence, phrase_confidence)
 
-        return updates
+        if confidence < 0.7 and matched_phrases:
+            # Low-confidence matches are logged but deliberately ignored.
+            logger.debug(
+                "Low-confidence preference signal ignored",
+                matched_phrases=matched_phrases,
+                word_count=words,
+                confidence=confidence,
+            )
+
+        return PreferenceDetection(updates=updates, confidence=confidence, matched_phrases=matched_phrases)
 
     def _apply_preference_updates(
         self,
-        updates: dict[str, str],
+        detection: PreferenceDetection,
         *,
         source: str,
         reason: str,
         turn_id: str | None,
         trigger_text: str,
     ) -> bool:
-        if not updates:
+        if not detection.updates or detection.confidence < 0.7:
             return False
 
         prefs = self._current_user_preferences()
         before = prefs.to_dict()
         changed = False
 
-        verbosity = updates.get("verbosity")
+        verbosity = detection.updates.get("verbosity")
         if verbosity and verbosity != prefs.verbosity:
             prefs.verbosity = verbosity
             changed = True
 
-        tone = updates.get("tone")
+        tone = detection.updates.get("tone")
         if tone and tone != prefs.tone:
             prefs.tone = tone
             changed = True
@@ -887,29 +946,68 @@ class AsyncPipeline:
         if not changed:
             return False
 
-        prefs.correction_count = int(prefs.correction_count or 0) + 1
+        prefs.preference_change_count = int(prefs.preference_change_count or 0) + 1
         prefs.last_updated_ts = time.time()
         self.session_context.user_preferences = prefs
-        self.context_store.save(self.session_context)
         logger.info(
             "preference_update",
             source=source,
             reason=reason,
             turn_id=turn_id,
             trigger_text=trigger_text[:120],
+            confidence=detection.confidence,
             previous=before,
             updated=prefs.to_dict(),
         )
         return True
 
     def _apply_preference_signals(self, text: str, *, source: str, reason: str, turn_id: str | None) -> bool:
-        return self._apply_preference_updates(
-            self._detect_preference_updates(text),
+        detection = self._detect_preference_updates(text)
+        if not detection.updates:
+            return False
+        updated = self._apply_preference_updates(
+            detection,
             source=source,
             reason=reason,
             turn_id=turn_id,
             trigger_text=text,
         )
+        if not updated:
+            return False
+        try:
+            self.context_store.save(self.session_context)
+        except Exception as exc:
+            logger.error("Preference save failed: %s", str(exc))
+        return True
+
+    def _looks_like_explicit_correction(self, text: str) -> bool:
+        normalized = self._normalize_preference_text(text)
+        correction_phrases = (
+            "that's not what i meant",
+            "that is not what i meant",
+            "wrong answer",
+            "no that's incorrect",
+            "no thats incorrect",
+            "that's incorrect",
+            "that is incorrect",
+            "that's wrong",
+            "that is wrong",
+        )
+        return any(self._phrase_in_text(phrase, normalized) for phrase in correction_phrases)
+
+    def _record_explicit_correction(self, text: str, turn_id: str | None) -> bool:
+        if not self._looks_like_explicit_correction(text):
+            return False
+        prefs = self._current_user_preferences()
+        prefs.correction_count = int(prefs.correction_count or 0) + 1
+        prefs.last_updated_ts = time.time()
+        self.session_context.user_preferences = prefs
+        try:
+            self.context_store.save(self.session_context)
+        except Exception as exc:
+            logger.error("Preference save failed: %s", str(exc))
+        logger.info("correction_count_incremented", turn_id=turn_id, text_preview=text[:120])
+        return True
 
     def _mark_response_interrupted(self) -> None:
         self._response_interrupted = True

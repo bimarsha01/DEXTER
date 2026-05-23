@@ -20,7 +20,8 @@ def test_user_preferences_round_trip_through_context_store(tmp_path):
         user_preferences=UserPreferences(
             verbosity="brief",
             tone="casual",
-            correction_count=2,
+            preference_change_count=2,
+            correction_count=1,
             last_updated_ts=123.45,
         ),
     )
@@ -31,7 +32,8 @@ def test_user_preferences_round_trip_through_context_store(tmp_path):
     assert isinstance(loaded.user_preferences, UserPreferences)
     assert loaded.user_preferences.verbosity == "brief"
     assert loaded.user_preferences.tone == "casual"
-    assert loaded.user_preferences.correction_count == 2
+    assert loaded.user_preferences.preference_change_count == 2
+    assert loaded.user_preferences.correction_count == 1
     assert loaded.user_preferences.last_updated_ts == 123.45
 
 
@@ -83,5 +85,6 @@ def test_pipeline_updates_preferences_from_explicit_signal_and_saves(tmp_path):
     assert changed is True
     assert loaded.user_preferences.verbosity == "brief"
     assert loaded.user_preferences.tone == "casual"
-    assert loaded.user_preferences.correction_count == 1
+    assert loaded.user_preferences.preference_change_count == 1
+    assert loaded.user_preferences.correction_count == 0
     assert loaded.user_preferences.last_updated_ts > 0.0

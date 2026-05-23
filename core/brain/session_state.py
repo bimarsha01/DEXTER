@@ -64,6 +64,7 @@ class ProjectContext:
 class UserPreferences:
     verbosity: str = "normal"
     tone: str = "neutral"
+    preference_change_count: int = 0
     correction_count: int = 0
     last_updated_ts: float = 0.0
 
@@ -76,6 +77,7 @@ class UserPreferences:
             tone = "neutral"
         self.verbosity = verbosity
         self.tone = tone
+        self.preference_change_count = max(0, int(self.preference_change_count or 0))
         self.correction_count = max(0, int(self.correction_count or 0))
         self.last_updated_ts = float(self.last_updated_ts or 0.0)
 
@@ -83,6 +85,7 @@ class UserPreferences:
         return {
             "verbosity": self.verbosity,
             "tone": self.tone,
+            "preference_change_count": int(self.preference_change_count),
             "correction_count": int(self.correction_count),
             "last_updated_ts": float(self.last_updated_ts),
         }
@@ -90,9 +93,13 @@ class UserPreferences:
     @classmethod
     def from_dict(cls, data: dict[str, Any] | None) -> "UserPreferences":
         payload = data or {}
+        preference_change_count = payload.get("preference_change_count")
+        if preference_change_count is None and "correction_count" in payload:
+            preference_change_count = payload.get("correction_count")
         return cls(
             verbosity=str(payload.get("verbosity", "normal") or "normal"),
             tone=str(payload.get("tone", "neutral") or "neutral"),
+            preference_change_count=int(preference_change_count or 0),
             correction_count=int(payload.get("correction_count", 0) or 0),
             last_updated_ts=float(payload.get("last_updated_ts", 0.0) or 0.0),
         )
@@ -272,10 +279,22 @@ class ContextStore:
                     str(item["pref_key"]): self._deserialize_value(item["pref_value"])
                     for item in preference_rows
                 }
+                # Migrate legacy rows by filling missing preference fields before rebuilding the dataclass.
+                defaults = UserPreferences().to_dict()
+                migrated_preferences: dict[str, Any] = {}
+                for field_name, default_value in defaults.items():
+                    if field_name not in user_preferences_raw:
+                        logger.warning("Migrating legacy session — missing field: %s", field_name)
+                        if field_name == "preference_change_count" and "correction_count" in user_preferences_raw:
+                            migrated_preferences[field_name] = int(user_preferences_raw.get("correction_count") or 0)
+                        else:
+                            migrated_preferences[field_name] = default_value
+                    else:
+                        migrated_preferences[field_name] = user_preferences_raw[field_name]
                 return SessionContext(
                     project=project,
                     recent_turn_summaries=recent_turn_summaries,
-                    user_preferences=UserPreferences.from_dict(user_preferences_raw),
+                    user_preferences=UserPreferences(**migrated_preferences),
                 )
             finally:
                 connection.close()
