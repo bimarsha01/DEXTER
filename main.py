@@ -18,7 +18,7 @@ import time
 from datetime import datetime
 from utils.logger import get_logger
 from utils.config import get_config, config_validation_warnings
-from core.health import HealthMonitor, set_global_health_monitor
+from core.health import GPUStatus, RAGStatus, HealthMonitor, set_global_health_monitor
 from utils.lazy_loader import LazyLoader
 from utils.user_profile import UserProfile
 from utils.asr_corrections import ASRCorrectionEngine
@@ -82,6 +82,240 @@ def _build_greeting(profile: UserProfile = None) -> str:
     return f"{time_greeting}. Dexter is online and ready."
 
 
+def _format_gb(value: float) -> str:
+    return f"{value:.0f}GB" if value >= 10 else f"{value:.1f}GB"
+
+
+def _format_age(seconds: float) -> str:
+    if seconds <= 0:
+        return "just now"
+    minutes = seconds / 60.0
+    hours = minutes / 60.0
+    days = hours / 24.0
+    if days >= 1:
+        return f"{int(days)}d ago"
+    if hours >= 1:
+        return f"{int(hours)}h ago"
+    if minutes >= 1:
+        return f"{int(minutes)}m ago"
+    return f"{int(seconds)}s ago"
+
+
+def _provider_marks(provider_status: dict[str, str]) -> str:
+    parts: list[str] = []
+    for name, status in provider_status.items():
+        normalized = str(status or "").strip().lower()
+        mark = "✓" if normalized in {"ready", "available", "healthy", "ok", "true", "success"} else "✗"
+        parts.append(f"{name.lower()}{mark}")
+    return " ".join(parts)
+
+
+def resolve_hardware_config(runtime_config) -> None:
+    hardware = runtime_config.hardware
+
+    try:
+        import torch
+
+        gpu_available = bool(torch.cuda.is_available())
+        total_vram_gb = 0.0
+        if gpu_available:
+            props = torch.cuda.get_device_properties(0)
+            total_vram_gb = float(props.total_memory) / (1024 ** 3)
+    except Exception as exc:
+        gpu_available = False
+        total_vram_gb = 0.0
+        logger.warning("hardware_probe_failed", error=str(exc), exc_info=True)
+
+    requested_device = str(getattr(hardware, "device", "auto") or "auto").strip().lower()
+    if requested_device == "auto":
+        resolved_device = "cuda" if gpu_available else "cpu"
+    elif requested_device in {"cuda", "cpu"}:
+        resolved_device = requested_device if (requested_device == "cpu" or gpu_available) else "cpu"
+    else:
+        resolved_device = "cuda" if gpu_available else "cpu"
+
+    requested_whisper_model = str(getattr(hardware, "whisper_model", "auto") or "auto").strip().lower()
+    if requested_whisper_model == "auto":
+        if total_vram_gb >= 8.0:
+            resolved_whisper_model = "medium"
+        elif total_vram_gb >= 4.0:
+            resolved_whisper_model = "small"
+        else:
+            resolved_whisper_model = "tiny"
+    else:
+        resolved_whisper_model = requested_whisper_model
+
+    requested_compute_type = str(getattr(hardware, "whisper_compute_type", "auto") or "auto").strip().lower()
+    if requested_compute_type == "auto":
+        if resolved_device == "cuda" and total_vram_gb >= 4.0:
+            resolved_compute_type = "float16"
+        elif resolved_device == "cuda":
+            resolved_compute_type = "int8"
+        else:
+            resolved_compute_type = "float32"
+    else:
+        resolved_compute_type = requested_compute_type
+
+    requested_embedding_device = str(getattr(hardware, "embedding_device", "auto") or "auto").strip().lower()
+    if requested_embedding_device == "auto":
+        resolved_embedding_device = "cuda" if gpu_available else "cpu"
+    elif requested_embedding_device in {"cuda", "cpu"}:
+        resolved_embedding_device = requested_embedding_device if (requested_embedding_device == "cpu" or gpu_available) else "cpu"
+    else:
+        resolved_embedding_device = "cuda" if gpu_available else "cpu"
+
+    hardware.device = resolved_device
+    hardware.whisper_model = resolved_whisper_model
+    hardware.whisper_compute_type = resolved_compute_type
+    hardware.embedding_device = resolved_embedding_device
+    hardware.vram_gb = total_vram_gb if gpu_available else 0.0
+
+    if hasattr(runtime_config, "rag"):
+        runtime_config.rag.embedding_device = resolved_embedding_device
+
+    logger.info(
+        f"Hardware: {resolved_device}, Whisper: {resolved_whisper_model} ({resolved_compute_type}), Embeddings: {resolved_embedding_device}"
+    )
+
+
+def check_gpu_readiness(runtime_config, health_monitor: HealthMonitor | None = None) -> GPUStatus:
+    expected_cuda = bool(getattr(getattr(runtime_config, "runtime", None), "expect_cuda", False))
+    status = GPUStatus(expected_cuda=expected_cuda)
+    try:
+        import torch
+
+        cuda_available = bool(torch.cuda.is_available())
+        status.cuda_available = cuda_available
+        if cuda_available:
+            device_index = int(torch.cuda.current_device())
+            device_name = str(torch.cuda.get_device_name(device_index))
+            major, minor = torch.cuda.get_device_capability(device_index)
+            try:
+                free_bytes, total_bytes = torch.cuda.mem_get_info()
+                total_vram_gb = float(total_bytes) / (1024 ** 3)
+                free_vram_gb = float(free_bytes) / (1024 ** 3)
+            except Exception:
+                props = torch.cuda.get_device_properties(device_index)
+                total_vram_gb = float(props.total_memory) / (1024 ** 3)
+                free_vram_gb = total_vram_gb
+
+            status.status = "ready"
+            status.device_name = device_name
+            status.compute_capability = f"{major}.{minor}"
+            status.total_vram_gb = total_vram_gb
+            status.free_vram_gb = free_vram_gb
+            status.details = "CUDA available"
+
+            logger.info(
+                "gpu_readiness_detected",
+                device=device_name,
+                compute_capability=status.compute_capability,
+                total_vram_gb=round(total_vram_gb, 2),
+                free_vram_gb=round(free_vram_gb, 2),
+            )
+            if total_vram_gb < 4.0:
+                logger.warning(
+                    "gpu_low_vram_warning",
+                    total_vram_gb=round(total_vram_gb, 2),
+                    detail="VRAM below 4GB may affect Whisper batch size",
+                )
+        else:
+            status.status = "unavailable"
+            status.details = "CUDA unavailable"
+            logger.warning("gpu_unavailable", expected_cuda=expected_cuda)
+            if expected_cuda:
+                logger.error("cuda_expected_but_unavailable", expected_cuda=expected_cuda)
+    except Exception as exc:
+        status.status = "unavailable"
+        status.details = str(exc)
+        logger.error("gpu_readiness_check_failed", error=str(exc), exc_info=True)
+        if expected_cuda:
+            logger.error("cuda_expected_but_unavailable", error=str(exc))
+
+    if health_monitor is not None:
+        health_monitor.set_gpu_status(status)
+    return status
+
+
+def check_rag_readiness(memory_vault, runtime_config, health_monitor: HealthMonitor | None = None) -> RAGStatus:
+    now = time.time()
+    status = RAGStatus()
+    try:
+        rag_proxy = getattr(memory_vault, "personal_rag", None)
+        status.index_exists = rag_proxy is not None
+
+        if rag_proxy is None:
+            status.status = "empty"
+            disable_warming = bool(getattr(getattr(runtime_config, "runtime", None), "disable_rag_warming", False))
+            status.details = "RAG warming is disabled at startup" if disable_warming else "RAG index is unavailable at startup"
+            if health_monitor is not None:
+                health_monitor.set_rag_status(status)
+            return status
+
+        if hasattr(rag_proxy, "is_ready") and not bool(getattr(rag_proxy, "is_ready")):
+            status.status = "warming"
+            status.details = "RAG index is still warming up"
+            if health_monitor is not None:
+                health_monitor.set_rag_status(status)
+            return status
+
+        rag_index = getattr(rag_proxy, "_index", rag_proxy)
+        collection = getattr(rag_index, "_collection", None)
+        doc_count = 0
+        if collection is not None:
+            try:
+                doc_count = int(collection.count() or 0)
+            except Exception:
+                doc_count = 0
+        elif hasattr(rag_index, "get_all_indexed_filenames"):
+            try:
+                doc_count = len(rag_index.get_all_indexed_filenames())
+            except Exception:
+                doc_count = 0
+
+        status.doc_count = doc_count
+        embedding_provider = str(getattr(getattr(rag_index, "_embedding_profile", None), "provider", "") or "")
+        status.embedding_model_loaded = bool(getattr(rag_index, "_ef", None) is not None or embedding_provider == "chromadb-default")
+        status.last_updated_ts = float(getattr(rag_index, "_last_refresh", 0.0) or 0.0)
+
+        if doc_count <= 0:
+            status.status = "empty"
+            status.details = "RAG index is present but empty"
+        elif not status.embedding_model_loaded:
+            status.status = "warming"
+            status.details = "RAG embedding model is still loading"
+        else:
+            age_seconds = now - status.last_updated_ts if status.last_updated_ts > 0 else 0.0
+            if age_seconds > 7 * 24 * 3600:
+                status.status = "stale"
+                status.details = f"RAG index last updated {_format_age(age_seconds)}"
+                logger.warning(
+                    "rag_index_stale",
+                    doc_count=doc_count,
+                    last_updated_ts=status.last_updated_ts,
+                    age_seconds=round(age_seconds, 2),
+                )
+            else:
+                status.status = "ready"
+                status.details = f"RAG index refreshed {_format_age(age_seconds)}"
+
+        logger.info(
+            "rag_readiness_checked",
+            status=status.status,
+            doc_count=doc_count,
+            last_updated_ts=status.last_updated_ts,
+            embedding_model_loaded=status.embedding_model_loaded,
+        )
+    except Exception as exc:
+        status.status = "empty"
+        status.details = str(exc)
+        logger.error("rag_readiness_check_failed", error=str(exc), exc_info=True)
+
+    if health_monitor is not None:
+        health_monitor.set_rag_status(status)
+    return status
+
+
 async def main():
     logger.info("boot_banner_top", char="=", repeat=60)
     logger.info("boot_title", title="DEXTER AI ASSISTANT — Booting Up")
@@ -95,6 +329,7 @@ async def main():
     for warning in config_validation_warnings(runtime_config):
         logger.warning("configuration_warning", detail=warning)
     logger.info("configuration_validated")
+    resolve_hardware_config(runtime_config)
 
     try:
         # Safe mode: disable audio input/output for diagnostics or CI
@@ -112,7 +347,7 @@ async def main():
         def _load_transcriber():
             from core.audio.transcriber import DexterTranscriber
 
-            stt_model = runtime_config.stt.model or runtime_config.models.whisper_model
+            stt_model = runtime_config.stt.model or runtime_config.hardware.whisper_model
             t = DexterTranscriber(
                 model_size=stt_model,
                 beam_size=runtime_config.stt.beam_size,
@@ -215,6 +450,10 @@ async def main():
         )
         logger.info("startup_primary_provider", provider=primary_provider)
 
+        health_monitor.attach_runtime_context(runtime_config, memory_vault, event_bus)
+        health_monitor.evaluate()
+        health_monitor.start_evaluation_loop(interval_seconds=300.0)
+
         proactive = None
         if runtime_config.proactive.enabled and not runtime_config.runtime.disable_proactive_mode:
             from core.proactive import ProactiveAssistant
@@ -251,6 +490,9 @@ async def main():
         memory_vault = await asyncio.to_thread(memory_loader.get)
         health_monitor.healthy("memory", "long-term memory ready")
 
+        gpu_status = check_gpu_readiness(runtime_config, health_monitor)
+        rag_status = check_rag_readiness(memory_vault, runtime_config, health_monitor)
+
         ready_time = time.perf_counter() - start_time
         logger.info("startup_profiler", stage="fully_ready", elapsed_sec=round(ready_time, 2))
         
@@ -260,6 +502,29 @@ async def main():
         wake_words = list(runtime_config.activation.wake_words or runtime_config.wake_words)
         logger.info("assistant_ready", activation_mode=activation_mode, wake_words=wake_words)
         logger.info("boot_banner_bottom", char="═", repeat=60)
+
+        rag_age_label = "warming"
+        if rag_status.status in {"ready", "stale"} and rag_status.last_updated_ts > 0:
+            rag_age_label = _format_age(time.time() - rag_status.last_updated_ts)
+        elif rag_status.status == "empty":
+            rag_age_label = "empty"
+
+        gpu_label = "no GPU"
+        if gpu_status.status == "ready" and gpu_status.device_name:
+            vram_label = _format_gb(gpu_status.total_vram_gb)
+            gpu_label = f"{gpu_status.device_name} ({vram_label})"
+        elif gpu_status.expected_cuda and not gpu_status.cuda_available:
+            gpu_label = "expected but unavailable"
+
+        provider_summary = _provider_marks(provider_status)
+        logger.info(
+            "dexter_ready_summary",
+            summary=(
+                f"DEXTER ready — GPU: {gpu_label}, "
+                f"RAG: {rag_status.doc_count:,} docs ({rag_age_label}), "
+                f"Providers: {provider_summary}"
+            ),
+        )
 
         from core.pipeline import AsyncPipeline
 
@@ -310,6 +575,10 @@ async def main():
                 logger.warning("mcp_shutdown_error", error=str(e))
             if proactive_task is not None:
                 proactive_task.cancel()
+            try:
+                health_monitor.stop_evaluation_loop()
+            except Exception:
+                pass
 
     except Exception as e:
         logger.error("critical_system_error", error=str(e), exc_info=True)

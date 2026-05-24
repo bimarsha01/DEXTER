@@ -28,6 +28,16 @@ class ModelsConfig(BaseModel):
     tts_voice: str = "en-GB-RyanNeural"
 
 
+class HardwareConfig(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    device: str = "auto"
+    whisper_model: str = "auto"
+    whisper_compute_type: str = "auto"
+    embedding_device: str = "auto"
+    vram_gb: float = 0.0
+
+
 class DefaultsConfig(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
@@ -203,6 +213,8 @@ class ProvidersConfig(BaseModel):
     groq_max_tools: int = 10
     ollama_timeout_seconds: float = 25.0
     overall_turn_timeout_seconds: float = 30.0
+    # Maximum age, in seconds, after which a provider cooldown is considered stale and cleared on load
+    max_cooldown_age_sec: int = 3600
 
 
 class AudioSettingsConfig(BaseModel):
@@ -210,6 +222,7 @@ class AudioSettingsConfig(BaseModel):
 
     sample_rate: int = 16000
     chunk_size: int = 512
+    whisper_batch_size: int = 16
     device_index: int | None = None
     vad_threshold: float = 0.25
     min_speech_duration_ms: int = 100
@@ -257,6 +270,7 @@ class McpConfig(BaseModel):
     server_script: str = "mcp_server/dexter_mcp_server.py"
     timeout_seconds: float = 15.0
     start_delay_seconds: float = 5.0
+    max_calls_per_minute: int = 30
 
 
 class ProactiveConfig(BaseModel):
@@ -267,6 +281,14 @@ class ProactiveConfig(BaseModel):
     system_status_interval_seconds: int = 900
 
 
+class HealthPolicy(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    max_rag_staleness_hours: float = 168.0
+    min_vram_gb: float = 2.0
+    max_provider_failure_rate: float = 0.5
+
+
 class RuntimeConfig(BaseModel):
     """Runtime flags set by low-power mode detection."""
 
@@ -274,6 +296,7 @@ class RuntimeConfig(BaseModel):
 
     disable_rag_warming: bool = False
     disable_proactive_mode: bool = False
+    expect_cuda: bool = False
 
 
 class PrivacyConfig(BaseModel):
@@ -284,6 +307,20 @@ class PrivacyConfig(BaseModel):
     # If enabled, log full user transcripts to disk (logs/dexter.log).
     # This can contain sensitive personal voice content.
     debug_log_transcripts: bool = False
+
+
+class VisionConfig(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    capture_timeout: float = 5.0
+
+
+class AutomationConfig(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    focus_wait_ms: int = 300
+    post_action_verify: bool = True
+    max_focus_retries: int = 3
 
 
 class SpotifyConfig(BaseModel):
@@ -315,6 +352,7 @@ class DexterConfig(BaseModel):
     wake_behavior: WakeBehaviorConfig = Field(default_factory=WakeBehaviorConfig)
     activation: ActivationConfig = Field(default_factory=ActivationConfig)
     models: ModelsConfig = Field(default_factory=ModelsConfig)
+    hardware: HardwareConfig = Field(default_factory=HardwareConfig)
     defaults: DefaultsConfig = Field(default_factory=DefaultsConfig)
     security: SecurityConfig = Field(default_factory=SecurityConfig)
     providers: ProvidersConfig = Field(default_factory=ProvidersConfig)
@@ -326,6 +364,9 @@ class DexterConfig(BaseModel):
     proactive: ProactiveConfig = Field(default_factory=ProactiveConfig)
     runtime: RuntimeConfig = Field(default_factory=RuntimeConfig)
     privacy: PrivacyConfig = Field(default_factory=PrivacyConfig)
+    vision: VisionConfig = Field(default_factory=VisionConfig)
+    health_policy: HealthPolicy = Field(default_factory=HealthPolicy)
+    automation: AutomationConfig = Field(default_factory=AutomationConfig)
     spotify: SpotifyConfig = Field(default_factory=SpotifyConfig)
     briefing: BriefingConfig = Field(default_factory=BriefingConfig)
     media: MediaConfig = Field(default_factory=MediaConfig)
@@ -368,6 +409,7 @@ def _ensure_config_shape(config: dict) -> dict:
     config = config or {}
     config.setdefault("api_keys", {})
     config.setdefault("models", {})
+    config.setdefault("hardware", {})
     config.setdefault("security", {})
     config.setdefault("providers", {})
     config.setdefault("audio_settings", {})
@@ -379,6 +421,9 @@ def _ensure_config_shape(config: dict) -> dict:
     config.setdefault("proactive", {})
     config.setdefault("runtime", {})
     config.setdefault("privacy", {})
+    config.setdefault("vision", {})
+    config.setdefault("health_policy", {})
+    config.setdefault("automation", {})
     config.setdefault("media", {})
     return config
 

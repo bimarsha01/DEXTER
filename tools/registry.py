@@ -261,6 +261,20 @@ async def execute_tool(func_name: str, arguments: dict, event_bus=None):
             document_tools.set_event_bus(event_bus)
         except Exception:
             pass
+    if event_bus is not None and func_name in {"read_workspace_file", "capture_screen"}:
+        try:
+            from tools import vision_tools
+
+            vision_tools.set_event_bus(event_bus)
+        except Exception:
+            pass
+    if event_bus is not None and func_name in {"type_text", "press_shortcut", "enter_key", "minimize_all_windows"}:
+        try:
+            from tools import input_tools
+
+            input_tools.set_event_bus(event_bus)
+        except Exception:
+            pass
 
     if func_name.startswith("mcp_"):
         if _mcp_ready and _mcp_client is not None:

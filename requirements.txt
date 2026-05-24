@@ -1,3 +1,7 @@
+# NOTE: PyTorch must be installed manually with CUDA support.
+# Run: python tools/diagnostics/gpu_setup.py
+# Do NOT run plain: pip install torch (installs CPU version)
+
 # ─── Core Dependencies ───
 faster-whisper
 edge-tts
@@ -21,7 +25,7 @@ psutil
 sounddevice
 soundfile
 numpy
-torch
+torch  # installed via CUDA wheel — see gpu_setup.py for install command
 torchaudio
 
 # ─── PC Control & Input ───

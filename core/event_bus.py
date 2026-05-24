@@ -49,18 +49,23 @@ class EventBus:
         self._subscribers.discard(queue)
 
     def emit(self, event_type: str, payload: Dict[str, Any] | None = None) -> None:
-        safe_payload = dict(payload or {})
-        if "correlation_id" not in safe_payload:
-            safe_payload["correlation_id"] = get_correlation_id()
-        if "event_id" not in safe_payload:
-            safe_payload["event_id"] = uuid.uuid4().hex
-        event = {
-            "type": event_type,
-            "payload": safe_payload,
-            "timestamp": time.time(),
-        }
-        for queue in list(self._subscribers):
-            try:
-                queue.put_nowait(event)
-            except asyncio.QueueFull:
-                logger.warning("event_bus_subscriber_queue_full", event_type=event_type)
+        try:
+            safe_payload = dict(payload or {})
+            if "correlation_id" not in safe_payload:
+                safe_payload["correlation_id"] = get_correlation_id()
+            if "event_id" not in safe_payload:
+                safe_payload["event_id"] = uuid.uuid4().hex
+            event = {
+                "type": event_type,
+                "payload": safe_payload,
+                "timestamp": time.time(),
+            }
+            for queue in list(self._subscribers):
+                try:
+                    queue.put_nowait(event)
+                except asyncio.QueueFull:
+                    logger.warning("event_bus_subscriber_queue_full", event_type=event_type)
+                except Exception as e:
+                    logger.warning("event_bus_emit_subscriber_failed", event_type=event_type, error=str(e))
+        except Exception as e:
+            logger.warning("Event bus emit failed (non-critical)", event_type=event_type, error=str(e))

@@ -300,6 +300,21 @@ def _resolve_best_document(query: str, seed_path: str | None = None) -> tuple[st
                 top = results[0]
                 score = float(top.get('score', 0.0))
                 path = top.get('path') or None
+                if len(results) > 1:
+                    second = results[1]
+                    second_score = float(second.get('score', 0.0))
+                    spread_threshold = float(getattr(cfg.rag, 'filename_score_spread_threshold', 5.0))
+                    top_name = os.path.basename(str(path or top.get('title') or ''))
+                    second_name = os.path.basename(str(second.get('path') or second.get('title') or ''))
+                    if abs(score - second_score) <= spread_threshold:
+                        logger.warning(
+                            'project_resolution_ambiguous',
+                            query=query,
+                            top_candidate=top_name,
+                            second_candidate=second_name,
+                            top_score=round(score, 2),
+                            second_score=round(second_score, 2),
+                        )
                 if path:
                     # Confidence is normalized to 0–1; callers may decide to
                     # ask for clarification if confidence is low.
@@ -418,6 +433,17 @@ def summarize_document(path: str, max_bullets: int = 8) -> str:
 
 def _answer_from_resolved_document(resolved_path: str, question: str, confidence: float = 1.0, set_session_project: bool = False) -> DocumentResult:
     """Build an answer from a resolved file path without performing resolution."""
+    if not Path(resolved_path).exists():
+        result = DocumentResult(
+            text=f"Stale project reference: {Path(resolved_path).name} no longer exists.",
+            returned_path=resolved_path,
+            query=question,
+            confidence=confidence,
+            metadata={"stale": True, "reason": "resolved_path_missing"},
+        )
+        _emit_retrieval_event(result)
+        return result
+
     text = _read_file_as_text(resolved_path)
     if not text or text.startswith("I could not") or text.startswith("No readable"):
         result = DocumentResult(text=text, returned_path=resolved_path, query=question, confidence=confidence)

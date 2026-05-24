@@ -2,6 +2,7 @@ import asyncio
 import os
 import re
 import time
+import threading
 from dataclasses import dataclass, field
 from functools import partial
 from pathlib import Path
@@ -26,7 +27,7 @@ from core.feedback import FeedbackStore, RetrievalFeedback
 logger = get_logger("pipeline")
 
 
-@dataclass
+@dataclass(eq=True)
 class TurnContext:
     cid: str
     turn_start: float
@@ -45,13 +46,25 @@ class TurnContext:
     stop_turn: bool = False
     stop_reason: str = ""
 
+    def __repr__(self) -> str:
+        return (
+            f"TurnContext(cid={self.cid!r}, turn_start={self.turn_start!r}, clean_command={self.clean_command!r}, "
+            f"response_text={self.response_text!r}, provider_hint={self.provider_hint!r})"
+        )
 
-@dataclass
+
+@dataclass(eq=True)
 class PreferenceDetection:
     updates: dict[str, str] = field(default_factory=dict)
     confidence: float = 0.0
     matched_phrases: list[str] = field(default_factory=list)
     ambiguous: bool = False
+
+    def __repr__(self) -> str:
+        return (
+            f"PreferenceDetection(updates={self.updates!r}, confidence={self.confidence!r}, "
+            f"matched_phrases={self.matched_phrases!r}, ambiguous={self.ambiguous!r})"
+        )
 
 
 class TurnStageError(RuntimeError):
@@ -73,6 +86,7 @@ class TurnController:
 
     def __init__(self, pipeline: "AsyncPipeline") -> None:
         self.pipeline = pipeline
+        self._current_turn_context: TurnContext | None = None
 
     def _effective_stage_timeout(self, stage: str) -> float:
         configured = float(getattr(self.pipeline.config.providers, "overall_turn_timeout_seconds", 0.0) or 0.0)
@@ -141,6 +155,10 @@ class TurnController:
                 error=f"{stage} stage timed out after {timeout:.1f}s",
                 duration_ms=round(duration_ms, 2),
             )
+            try:
+                self.pipeline.event_bus.emit("turn_stage_error", {"stage": stage, "error": f"{stage} stage timed out after {timeout:.1f}s", "turn_id": ctx.cid, "duration_ms": round(duration_ms, 2)})
+            except Exception:
+                pass
             raise TurnStageError(stage, f"{stage} stage timed out after {timeout:.1f}s", cause=e) from e
         except TurnStageError as e:
             duration_ms = (time.perf_counter() - stage_start) * 1000
@@ -160,6 +178,10 @@ class TurnController:
                 error=str(e),
                 duration_ms=round(duration_ms, 2),
             )
+            try:
+                self.pipeline.event_bus.emit("turn_stage_error", {"stage": stage, "error": str(e), "turn_id": ctx.cid, "duration_ms": round(duration_ms, 2)})
+            except Exception:
+                pass
             raise
         except Exception as e:
             duration_ms = (time.perf_counter() - stage_start) * 1000
@@ -179,6 +201,10 @@ class TurnController:
                 error=f"{stage} stage failed",
                 duration_ms=round(duration_ms, 2),
             )
+            try:
+                self.pipeline.event_bus.emit("turn_stage_error", {"stage": stage, "error": f"{stage} stage failed", "turn_id": ctx.cid, "duration_ms": round(duration_ms, 2)})
+            except Exception:
+                pass
             raise TurnStageError(stage, f"{stage} stage failed", cause=e) from e
         duration_ms = (time.perf_counter() - stage_start) * 1000
         self._record_stage_timing(stage, duration_ms)
@@ -198,7 +224,19 @@ class TurnController:
         turn_start = time.perf_counter()
         ctx = TurnContext(cid=cid, turn_start=turn_start)
 
-        loaded_context = self.pipeline.context_store.load()
+        # Leak-guard: ensure previous turn context cleaned up
+        try:
+            if getattr(self, "_current_turn_context", None) is not None:
+                logger.warning("leaked_turn_context_cleared", previous_turn_id=getattr(self._current_turn_context, "cid", None))
+                self._current_turn_context = None
+        except Exception:
+            self._current_turn_context = None
+
+        try:
+            initial_user_scope = getattr(self.pipeline.session_context, "_user_scope", None)
+        except Exception:
+            initial_user_scope = None
+        loaded_context = self.pipeline.context_store.load(user_scope=initial_user_scope)
         self.pipeline._sync_session_context(loaded_context)
         logger.info(
             "session_context_loaded",
@@ -209,7 +247,13 @@ class TurnController:
         )
 
         try:
+            # mark active turn context for leak detection
+            self._current_turn_context = ctx
             self.pipeline._set_state(AssistantState.LISTENING)
+            try:
+                logger.debug("response_interrupted_flag_at_turn_start", value=self.pipeline._response_interrupted)
+            except Exception:
+                pass
             ctx = await self._run_stage("transcribe", ctx, self._stage_transcribe, self._effective_stage_timeout("transcribe"))
             if ctx.stop_turn:
                 return
@@ -259,11 +303,35 @@ class TurnController:
 
             summary = f"{ctx.clean_command} -> {ctx.response_text[:240]}".strip()
             if summary:
-                self.pipeline.session_context.recent_turn_summaries.append(summary)
-                self.pipeline.session_context.recent_turn_summaries = self.pipeline.session_context.recent_turn_summaries[-20:]
+                try:
+                    with getattr(self.pipeline.session_context, "_write_lock", threading.RLock()):
+                        self.pipeline.session_context.recent_turn_summaries.append(summary)
+                        self.pipeline.session_context.recent_turn_summaries = self.pipeline.session_context.recent_turn_summaries[-20:]
+                except Exception:
+                    # best-effort
+                    self.pipeline.session_context.recent_turn_summaries.append(summary)
+                    self.pipeline.session_context.recent_turn_summaries = self.pipeline.session_context.recent_turn_summaries[-20:]
             if self.pipeline.session_context.project is not None:
-                self.pipeline.session_context.project.last_confirmed_ts = time.time()
-            self.pipeline.context_store.save(self.pipeline.session_context)
+                try:
+                    with getattr(self.pipeline.session_context, "_write_lock", threading.RLock()):
+                        self.pipeline.session_context.project.last_confirmed_ts = time.time()
+                except Exception:
+                    self.pipeline.session_context.project.last_confirmed_ts = time.time()
+            try:
+                if getattr(self.pipeline.session_context, "_just_saved", False):
+                    try:
+                        delattr(self.pipeline.session_context, "_just_saved")
+                    except Exception:
+                        pass
+                else:
+                    with getattr(self.pipeline.session_context, "_write_lock", threading.RLock()):
+                        self.pipeline.context_store.save(self.pipeline.session_context)
+            except Exception:
+                # preserve behavior: still log and continue
+                try:
+                    self.pipeline.context_store.save(self.pipeline.session_context)
+                except Exception:
+                    pass
             logger.info(
                 "session_context_saved",
                 turn_id=ctx.cid,
@@ -316,6 +384,11 @@ class TurnController:
             except Exception:
                 self._latest_retrieval_event = None
             clear_correlation_id()
+            # Clear active turn context to avoid leaks
+            try:
+                self._current_turn_context = None
+            except Exception:
+                pass
 
     async def _stage_transcribe(self, ctx: TurnContext) -> TurnContext:
         pipeline = self.pipeline
@@ -402,13 +475,30 @@ class TurnController:
             ctx.identified_text = identified_text
             ctx.preprocessed_text = apply_wake_word_corrections(identified_text)
             if pipeline._consume_response_interrupted():
-                pipeline._apply_preference_updates(
-                    {"verbosity": "brief"},
-                    source="barge_in",
-                    reason="user interrupted Dexter mid-response",
-                    turn_id=ctx.cid,
-                    trigger_text=identified_text,
-                )
+                # Barge-in implies the user wanted less verbosity — treat as a brief preference signal.
+                try:
+                    updated = pipeline._apply_preference_updates(
+                        {"verbosity": "brief"},
+                        source="barge_in",
+                        reason="user interrupted Dexter mid-response",
+                        turn_id=ctx.cid,
+                        trigger_text=identified_text,
+                    )
+                    if updated:
+                        try:
+                            with getattr(pipeline.session_context, "_write_lock", threading.RLock()):
+                                pipeline.context_store.save(pipeline.session_context)
+                                try:
+                                    setattr(pipeline.session_context, "_just_saved", True)
+                                except Exception:
+                                    pass
+                        except Exception:
+                            try:
+                                pipeline.context_store.save(pipeline.session_context)
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
             pipeline._diag("transcript_received", transcript=identified_text, activation_mode=pipeline._effective_activation_mode())
             return ctx
         except TurnStageError:
@@ -529,7 +619,12 @@ class TurnController:
             session_state.clear_if_stale(pipeline._turn_count)
         except Exception:
             pass
-        pipeline._sync_session_context(pipeline.context_store.load())
+        # Reload the same user scope we started the turn with (if available)
+        try:
+            user_scope = getattr(pipeline.session_context, "_user_scope", None)
+        except Exception:
+            user_scope = None
+        pipeline._sync_session_context(pipeline.context_store.load(user_scope=user_scope))
 
         if pipeline.activation_mode == "clap":
             pipeline._open_wake_window()
@@ -746,6 +841,7 @@ class AsyncPipeline:
         self._retrieval_event_queue = self.event_bus.subscribe(maxsize=0) if hasattr(self.event_bus, "subscribe") else None
         self._latest_retrieval_event: dict | None = None
         self._response_interrupted = False
+        self._turn_lock: asyncio.Lock | None = None
 
         self.state = AssistantState.IDLE
         self._state_changed_at = time.time()
@@ -926,6 +1022,9 @@ class AsyncPipeline:
         turn_id: str | None,
         trigger_text: str,
     ) -> bool:
+        # Accept plain dicts for quick updates (barge-in shortcuts)
+        if isinstance(detection, dict):
+            detection = PreferenceDetection(updates=detection, confidence=1.0, matched_phrases=list(detection.values()))
         if not detection.updates or detection.confidence < 0.7:
             return False
 
@@ -948,7 +1047,11 @@ class AsyncPipeline:
 
         prefs.preference_change_count = int(prefs.preference_change_count or 0) + 1
         prefs.last_updated_ts = time.time()
-        self.session_context.user_preferences = prefs
+        try:
+            with getattr(self.session_context, "_write_lock", threading.RLock()):
+                self.session_context.user_preferences = prefs
+        except Exception:
+            self.session_context.user_preferences = prefs
         logger.info(
             "preference_update",
             source=source,
@@ -959,6 +1062,24 @@ class AsyncPipeline:
             previous=before,
             updated=prefs.to_dict(),
         )
+        # Emit an event for listeners (tests and telemetry)
+        try:
+            payload = {
+                "source": source,
+                "reason": reason,
+                "turn_id": turn_id,
+                "trigger_text": trigger_text[:120],
+                "confidence": detection.confidence,
+                "previous": before,
+                "updated": prefs.to_dict(),
+            }
+            try:
+                self.event_bus.emit("preference_update", payload)
+            except Exception:
+                # best-effort: don't fail the turn for event emission issues
+                pass
+        except Exception:
+            pass
         return True
 
     def _apply_preference_signals(self, text: str, *, source: str, reason: str, turn_id: str | None) -> bool:
@@ -974,10 +1095,17 @@ class AsyncPipeline:
         )
         if not updated:
             return False
+        # Persist preferences immediately so mid-turn reloads keep the update.
         try:
-            self.context_store.save(self.session_context)
+            with getattr(self.session_context, "_write_lock", threading.RLock()):
+                self.context_store.save(self.session_context)
+                try:
+                    # Mark that we've just saved this session to avoid a duplicate save at end-of-turn
+                    setattr(self.session_context, "_just_saved", True)
+                except Exception:
+                    pass
         except Exception as exc:
-            logger.error("Preference save failed: %s", str(exc))
+            logger.warning("Preference save failed", error=str(exc))
         return True
 
     def _looks_like_explicit_correction(self, text: str) -> bool:
@@ -1001,11 +1129,12 @@ class AsyncPipeline:
         prefs = self._current_user_preferences()
         prefs.correction_count = int(prefs.correction_count or 0) + 1
         prefs.last_updated_ts = time.time()
-        self.session_context.user_preferences = prefs
         try:
-            self.context_store.save(self.session_context)
+            with getattr(self.session_context, "_write_lock", threading.RLock()):
+                self.session_context.user_preferences = prefs
+                self.context_store.save(self.session_context)
         except Exception as exc:
-            logger.error("Preference save failed: %s", str(exc))
+            logger.warning("Preference save failed", error=str(exc))
         logger.info("correction_count_incremented", turn_id=turn_id, text_preview=text[:120])
         return True
 
@@ -1014,6 +1143,10 @@ class AsyncPipeline:
 
     def _consume_response_interrupted(self) -> bool:
         interrupted = self._response_interrupted
+        try:
+            logger.debug("response_interrupted_consumed", interrupted=interrupted)
+        except Exception:
+            pass
         self._response_interrupted = False
         return interrupted
 
@@ -1796,4 +1929,7 @@ class AsyncPipeline:
             watchdog.cancel()
 
     async def _handle_once(self) -> None:
-        await self.turn_controller.run_turn()
+        if self._turn_lock is None:
+            self._turn_lock = asyncio.Lock()
+        async with self._turn_lock:
+            await self.turn_controller.run_turn()

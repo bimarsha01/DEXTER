@@ -247,7 +247,14 @@ Never use mcp_write_file to overwrite important system files. Always confirm wit
         else:
             hints.append("Use a neutral, straightforward tone.")
 
-        return self.base_system_instruction + "\n\nCurrent user preferences:\n- " + "\n- ".join(hints) if hints else self.base_system_instruction
+        base = self.base_system_instruction
+        sentinel = "Current user preferences:"
+        # If preferences block already present, avoid appending again (idempotent)
+        if sentinel in base:
+            return base
+        if hints:
+            return base + "\n\n" + sentinel + "\n- " + "\n- ".join(hints)
+        return base
 
     @property
     def system_instruction(self) -> str:
@@ -1070,6 +1077,12 @@ Never use mcp_write_file to overwrite important system files. Always confirm wit
             providers=["gemini", "groq", "ollama"],
             command_preview=user_command[:120],
         )
+        try:
+            if getattr(self, "_event_bus", None) is not None:
+                self._event_bus.emit("all_providers_exhausted", {"providers": ["gemini", "groq", "ollama"], "prompt_preview": user_command[:120]})
+                logger.info("all_providers_exhausted_emitted", providers=["gemini", "groq", "ollama"])
+        except Exception:
+            pass
         return (
             "All my providers are unreachable right now. "
             "Check your API keys in config.yaml and your internet connection."
@@ -1196,6 +1209,12 @@ Never use mcp_write_file to overwrite important system files. Always confirm wit
             providers=["gemini", "groq", "ollama"],
             command_preview=user_command[:120],
         )
+        try:
+            if getattr(self, "_event_bus", None) is not None:
+                self._event_bus.emit("all_providers_exhausted", {"providers": ["gemini", "groq", "ollama"], "prompt_preview": user_command[:120]})
+                logger.info("all_providers_exhausted_emitted", providers=["gemini", "groq", "ollama"])
+        except Exception:
+            pass
         response_text = await self.process_command(user_command, long_term_memory, indexed_context)
         yield response_text
 
@@ -1329,6 +1348,12 @@ Never use mcp_write_file to overwrite important system files. Always confirm wit
             self._emit_provider_fallback("ollama", "unavailable", "none")
 
         logger.error("llm_providers_exhausted", providers=["gemini", "groq", "ollama"], prompt_preview=prompt[:120])
+        try:
+            if getattr(self, "_event_bus", None) is not None:
+                self._event_bus.emit("all_providers_exhausted", {"providers": ["gemini", "groq", "ollama"], "prompt_preview": prompt[:120]})
+                logger.info("all_providers_exhausted_emitted", providers=["gemini", "groq", "ollama"])
+        except Exception:
+            pass
         return "Can't reach any LLM providers right now."
 
     async def check_provider_status(self) -> tuple[dict[str, str], str]:

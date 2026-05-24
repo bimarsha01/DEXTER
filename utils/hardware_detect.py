@@ -27,6 +27,7 @@ class LowPowerSettings(TypedDict):
     whisper_model: str
     chunk_size: int
     batch_size: int
+    whisper_batch_size: int
     max_embedding_threads: int
     disable_rag_warming: bool
     disable_proactive_mode: bool
@@ -44,6 +45,7 @@ PROFILES = {
         whisper_model="tiny.en",
         chunk_size=300,
         batch_size=32,
+        whisper_batch_size=8,
         max_embedding_threads=1,
         disable_rag_warming=True,
         disable_proactive_mode=True,
@@ -52,6 +54,7 @@ PROFILES = {
         whisper_model="base.en",
         chunk_size=500,
         batch_size=128,
+        whisper_batch_size=12,
         max_embedding_threads=2,
         disable_rag_warming=False,
         disable_proactive_mode=False,
@@ -60,6 +63,7 @@ PROFILES = {
         whisper_model="small.en",
         chunk_size=600,
         batch_size=256,
+        whisper_batch_size=16,
         max_embedding_threads=4,
         disable_rag_warming=False,
         disable_proactive_mode=False,
@@ -232,6 +236,9 @@ def apply_low_power_overrides(config_dict: dict) -> dict:
         config_dict["models"] = {}
     
     config_dict["models"]["whisper_model"] = settings["whisper_model"]
+    if "audio_settings" not in config_dict:
+        config_dict["audio_settings"] = {}
+    config_dict["audio_settings"]["whisper_batch_size"] = settings["whisper_batch_size"]
     
     # Apply overrides to RAG section
     if "rag" not in config_dict:

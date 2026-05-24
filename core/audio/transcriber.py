@@ -25,7 +25,7 @@ DEFAULT_WAKE_PROMPT = "Dexter,"
 class DexterTranscriber:
     def __init__(
         self,
-        model_size: str = "small.en",
+        model_size: str | None = None,
         beam_size: int = 5,
         best_of: int = 5,
         temperature: float = 0.0,
@@ -39,7 +39,7 @@ class DexterTranscriber:
         Initialize Whisper speech-to-text model.
         
         Args:
-            model_size: Whisper model size (tiny.en, base.en, small.en, medium.en)
+            model_size: Whisper model size (tiny, base, small, medium, large-v2)
             beam_size: Beam search width. Lower = faster, Higher = more accurate.
                        1 = greedy (fastest), 5 = thorough (default whisper).
         """
@@ -72,7 +72,8 @@ class DexterTranscriber:
                 self.initial_prompt = DEFAULT_INITIAL_PROMPT
         
         self._initial_prompt = getattr(self, 'initial_prompt', DEFAULT_INITIAL_PROMPT)
-        self.model_size = model_size
+            cfg = get_config()
+            self.model_size = (model_size or cfg.hardware.whisper_model or "tiny").strip()
         self._model: WhisperModel | None = None
         self._model_lock = threading.Lock()
         logger.info(
@@ -100,15 +101,22 @@ class DexterTranscriber:
             if self._model is not None:
                 return self._model
 
+            cfg = get_config()
+            hardware = cfg.hardware
+            device = (hardware.device or "cpu").strip().lower()
+            compute_type = (hardware.whisper_compute_type or "float32").strip().lower()
             try:
                 logger.info("whisper_model_downloading", model=self.model_size)
-                # Use float16 for RTX GPUs to maximize speed and save VRAM
-                self._model = WhisperModel(self.model_size, device="cuda", compute_type="float16")
-                logger.info("transcriber_device_ready", device="cuda", compute_type="float16")
+                self._model = WhisperModel(self.model_size, device=device, compute_type=compute_type)
+                logger.info(f"Whisper loaded: {self.model_size} on {device} ({compute_type})")
             except Exception as e:
-                logger.warning("transcriber_gpu_fallback", error=str(e), exc_info=True)
-                self._model = WhisperModel(self.model_size, device="cpu", compute_type="int8")
-                logger.info("transcriber_device_ready", device="cpu", compute_type="int8")
+                logger.warning("transcriber_model_load_failed", device=device, compute_type=compute_type, error=str(e), exc_info=True)
+                fallback_device = "cpu"
+                fallback_compute_type = "float32"
+                self._model = WhisperModel(self.model_size, device=fallback_device, compute_type=fallback_compute_type)
+                hardware.device = fallback_device
+                hardware.whisper_compute_type = fallback_compute_type
+                logger.info(f"Whisper loaded: {self.model_size} on {fallback_device} ({fallback_compute_type})")
 
         return self._model
 
@@ -203,6 +211,7 @@ class DexterTranscriber:
                 prompt = f"{DEFAULT_WAKE_PROMPT} {extra_prompt}"
         cfg = get_config()
         audio_cfg = getattr(cfg, "audio_settings", None)
+        whisper_batch_size = int(getattr(audio_cfg, "whisper_batch_size", 16) or 16)
         vad_params = {
             "threshold": 0.25,
             "min_speech_duration_ms": 100,
@@ -214,6 +223,7 @@ class DexterTranscriber:
             beam_size=self.beam_size,
             best_of=5,
             temperature=self.temperature,
+            batch_size=whisper_batch_size,
             condition_on_previous_text=False,
             initial_prompt=self._initial_prompt,
             vad_filter=True,

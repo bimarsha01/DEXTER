@@ -13,6 +13,7 @@ import tempfile
 import threading
 import time
 from dataclasses import dataclass, field
+import os
 from pathlib import Path
 from typing import Any, Optional
 
@@ -57,6 +58,13 @@ class ProjectContext:
             confidence=float(row["project_confidence"] or 0.0),
             last_confirmed_ts=float(row["project_last_confirmed_ts"] or 0.0),
             user_scope=user_scope,
+        )
+
+    def __repr__(self) -> str:
+        return (
+            f"ProjectContext(name={self.name!r}, source_path={self.source_path!r}, "
+            f"confidence={self.confidence!r}, last_confirmed_ts={self.last_confirmed_ts!r}, "
+            f"user_scope={self.user_scope!r})"
         )
 
 
@@ -104,12 +112,21 @@ class UserPreferences:
             last_updated_ts=float(payload.get("last_updated_ts", 0.0) or 0.0),
         )
 
+    def __repr__(self) -> str:
+        return (
+            f"UserPreferences(verbosity={self.verbosity!r}, tone={self.tone!r}, "
+            f"preference_change_count={self.preference_change_count!r}, correction_count={self.correction_count!r}, "
+            f"last_updated_ts={self.last_updated_ts!r})"
+        )
+
 
 @dataclass
 class SessionContext:
     project: ProjectContext | None = None
     recent_turn_summaries: list[str] = field(default_factory=list)
     user_preferences: UserPreferences | dict[str, Any] = field(default_factory=UserPreferences)
+    provider_health: dict[str, Any] = field(default_factory=dict)
+    _write_lock: threading.RLock = field(default_factory=threading.RLock, init=False, repr=False)
 
     def __post_init__(self) -> None:
         self.recent_turn_summaries = [str(item) for item in self.recent_turn_summaries][-20:]
@@ -117,6 +134,12 @@ class SessionContext:
             self.user_preferences = UserPreferences.from_dict(self.user_preferences.to_dict())
         else:
             self.user_preferences = UserPreferences.from_dict(dict(self.user_preferences or {}))
+
+    def __repr__(self) -> str:
+        return (
+            f"SessionContext(project={self.project!r}, recent_turn_summaries={self.recent_turn_summaries!r}, "
+            f"user_preferences={self.user_preferences!r}, provider_health={self.provider_health!r})"
+        )
 
 
 class ContextStore:
@@ -189,7 +212,11 @@ class ContextStore:
         )
 
     def save(self, session_context: SessionContext, user_scope: str | None = None) -> None:
-        scope = _user_key(user_scope or (session_context.project.user_scope if session_context.project else None))
+        scope = _user_key(
+            user_scope
+            or getattr(session_context, "_user_scope", None)
+            or (session_context.project.user_scope if session_context.project else None)
+        )
         user_preferences = session_context.user_preferences
         if not isinstance(user_preferences, UserPreferences):
             user_preferences = UserPreferences.from_dict(dict(user_preferences or {}))
@@ -197,15 +224,23 @@ class ContextStore:
             project=session_context.project,
             recent_turn_summaries=list(session_context.recent_turn_summaries)[-20:],
             user_preferences=user_preferences,
+            provider_health=dict(getattr(session_context, "provider_health", {}) or {}),
         )
         if payload.project is not None and payload.project.user_scope != scope:
             payload.project.user_scope = scope
 
         db_path = self._resolve_db_path()
+        logger.info("saving_session_context", user_scope=scope, preferences=user_preferences.to_dict())
         self._ensure_parent_dir(db_path)
         try:
             connection = sqlite3.connect(db_path)
             try:
+                # Enable WAL for better resilience / concurrency
+                try:
+                    connection.execute("PRAGMA journal_mode=WAL")
+                except Exception:
+                    # Best-effort only; continue if the PRAGMA is unsupported
+                    pass
                 connection.row_factory = sqlite3.Row
                 connection.execute("BEGIN IMMEDIATE")
                 self._init_schema(connection)
@@ -243,6 +278,15 @@ class ContextStore:
                         "INSERT INTO user_preferences (user_scope, pref_key, pref_value) VALUES (?, ?, ?)",
                         (scope, str(pref_key), self._serialize_value(pref_value)),
                     )
+                # Persist provider health as an opaque preference slot
+                try:
+                    connection.execute(
+                        "INSERT INTO user_preferences (user_scope, pref_key, pref_value) VALUES (?, ?, ?)",
+                        (scope, "provider_health", self._serialize_value(payload.provider_health)),
+                    )
+                except Exception:
+                    # Non-fatal: provider health best-effort
+                    logger.warning("provider_health_persist_failed", user_scope=scope)
                 connection.commit()
             finally:
                 connection.close()
@@ -254,7 +298,12 @@ class ContextStore:
         db_path = self._resolve_db_path()
         if not os.path.exists(db_path):
             logger.warning("session_context_db_missing", path=db_path, user_scope=scope)
-            return SessionContext()
+            sc = SessionContext()
+            try:
+                setattr(sc, "_user_scope", scope)
+            except Exception:
+                pass
+            return sc
 
         try:
             connection = sqlite3.connect(db_path)
@@ -279,25 +328,61 @@ class ContextStore:
                     str(item["pref_key"]): self._deserialize_value(item["pref_value"])
                     for item in preference_rows
                 }
+                # Extract provider health and remove from preferences map so migration targets only user prefs
+                provider_health_raw = user_preferences_raw.pop("provider_health", {}) or {}
                 # Migrate legacy rows by filling missing preference fields before rebuilding the dataclass.
                 defaults = UserPreferences().to_dict()
                 migrated_preferences: dict[str, Any] = {}
                 for field_name, default_value in defaults.items():
                     if field_name not in user_preferences_raw:
-                        logger.warning("Migrating legacy session — missing field: %s", field_name)
+                        logger.warning("Migrating legacy session — missing field", field=field_name)
                         if field_name == "preference_change_count" and "correction_count" in user_preferences_raw:
                             migrated_preferences[field_name] = int(user_preferences_raw.get("correction_count") or 0)
                         else:
                             migrated_preferences[field_name] = default_value
                     else:
                         migrated_preferences[field_name] = user_preferences_raw[field_name]
-                return SessionContext(
+                # Apply provider health staleness policy
+                cfg = get_config()
+                max_age = getattr(getattr(cfg, "providers", None), "max_cooldown_age_sec", 3600)
+                try:
+                    now = time.time()
+                    if isinstance(provider_health_raw, dict):
+                        for provider, state in list(provider_health_raw.items()):
+                            if isinstance(state, dict) and "cooldown_until" in state:
+                                try:
+                                    cooldown_until = float(state.get("cooldown_until") or 0)
+                                except Exception:
+                                    cooldown_until = 0
+                                if cooldown_until > 0 and (now - cooldown_until) > float(max_age or 3600):
+                                    # Clear stale cooldown
+                                    provider_health_raw[provider]["cooldown_until"] = 0
+                except Exception:
+                    # non-fatal
+                    pass
+
+                sc = SessionContext(
                     project=project,
                     recent_turn_summaries=recent_turn_summaries,
                     user_preferences=UserPreferences(**migrated_preferences),
+                    provider_health=provider_health_raw,
                 )
+                try:
+                    setattr(sc, "_user_scope", scope)
+                except Exception:
+                    pass
+                return sc
             finally:
                 connection.close()
+        except sqlite3.DatabaseError as exc:
+            # Defensive: if the DB is corrupted, move it aside and return a fresh context
+            try:
+                corrupt_path = f"{db_path}.corrupt.{int(time.time())}"
+                os.rename(db_path, corrupt_path)
+                logger.warning("session_context_db_corrupt_moved", path=db_path, new_path=corrupt_path, user_scope=scope)
+            except Exception:
+                logger.warning("session_context_db_corrupt_rename_failed", path=db_path, error=str(exc))
+            return SessionContext()
         except Exception as exc:
             logger.warning("session_context_load_failed", path=db_path, user_scope=scope, error=str(exc), exc_info=True)
             return SessionContext()

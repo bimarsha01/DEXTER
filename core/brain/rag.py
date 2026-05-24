@@ -379,12 +379,10 @@ _EMBEDDING_FN_LOCK = threading.Lock()
 def _resolve_embedding_device(device: str | None) -> str:
     requested = (device or "").strip()
     if not requested or requested.lower() in {"auto", "default"}:
-        try:
-            import torch
-
-            return "cuda" if torch.cuda.is_available() else "cpu"
-        except Exception:
-            return "cpu"
+        cfg = get_config()
+        hardware = getattr(cfg, "hardware", None)
+        resolved = str(getattr(hardware, "embedding_device", "cpu") or "cpu").strip().lower()
+        return resolved if resolved else "cpu"
     return requested
 
 
@@ -393,6 +391,7 @@ def _get_embedding_fn(model_name: str, device: str | None) -> SentenceTransforme
     cache_key = (model_name, resolved_device)
     with _EMBEDDING_FN_LOCK:
         if cache_key not in _EMBEDDING_FN_CACHE:
+            logger.info(f"Embedding model on {resolved_device}")
             logger.info("loading_embedding_model", model=model_name, device=resolved_device)
             try:
                 _EMBEDDING_FN_CACHE[cache_key] = SentenceTransformerEmbeddingFunction(
@@ -407,10 +406,12 @@ def _get_embedding_fn(model_name: str, device: str | None) -> SentenceTransforme
                         requested_device=resolved_device,
                         error=str(e),
                     )
-                    cache_key = (model_name, "cpu")
+                    fallback_device = "cpu"
+                    cache_key = (model_name, fallback_device)
+                    logger.info("Embedding model on cpu")
                     _EMBEDDING_FN_CACHE[cache_key] = SentenceTransformerEmbeddingFunction(
                         model_name=model_name,
-                        device="cpu",
+                        device=fallback_device,
                     )
                 else:
                     raise
