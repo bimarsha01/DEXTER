@@ -23,6 +23,7 @@ from utils.config import DexterConfig
 from core.brain import session_state
 from core.brain.session_state import ContextStore, SessionContext, UserPreferences
 from core.feedback import FeedbackStore, RetrievalFeedback
+from tools.input_tools import AutomationFocusError
 
 logger = get_logger("pipeline")
 
@@ -65,6 +66,11 @@ class PreferenceDetection:
             f"PreferenceDetection(updates={self.updates!r}, confidence={self.confidence!r}, "
             f"matched_phrases={self.matched_phrases!r}, ambiguous={self.ambiguous!r})"
         )
+
+
+@dataclass
+class ToolError:
+    message: str
 
 
 class TurnStageError(RuntimeError):
@@ -715,17 +721,33 @@ class TurnController:
         pipeline = self.pipeline
         if ctx.stop_turn:
             return ctx
+        try:
+            ctx.provider_hint = pipeline._active_llm_provider()
+            ctx.augmented_command = ctx.clean_command
+            if ctx.rag_context:
+                ctx.augmented_command = f"{ctx.rag_context}\nUser question: {ctx.clean_command}"
+                ctx.augmented_command += "\nAnswer questions about files in maximum 4 sentences. User is listening not reading."
 
-        ctx.provider_hint = pipeline._active_llm_provider()
-        ctx.augmented_command = ctx.clean_command
-        if ctx.rag_context:
-            ctx.augmented_command = f"{ctx.rag_context}\nUser question: {ctx.clean_command}"
-            ctx.augmented_command += "\nAnswer questions about files in maximum 4 sentences. User is listening not reading."
-
-        configured_timeout = float(getattr(pipeline.config.providers, "overall_turn_timeout_seconds", 30.0))
-        default_timeout = 45.0 if (ctx.rag_context and len(ctx.rag_context) > 100) else 20.0
-        ctx.turn_timeout_seconds = min(configured_timeout, default_timeout)
-        return ctx
+            configured_timeout = float(getattr(pipeline.config.providers, "overall_turn_timeout_seconds", 30.0))
+            default_timeout = 45.0 if (ctx.rag_context and len(ctx.rag_context) > 100) else 20.0
+            ctx.turn_timeout_seconds = min(configured_timeout, default_timeout)
+            return ctx
+        except AutomationFocusError as e:
+            # HARDENING RULE 4 — surface focus failures clearly to telemetry + user
+            msg = "I couldn't focus the right window to complete that action. Is the target window open?"
+            logger.error("automation_focus_failed", error=str(e))
+            try:
+                pipeline.event_bus.emit("automation_focus_failed", {"expected": getattr(e, "expected", None), "actual": getattr(e, "actual", None), "retries": getattr(e, "retries", 0)})
+            except Exception:
+                pass
+            try:
+                await pipeline.tts.speak(msg)
+            except Exception:
+                pass
+            ctx.tool_result = ToolError(message=msg)
+            ctx.stop_turn = True
+            ctx.stop_reason = "automation_focus_failed"
+            return ctx
 
     async def _stage_generate_response(self, ctx: TurnContext) -> TurnContext:
         pipeline = self.pipeline

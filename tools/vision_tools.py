@@ -7,6 +7,7 @@ import hashlib
 import io
 import os
 import time
+import threading
 from dataclasses import dataclass, field
 from functools import lru_cache
 from typing import Any, Optional
@@ -34,6 +35,9 @@ logger = get_logger("vision_tools")
 
 _EVENT_BUS = None
 
+# Guard to prevent concurrent captures from interleaving window state
+_capture_lock = threading.Lock()
+
 
 class _RECT(ctypes.Structure):
     _fields_ = [("left", ctypes.c_long), ("top", ctypes.c_long), ("right", ctypes.c_long), ("bottom", ctypes.c_long)]
@@ -52,10 +56,10 @@ class VisionCaptureRestoreError(VisionCaptureError):
 
 
 @dataclass
-class ScreenCaptureResult:
-    image_bytes: bytes
-    foreground_window: str
-    capture_mode: str
+class CaptureResult:
+    image: Image.Image
+    capture_ts: float
+    was_verified: bool
 
 
 @dataclass
@@ -86,7 +90,7 @@ def _emit_vision_capture_event(status: str, duration_ms: float, **fields: Any) -
     if _EVENT_BUS is None:
         return
     try:
-        _EVENT_BUS.emit("vision_capture", {"status": status, "duration_ms": duration_ms, **fields})
+        _EVENT_BUS.emit("vision_capture", {"status": status, "duration_ms": duration_ms, "ts": time.time(), **fields})
     except Exception:
         logger.debug("vision_capture_event_emit_failed", status=status, exc_info=True)
 

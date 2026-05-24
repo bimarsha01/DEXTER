@@ -6,6 +6,15 @@ from typing import Any
 
 try:
     import pyautogui as _pyautogui
+    # HARDENING RULE 5 — explicit FAILSAFE and PAUSE settings
+    try:
+        import pyautogui
+
+        pyautogui.FAILSAFE = True
+        pyautogui.PAUSE = 0.05
+    except Exception:
+        # Best-effort: if pyautogui cannot be fully configured, leave _pyautogui usable
+        pass
 except Exception:
     _pyautogui = None
 
@@ -24,12 +33,24 @@ logger = get_logger("input_tools")
 _EVENT_BUS = None
 
 
-class AutomationError(RuntimeError):
-    pass
+class AutomationError(Exception):
+    """Base exception for automation failures."""
 
 
-class AutomationFocusError(AutomationError):
-    pass
+class AutomationFocusError(Exception):
+    """Raised when foreground focus cannot be achieved.
+
+    Attributes:
+        expected: the expected title fragment
+        actual: the actual foreground title observed
+        retries: number of focus attempts performed
+    """
+
+    def __init__(self, expected: str, actual: str, retries: int):
+        self.expected = expected
+        self.actual = actual
+        self.retries = int(retries or 0)
+        super().__init__(f"Focus failed after {self.retries} retries. Expected '{expected}' in foreground, got '{actual}'")
 
 
 def set_event_bus(event_bus) -> None:
@@ -41,7 +62,7 @@ def _emit_automation_action(action: str, target: str, status: str, **fields: Any
     if _EVENT_BUS is None:
         return
     try:
-        payload = {"action": action, "target": target, "status": status, **fields}
+        payload = {"action": action, "target": target, "status": status, "ts": time.time(), **fields}
         _EVENT_BUS.emit("automation_action", payload)
     except Exception:
         logger.debug("automation_action_emit_failed", action=action, target=target, status=status, exc_info=True)
@@ -67,18 +88,25 @@ def _foreground_title() -> str:
 
 
 def verify_foreground(expected_title_fragment: str | None) -> tuple[bool, str]:
+    """Return (matched, actual_title).
+
+    HARDENING RULE 1 — perform a partial, case-insensitive title match.
+    """
     if win32gui is None:
         return False, ""
 
-    title = _foreground_title()
-    if not title:
-        return False, title
+    try:
+        hwnd = win32gui.GetForegroundWindow()
+        if not hwnd:
+            return False, ""
+        actual = str(win32gui.GetWindowText(hwnd) or "").lower()
+    except Exception:
+        return False, ""
 
     needle = (expected_title_fragment or "").strip().lower()
-    if needle and needle not in title.lower():
-        return False, title
-
-    return True, title
+    if needle and needle not in actual:
+        return False, actual
+    return True, actual
 
 
 def _focus_window_for_app(app_name: str, wait_ms: int) -> bool:
@@ -120,26 +148,37 @@ def _focus_window_for_app(app_name: str, wait_ms: int) -> bool:
 
 
 def _ensure_foreground(expected_title_fragment: str | None, *, focus_target: str | None = None) -> str:
+    """Ensure the expected window is in the foreground.
+
+    HARDENING RULE 2 — use monotonic deadline based on focus_wait_ms * max_focus_retries.
+    HARDENING RULE 3 — raise AutomationFocusError with structured context on failure.
+    """
     settings = _automation_settings()
     focus_wait_ms = max(0, int(settings.focus_wait_ms or 0))
     max_retries = max(0, int(settings.max_focus_retries or 0))
 
+    # initial quick check
     matched, title = verify_foreground(expected_title_fragment)
     if matched:
         return title
 
-    for _ in range(max_retries):
+    # Deadline-based retry loop (monotonic)
+    start = time.monotonic()
+    deadline = start + (max_retries * (focus_wait_ms / 1000.0))
+    attempts = 0
+    while time.monotonic() <= deadline:
         if focus_target:
             _focus_window_for_app(focus_target, focus_wait_ms)
         if focus_wait_ms > 0:
             time.sleep(focus_wait_ms / 1000.0)
+        attempts += 1
         matched, title = verify_foreground(expected_title_fragment)
         if matched:
             return title
 
-    actual_title = _foreground_title()
+    actual_title = _foreground_title() or "<none>"
     expected_label = (expected_title_fragment or focus_target or "any foreground window").strip() or "any foreground window"
-    raise AutomationFocusError(f"Foreground window check failed for '{expected_label}'. Current foreground title: '{actual_title or '<none>'}'")
+    raise AutomationFocusError(expected_label, actual_title, attempts)
 
 
 def _mouse_position() -> tuple[int, int] | None:
@@ -182,6 +221,25 @@ def _post_action_verified(action: str, before_cursor: tuple[int, int] | None, be
         return after_clipboard is not None or after_cursor is not None
 
     return after_cursor is not None or after_clipboard is not None
+
+
+def can_automate() -> bool:
+    """Return True if the environment seems to support automation (pyautogui + win32gui + a foreground window).
+
+    HARDENING RULE 6 — never raise, always return bool.
+    """
+    try:
+        if _pyautogui is None:
+            return False
+        if win32gui is None:
+            return False
+        try:
+            hwnd = win32gui.GetForegroundWindow()
+            return bool(hwnd)
+        except Exception:
+            return False
+    except Exception:
+        return False
 
 
 def _mark_unverified(action: str, target: str, reason: str, **fields: Any) -> str:

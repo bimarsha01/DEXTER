@@ -335,6 +335,7 @@ class VisionConfig(BaseModel):
     capture_timeout: float = 5.0
 
 
+# Automation settings for input tooling (keyboard/mouse automation)
 class AutomationConfig(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
