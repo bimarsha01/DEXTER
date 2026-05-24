@@ -10,11 +10,13 @@ import re
 import threading
 import time
 from collections import deque
+from enum import Enum
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Callable
 
 from fastmcp import FastMCP
+from fastapi.responses import JSONResponse
 
 from core.event_bus import EventBus
 from core.health import HealthMonitor, get_global_health_monitor, set_global_health_monitor
@@ -25,6 +27,14 @@ from utils.config import get_config
 logger = logging.getLogger("dexter_mcp_server")
 
 mcp = FastMCP("dexter-mcp-server")
+
+
+class MCPErrorCode(str, Enum):
+    TOOL_NOT_FOUND = "TOOL_NOT_FOUND"
+    VALIDATION_FAILED = "VALIDATION_FAILED"
+    RATE_LIMITED = "RATE_LIMITED"
+    EXECUTION_ERROR = "EXECUTION_ERROR"
+    INTERNAL_ERROR = "INTERNAL_ERROR"
 
 ALLOWED_ROOTS: list[str] = json.loads(os.environ.get("DEXTER_ALLOWED_ROOTS", "[]"))
 _SERVER_RUNTIME_ACTIVE = False
@@ -74,6 +84,31 @@ def _validate_path(path: str) -> Path:
     )
 
 
+def _sanitize_health_for_external(summary: dict) -> dict:
+    """
+    Remove any key whose name contains a sensitive keyword.
+    Operates recursively on nested dicts.
+    """
+    SENSITIVE_KEYWORDS = {"key", "secret", "token", "password", "api", "auth", "credential"}
+    if not isinstance(summary, dict):
+        return summary
+    cleaned = {}
+    for k, v in summary.items():
+        key_lower = k.lower()
+        if any(kw in key_lower for kw in SENSITIVE_KEYWORDS):
+            continue  # drop this field entirely
+        if isinstance(v, dict):
+            cleaned[k] = _sanitize_health_for_external(v)
+        elif isinstance(v, list):
+            cleaned[k] = [
+                _sanitize_health_for_external(item) if isinstance(item, dict) else item
+                for item in v
+            ]
+        else:
+            cleaned[k] = v
+    return cleaned
+
+
 def _schema_name(tool_name: str) -> str:
     return _TOOL_NAME_MAP.get(tool_name, f"mcp_{tool_name}")
 
@@ -97,7 +132,7 @@ def _rate_limit_per_minute() -> int:
 def _tool_error_response(
     tool_name: str,
     client_id: str,
-    code: str,
+    code: MCPErrorCode,
     message: str,
     *,
     details: dict[str, Any] | None = None,
@@ -114,6 +149,19 @@ def _tool_error_response(
     if details:
         payload["error"]["details"] = details
     return payload
+
+
+def _map_tool_error_code(code: str) -> MCPErrorCode:
+    normalized = (code or "").strip().lower()
+    if normalized == "rate_limited":
+        return MCPErrorCode.RATE_LIMITED
+    if normalized in {"validation_failed", "confirmation_required"}:
+        return MCPErrorCode.VALIDATION_FAILED
+    if normalized in {"tool_unavailable", "tool_not_found", "schema_missing"}:
+        return MCPErrorCode.TOOL_NOT_FOUND
+    if normalized in {"execution_error", "error"}:
+        return MCPErrorCode.EXECUTION_ERROR
+    return MCPErrorCode.INTERNAL_ERROR
 
 
 def _emit_mcp_event(tool_name: str, client_id: str, status: str, **details: Any) -> None:
@@ -178,7 +226,7 @@ async def _dispatch_tool(tool_name: str, args: dict[str, Any]) -> dict[str, Any]
         return _tool_error_response(
             tool_name,
             client_id,
-            "rate_limited",
+            MCPErrorCode.RATE_LIMITED,
             message,
             details={"retry_after_seconds": round(retry_after, 1)},
         )
@@ -190,7 +238,7 @@ async def _dispatch_tool(tool_name: str, args: dict[str, Any]) -> dict[str, Any]
         return _tool_error_response(
             tool_name,
             client_id,
-            "validation_failed",
+            MCPErrorCode.TOOL_NOT_FOUND,
             f"Schema '{schema_key}' is not registered.",
         )
 
@@ -200,7 +248,7 @@ async def _dispatch_tool(tool_name: str, args: dict[str, Any]) -> dict[str, Any]
         return _tool_error_response(
             tool_name,
             client_id,
-            "validation_failed",
+            MCPErrorCode.TOOL_NOT_FOUND,
             f"Tool '{tool_name}' is not registered.",
         )
 
@@ -210,13 +258,13 @@ async def _dispatch_tool(tool_name: str, args: dict[str, Any]) -> dict[str, Any]
         return result.data
 
     error_text = result.error or "Tool call failed."
-    error_code = "validation_failed"
+    error_code = MCPErrorCode.VALIDATION_FAILED
     if result.policy_decision == "tool_not_available":
-        error_code = "tool_unavailable"
+        error_code = MCPErrorCode.TOOL_NOT_FOUND
     elif result.confirmation_required:
-        error_code = "confirmation_required"
+        error_code = MCPErrorCode.VALIDATION_FAILED
     elif result.policy_decision not in {"invalid_args", "tool_not_available"}:
-        error_code = result.policy_decision or "validation_failed"
+        error_code = _map_tool_error_code(result.policy_decision or "validation_failed")
 
     _emit_mcp_event(
         tool_name,
@@ -925,6 +973,21 @@ async def list_calendar_events(days_ahead: int = 7, days_back: int = 0) -> dict:
 class _MCPStatusHandler(BaseHTTPRequestHandler):
     server_version = "DexterMCP/1.0"
 
+    @staticmethod
+    def _redact_sensitive(value: Any) -> Any:
+        if isinstance(value, dict):
+            redacted: dict[str, Any] = {}
+            for key, item in value.items():
+                key_name = str(key).lower()
+                if any(token in key_name for token in ("token", "secret", "password", "api_key", "key")):
+                    redacted[key] = "[redacted]"
+                else:
+                    redacted[key] = _MCPStatusHandler._redact_sensitive(item)
+            return redacted
+        if isinstance(value, list):
+            return [_MCPStatusHandler._redact_sensitive(item) for item in value]
+        return value
+
     def _write_json(self, status_code: int, payload: dict[str, Any]) -> None:
         body = json.dumps(payload, ensure_ascii=False, default=str).encode("utf-8")
         self.send_response(status_code)
@@ -936,7 +999,18 @@ class _MCPStatusHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:  # noqa: N802
         if self.path == "/health":
             monitor = get_global_health_monitor() or _LOCAL_HEALTH_MONITOR
-            self._write_json(200, monitor.get_health_summary())
+            raw_summary = monitor.get_health_summary()
+            safe_summary = _sanitize_health_for_external(raw_summary)
+            response = JSONResponse(safe_summary)
+            body = response.body
+            self.send_response(response.status_code)
+            for header_name, header_value in response.headers.items():
+                if header_name.lower() == "content-length":
+                    continue
+                self.send_header(header_name, header_value)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
             return
         if self.path == "/tools":
             self._write_json(200, {"tools": load_tool_schemas()})

@@ -27,6 +27,7 @@ from utils.lazy_loader import LazyLoader
 from utils.user_profile import UserProfile
 from utils.asr_corrections import ASRCorrectionEngine
 from utils.vocabulary_builder import VocabularyBuilder
+from tools.input_tools import can_automate
 import threading
 from core.brain.session_state import ContextStore, SessionContext
 from core.feedback import FeedbackStore
@@ -393,9 +394,16 @@ async def main():
         if safe_mode:
             logger.info("safe_mode_enabled", reason="DEXTER_SAFE_MODE=1")
 
-        health_monitor = HealthMonitor(service_name="Dexter")
+        _automation_available = can_automate()
+        if _automation_available:
+            logger.info("Automation subsystem: available")
+        else:
+            logger.warning("Automation subsystem: unavailable — input_tools and vision_tools will be disabled")
+
+        health_monitor = HealthMonitor(service_name="Dexter", automation_available=_automation_available)
         set_global_health_monitor(health_monitor)
         health_monitor.healthy("startup", "configuration loaded")
+        logger.info("automation_capability_checked", supported=can_automate())
 
         event_bus = EventBus()
         watchdog = HardwareWatchdog(runtime_config.hardware.watchdog, event_bus, _WATCHDOG_STOP_EVENT)

@@ -80,6 +80,10 @@ class TurnStageError(RuntimeError):
         self.cause = cause
 
 
+class WatchdogStopError(RuntimeError):
+    pass
+
+
 class TurnController:
     STAGE_TIMEOUTS = {
         "transcribe": 10.0,
@@ -110,6 +114,10 @@ class TurnController:
             "ts": time.time(),
             **fields,
         }
+        try:
+            self.pipeline.event_bus.emit(DexterEvents.TURN_STAGE, payload)
+        except Exception:
+            pass
 
     def _record_stage_timing(self, stage: str, duration_ms: float) -> None:
         if self.pipeline.health_monitor is None:
@@ -394,6 +402,24 @@ class TurnController:
                     pass
             self.pipeline._set_state(AssistantState.IDLE)
             await asyncio.sleep(1)
+        except WatchdogStopError as e:
+            # Hardware emergency — do the minimum possible. No TTS. No RAG. No LLM.
+            logger.critical(f"Turn aborted by hardware watchdog: {e}")
+            try:
+                self.pipeline.event_bus.emit(
+                    DexterEvents.TURN_STAGE,
+                    {
+                        "stage": "watchdog_abort",
+                        "status": "emergency_stop",
+                        "turn_id": ctx.cid if ctx else "unknown",
+                        "ts": time.time(),
+                    },
+                )
+            except Exception:
+                pass
+            # Reset turn context but do NOT call TTS, do NOT log to RAG, do NOT update session
+            self._current_turn_context = None
+            return
         finally:
             try:
                 duration_ms = (time.perf_counter() - turn_start) * 1000

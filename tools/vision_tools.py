@@ -58,6 +58,8 @@ class VisionCaptureRestoreError(VisionCaptureError):
 @dataclass
 class CaptureResult:
     image: Image.Image
+    foreground_window: str
+    capture_mode: str
     capture_ts: float
     was_verified: bool
 
@@ -171,13 +173,15 @@ def _get_local_vision_captioner():
         return None
 
 
-def _caption_screen_locally(capture: ScreenCaptureResult) -> str:
+def _caption_screen_locally(capture: CaptureResult | None) -> str:
     captioner = _get_local_vision_captioner()
     if captioner is None:
         return ""
 
     try:
-        image = Image.open(io.BytesIO(capture.image_bytes)).convert("RGB")
+        if capture is None or capture.image is None:
+            return ""
+        image = capture.image.convert("RGB")
         result = captioner(image)
         if isinstance(result, list) and result:
             first_item = result[0]
@@ -393,8 +397,16 @@ def _restore_window_z_order(snapshots: list[WindowSnapshot]) -> bool:
 
 def _restore_windows(snapshots: list[WindowSnapshot]) -> bool:
     ok = True
-    for snapshot in snapshots:
-        if not _restore_window_snapshot(snapshot):
+    # Restore in reverse order of the snapshot list (last modified => first restored)
+    for snapshot in reversed(snapshots or []):
+        try:
+            if not snapshot.hwnd or win32gui is None or not win32gui.IsWindow(snapshot.hwnd):
+                logger.debug("restore_skip_missing_window", hwnd=snapshot.hwnd)
+                continue
+            if not _restore_window_snapshot(snapshot):
+                ok = False
+        except Exception:
+            logger.debug("restore_window_exception", hwnd=getattr(snapshot, "hwnd", None), exc_info=True)
             ok = False
     if not _restore_window_z_order(snapshots):
         ok = False
@@ -487,18 +499,27 @@ class CaptureContext:
         self.restore_failed = False
 
     def __enter__(self):
+        # Acquire module-level capture lock to prevent concurrent captures
+        _capture_lock.acquire()
         self.started_at = time.monotonic()
         self.window_snapshots = _snapshot_windows()
         return self
 
     def __exit__(self, exc_type, exc, tb):
         try:
-            if not _restore_windows(self.window_snapshots):
+            try:
+                if not _restore_windows(self.window_snapshots):
+                    self.restore_failed = True
+                    logger.warning("capture_context_restore_failed", hidden_hwnd=getattr(self.hidden_window, "hwnd", None))
+            except Exception as restore_exc:
                 self.restore_failed = True
-                logger.warning("capture_context_restore_failed", hidden_hwnd=getattr(self.hidden_window, "hwnd", None))
-        except Exception as restore_exc:
-            self.restore_failed = True
-            logger.warning("capture_context_restore_failed", error=str(restore_exc), exc_info=True)
+                logger.warning("capture_context_restore_failed", error=str(restore_exc), exc_info=True)
+        finally:
+            try:
+                _capture_lock.release()
+            except Exception:
+                logger.debug("capture_lock_release_failed", exc_info=True)
+        # Do not suppress exceptions from the with-body
         return False
 
     def elapsed_ms(self) -> float:
@@ -606,12 +627,17 @@ def _resize_image(image: Image.Image, max_dimension: int) -> Image.Image:
     return image.resize(new_size, Image.LANCZOS)
 
 
-def capture_screen_for_vision(max_dimension: int = 1280) -> ScreenCaptureResult:
-    """Capture the user's actual viewport atomically and fail loudly on any verification problem."""
+def capture_screen_for_vision(max_dimension: int = 1280) -> Optional[CaptureResult]:
+    """Capture the user's actual viewport atomically.
+
+    Returns a CaptureResult on success or None on any failure. Never raises for expected capture failures.
+    """
     timeout_seconds = _capture_timeout_seconds()
-    with CaptureContext(capture_timeout=timeout_seconds) as capture_context:
-        status = "success"
-        try:
+    result = None
+    status = "success"
+    capture_context = None
+    try:
+        with CaptureContext(capture_timeout=timeout_seconds) as capture_context:
             capture_context.check_timeout()
             hidden_state = capture_context.hide_foreground_ide()
             capture_context.check_timeout()
@@ -628,8 +654,6 @@ def capture_screen_for_vision(max_dimension: int = 1280) -> ScreenCaptureResult:
             capture_mode = "full_screen"
             resized = _resize_image(image, max_dimension=max_dimension)
 
-            buffer = io.BytesIO()
-            resized.save(buffer, format="PNG")
             logger.info(
                 "screen_capture_prepared",
                 foreground_window=title or "",
@@ -640,33 +664,43 @@ def capture_screen_for_vision(max_dimension: int = 1280) -> ScreenCaptureResult:
                 capture_timeout_seconds=timeout_seconds,
             )
 
-            result = ScreenCaptureResult(
-                image_bytes=buffer.getvalue(),
+            result = CaptureResult(
+                image=resized,
                 foreground_window=title or "",
                 capture_mode=capture_mode,
+                capture_ts=time.time(),
+                was_verified=True,
             )
+    except VisionCaptureTimeoutError:
+        status = "timeout"
+        if capture_context is not None:
+            _emit_vision_capture_event(status, capture_context.elapsed_ms())
+        return None
+    except Exception:
+        status = "restore_failed"
+        if capture_context is not None:
+            _emit_vision_capture_event(status, capture_context.elapsed_ms())
+        return None
 
-            if capture_context.restore_failed:
-                status = "restore_failed"
-                raise VisionCaptureRestoreError("Capture state restore failed after screenshot generation")
+    # After leaving context, the restore has been attempted in __exit__.
+    if capture_context is not None and capture_context.restore_failed:
+        status = "restore_failed"
+        _emit_vision_capture_event(status, capture_context.elapsed_ms())
+        return None
 
-            _emit_vision_capture_event(status, capture_context.elapsed_ms())
-            return result
-        except VisionCaptureTimeoutError:
-            status = "timeout"
-            _emit_vision_capture_event(status, capture_context.elapsed_ms())
-            raise
-        except Exception:
-            status = "restore_failed"
-            _emit_vision_capture_event(status, capture_context.elapsed_ms())
-            raise
+    _emit_vision_capture_event(status, capture_context.elapsed_ms() if capture_context is not None else 0.0)
+    return result
 
 
 def capture_screen(max_dimension: int = 1280) -> str:
     """Captures the screen in memory and returns a base64-encoded PNG string."""
     try:
         result = capture_screen_for_vision(max_dimension=max_dimension)
-        encoded = base64.b64encode(result.image_bytes).decode("ascii")
+        if result is None:
+            return "I couldn't capture the screen cleanly"
+        buffer = io.BytesIO()
+        result.image.save(buffer, format="PNG")
+        encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
         return f"image/png;base64,{encoded}"
     except Exception as e:
         logger.error("screen_capture_base64_failed", error=str(e), exc_info=True)
@@ -677,14 +711,20 @@ async def describe_screen(user_question: str, gemini_client) -> str:
     """Capture the screen in memory and describe it with Gemini vision."""
     try:
         capture = capture_screen_for_vision()
-
+        if capture is None:
+            return "I couldn't capture the screen cleanly"
         from google.genai import types
+
+        # build payload from PIL image
+        buffer = io.BytesIO()
+        capture.image.save(buffer, format="PNG")
+        image_bytes = buffer.getvalue()
 
         response = await gemini_client.aio.models.generate_content(
             model="gemini-2.0-flash",
             contents=[
                 types.Content(parts=[
-                    types.Part.from_bytes(data=capture.image_bytes, mime_type="image/png"),
+                    types.Part.from_bytes(data=image_bytes, mime_type="image/png"),
                     types.Part(text=(
                         f"The user asked: {user_question}\n\n"
                         f"The foreground window title is: {capture.foreground_window}\n\n"
@@ -709,6 +749,8 @@ def describe_screen_without_vision() -> str:
     """Return a local fallback description when Gemini vision is unavailable."""
     try:
         capture = capture_screen_for_vision()
+        if capture is None:
+            return "I couldn't capture the screen cleanly"
         local_caption = _caption_screen_locally(capture)
         if local_caption:
             return (

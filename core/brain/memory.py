@@ -103,6 +103,7 @@ class DexterMemory:
         max_age_days: int | None = 30,
         retention_interval_seconds: int = 300,
         disable_rag_warming: bool = False,
+        event_bus=None,
     ):
         logger.info("Waking up Dexter's Long-Term Memory (ChromaDB)...")
         self._chroma_available = True
@@ -149,6 +150,7 @@ class DexterMemory:
                     "max_embedding_threads": cfg.rag.max_embedding_threads,
                 },
                 health_monitor=health_monitor,
+                event_bus=event_bus,
             )
             current_user = (getpass.getuser() or "default").lower()
             self.personal_rag = _LazyPersonalRAG(manager, current_user)

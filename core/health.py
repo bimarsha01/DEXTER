@@ -5,7 +5,7 @@ import time
 from dataclasses import asdict
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Optional
 
 from utils.config import HealthPolicy, get_config
 from utils.logger import get_logger
@@ -59,6 +59,7 @@ class HealthSummary:
     overall_status: str
     gpu: dict[str, Any]
     rag: dict[str, Any]
+    automation: dict[str, Any]
     checks: dict[str, dict[str, Any]]
     providers: dict[str, dict[str, Any]]
     policy: dict[str, Any]
@@ -67,7 +68,7 @@ class HealthSummary:
 
 
 class HealthMonitor:
-    def __init__(self, service_name: str = "Dexter") -> None:
+    def __init__(self, service_name: str = "Dexter", automation_available: bool = False) -> None:
         self.service_name = service_name
         self._lock = threading.RLock()
         self._evaluation_lock = threading.RLock()
@@ -77,6 +78,10 @@ class HealthMonitor:
         self._memory_vault: Any | None = None
         self._event_bus: Any | None = None
         self._rag_reindex_inflight = False
+        self._last_system_degraded_components: tuple[str, ...] | None = None
+        self._degraded_since: Optional[float] = None
+        self._degraded_episode_fired: bool = False
+        self._automation_available = bool(automation_available)
         self._checks: dict[str, HealthCheck] = {}
         self._turn_stage_timings_ms: dict[str, deque[float]] = {}
         self.gpu = GPUStatus()
@@ -329,6 +334,16 @@ class HealthMonitor:
         logger.info("health_action_system_degraded_emitted", reason=reason, components=components)
         self._record_corrective_action("system_degraded_emitted", reason, components=components)
 
+    def _maybe_emit_system_degraded(self, components: list[str], reason: str) -> None:
+        signature = tuple(sorted(set(components)))
+        if not signature:
+            self._last_system_degraded_components = None
+            return
+        if self._last_system_degraded_components == signature:
+            return
+        self._last_system_degraded_components = signature
+        self._emit_system_degraded(list(signature), reason)
+
     def evaluate(self) -> dict[str, Any]:
         with self._evaluation_lock:
             now = time.time()
@@ -387,11 +402,28 @@ class HealthMonitor:
                 if gpu_age_seconds > 30 * 60:
                     critical_components.append("gpu")
 
-            if critical_components:
-                reason = f"critical components stale beyond 30m: {', '.join(sorted(set(critical_components)))}"
-                logger.info("health_action_system_degraded_check", reason=reason)
-                self._emit_system_degraded(sorted(set(critical_components)), reason)
-                actions.append("system_degraded_emitted")
+            degraded_threshold_min = float(getattr(self._current_policy(), "degraded_threshold_min", 30.0) or 30.0)
+            is_degraded = bool(critical_components)
+
+            if is_degraded:
+                if self._degraded_since is None:
+                    self._degraded_since = time.monotonic()
+                elapsed_min = (time.monotonic() - self._degraded_since) / 60.0
+                if elapsed_min >= degraded_threshold_min and not self._degraded_episode_fired:
+                    degraded_components = sorted(set(critical_components))
+                    self._emit_system_degraded(
+                        degraded_components,
+                        f"system degraded for {elapsed_min:.1f} min",
+                    )
+                    logger.critical(f"System degraded for {elapsed_min:.1f} min — components: {degraded_components}")
+                    self._degraded_episode_fired = True
+                    actions.append("system_degraded_emitted")
+            else:
+                if self._degraded_episode_fired:
+                    logger.info("System health restored — degradation episode ended")
+                self._degraded_since = None
+                self._degraded_episode_fired = False
+                self._last_system_degraded_components = None
 
             summary = self.get_health_summary()
             summary["corrective_actions_last_run"] = actions
@@ -434,6 +466,9 @@ class HealthMonitor:
             "overall_status": overall_status,
             "gpu": gpu,
             "rag": rag,
+            "automation": {
+                "status": "ready" if self._automation_available else "unavailable",
+            },
             "checks": snapshot.get("checks", {}),
             "providers": enriched_providers,
             "policy": asdict(self._current_policy()),

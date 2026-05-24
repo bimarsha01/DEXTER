@@ -112,6 +112,72 @@ def _get_rag_index():
     return _RAG_MANAGER.get_index_for_user(user_id)
 
 
+def _looks_like_filename(text: str) -> bool:
+    """Returns True if the query appears to reference a specific file."""
+    return bool(re.search(r"\.(py|md|txt|pdf|json|yaml|yml|js|ts|html|csv|docx)\b", text or "", re.IGNORECASE))
+
+
+def _rag_threshold(name: str, fallback: float) -> float:
+    rag_cfg = getattr(get_config(), "rag", None)
+    if rag_cfg is None:
+        return float(fallback)
+
+    value = getattr(rag_cfg, name, None)
+    if value is None:
+        return float(fallback)
+
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return float(fallback)
+
+
+def get_document(query: str, context, file_path: str = None) -> dict:
+    """
+    Single entry point for all document questions.
+    Tries direct file lookup first, falls back to project lookup, then general.
+    context: SessionContext from session_state
+    """
+    # Used as an internal helper. The tool registry exposes the underlying functions directly.
+    direct_threshold = _rag_threshold("document_confidence_session_threshold", 0.6)
+    project_gate_threshold = _rag_threshold("project_confidence_threshold", 0.6)
+    project_accept_threshold = _rag_threshold("document_confidence_low_threshold", 0.5)
+
+    def _result_to_dict(result: DocumentResult, dispatch_path: str) -> dict[str, Any]:
+        payload = {
+            "answer": result.text,
+            "confidence": result.confidence,
+            "returned_path": result.returned_path,
+            "query": result.query,
+            "source_kind": result.source_kind,
+            "metadata": dict(result.metadata),
+            "dispatch_path": dispatch_path,
+        }
+        if result.user_note is not None:
+            payload["user_note"] = result.user_note
+        return payload
+
+    if file_path or _looks_like_filename(query):
+        result = answer_document_file_question(file_path or query, query)
+        if result and result.confidence >= direct_threshold:
+            logger.debug("document_dispatch", dispatch_path="direct", query=query, file_path=file_path)
+            return _result_to_dict(result, "direct")
+
+    if context and getattr(context, "project", None) and context.project.confidence >= project_gate_threshold:
+        result = answer_project_question(query, query, seed_path=getattr(context.project, "source_path", None))
+        if result and result.confidence >= project_accept_threshold:
+            logger.debug("document_dispatch", dispatch_path="project", query=query, file_path=file_path)
+            return _result_to_dict(result, "project")
+
+    result = answer_document_question(query, query)
+    if result:
+        logger.debug("document_dispatch", dispatch_path="general", query=query, file_path=file_path)
+        return _result_to_dict(result, "general")
+
+    logger.debug("document_dispatch", dispatch_path="none", query=query, file_path=file_path)
+    return {"answer": None, "confidence": 0.0, "dispatch_path": "none"}
+
+
 def _read_file_as_text(path: str) -> str:
     """Read any file as text with sensible fallbacks; returns up to 8000 chars."""
     file_path = Path(path).expanduser()

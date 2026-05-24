@@ -72,8 +72,8 @@ class DexterTranscriber:
                 self.initial_prompt = DEFAULT_INITIAL_PROMPT
         
         self._initial_prompt = getattr(self, 'initial_prompt', DEFAULT_INITIAL_PROMPT)
-            cfg = get_config()
-            self.model_size = (model_size or cfg.hardware.whisper_model or "tiny").strip()
+        cfg = get_config()
+        self.model_size = (model_size or cfg.hardware.whisper_model or "tiny").strip()
         self._model: WhisperModel | None = None
         self._model_lock = threading.Lock()
         logger.info(
@@ -83,6 +83,7 @@ class DexterTranscriber:
             best_of=self.best_of,
             temperature=self.temperature,
         )
+        self._ensure_model()
 
     def warm_up(self) -> None:
         """Preload the Whisper model so the first transcription doesn't time out."""
@@ -109,6 +110,24 @@ class DexterTranscriber:
                 logger.info("whisper_model_downloading", model=self.model_size)
                 self._model = WhisperModel(self.model_size, device=device, compute_type=compute_type)
                 logger.info(f"Whisper loaded: {self.model_size} on {device} ({compute_type})")
+                if device == "cuda":
+                    try:
+                        _dummy_audio = np.zeros(16000, dtype=np.float32)
+                        _segments, _info = self._model.transcribe(_dummy_audio, beam_size=1)
+                        list(_segments)
+                        logger.info("Whisper CUDA validation passed")
+                        del _dummy_audio, _segments, _info
+                    except Exception as e:
+                        logger.error(f"Whisper CUDA validation failed: {e} — falling back to CPU")
+                        self._model = WhisperModel(
+                            self.model_size,
+                            device="cpu",
+                            compute_type="float32"
+                        )
+                        hardware.device = "cpu"
+                        hardware.whisper_compute_type = "float32"
+                        hardware.embedding_device = "cpu"
+                        logger.warning("Whisper reloaded on CPU — DEXTER running in CPU mode for this session")
             except Exception as e:
                 logger.warning("transcriber_model_load_failed", device=device, compute_type=compute_type, error=str(e), exc_info=True)
                 fallback_device = "cpu"
@@ -116,6 +135,7 @@ class DexterTranscriber:
                 self._model = WhisperModel(self.model_size, device=fallback_device, compute_type=fallback_compute_type)
                 hardware.device = fallback_device
                 hardware.whisper_compute_type = fallback_compute_type
+                hardware.embedding_device = fallback_device
                 logger.info(f"Whisper loaded: {self.model_size} on {fallback_device} ({fallback_compute_type})")
 
         return self._model

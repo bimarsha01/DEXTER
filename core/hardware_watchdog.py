@@ -26,11 +26,19 @@ class HardwareWatchdog:
         self._gpu_temp_over_since: float | None = None
         self._thread: threading.Thread | None = None
         self._emergency_latched = False
+        self._poll_interval_warned = False
+        _configured_interval = float(getattr(self.config, "poll_interval_sec", 3.0) or 3.0)
+        if _configured_interval < 2.0:
+            logger.warning(
+                f"watchdog.poll_interval_sec={_configured_interval} is below the 2-second minimum — clamped to 2 seconds to prevent excessive CPU usage"
+            )
+            self._poll_interval_seconds = 2.0
+        else:
+            self._poll_interval_seconds = _configured_interval
         self._disk_root = self._resolve_disk_root()
 
     def _poll_interval(self) -> float:
-        poll = float(getattr(self.config, "poll_interval_sec", 3.0) or 3.0)
-        return max(2.0, poll)
+        return float(self._poll_interval_seconds)
 
     def _resolve_disk_root(self) -> str:
         configured = getattr(self.config, "data_root", None)
@@ -120,7 +128,8 @@ class HardwareWatchdog:
             if time.time() - self._cpu_temp_over_since >= critical_duration:
                 return "critical"
         else:
-            self._cpu_temp_over_since = None
+            if temp < warn_c:
+                self._cpu_temp_over_since = None
         if temp >= warn_c:
             logger.warning(f"CPU temp high: {temp:.0f}°C")
             return "warn"
@@ -139,7 +148,8 @@ class HardwareWatchdog:
             if time.time() - self._gpu_temp_over_since >= critical_duration:
                 return "critical"
         else:
-            self._gpu_temp_over_since = None
+            if temp < warn_c:
+                self._gpu_temp_over_since = None
         if temp >= warn_c:
             logger.warning(f"GPU temp high: {temp:.0f}°C")
             return "warn"

@@ -441,6 +441,14 @@ def _get_embedding_fn(model_name: str, device: str | None, event_bus: Any = None
                             model_name=model_name,
                             device="cpu",
                         )
+                        try:
+                            from core.config import runtime_config
+
+                            runtime_config.hardware.device = "cpu"
+                            runtime_config.hardware.embedding_device = "cpu"
+                            logger.error("CUDA OOM in RAG — config updated to CPU for remainder of session")
+                        except Exception:
+                            pass
                     except Exception as cpu_error:
                         _emit_hardware_emergency_stop(event_bus, f"embedding_model_init:{model_name}")
                         raise HardwareEmergencyStopError(f"embedding model init failed for {model_name}") from cpu_error
