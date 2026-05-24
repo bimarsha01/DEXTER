@@ -10,8 +10,10 @@
 ╚══════════════════════════════════════════════════════════════╝
 """
 import asyncio
+import atexit
 import getpass
 import os
+import signal
 import site
 import ctypes
 import time
@@ -19,6 +21,8 @@ from datetime import datetime
 from utils.logger import get_logger
 from utils.config import get_config, config_validation_warnings
 from core.health import GPUStatus, RAGStatus, HealthMonitor, set_global_health_monitor
+from core.event_bus import EventBus
+from core.hardware_watchdog import HardwareWatchdog
 from utils.lazy_loader import LazyLoader
 from utils.user_profile import UserProfile
 from utils.asr_corrections import ASRCorrectionEngine
@@ -28,6 +32,54 @@ from core.brain.session_state import ContextStore, SessionContext
 from core.feedback import FeedbackStore
 
 logger = get_logger("main")
+
+_WATCHDOG_STOP_EVENT = threading.Event()
+_ACTIVE_WATCHDOG: HardwareWatchdog | None = None
+_ACTIVE_PIPELINE = None
+_CLEANUP_DONE = False
+
+
+def _cleanup_runtime_sync() -> None:
+    global _ACTIVE_WATCHDOG, _ACTIVE_PIPELINE, _CLEANUP_DONE
+
+    if _CLEANUP_DONE:
+        return
+    _CLEANUP_DONE = True
+
+    watchdog = _ACTIVE_WATCHDOG
+    pipeline = _ACTIVE_PIPELINE
+
+    try:
+        if watchdog is not None:
+            watchdog.stop()
+    except Exception as exc:
+        logger.debug("watchdog_stop_failed", error=str(exc), exc_info=True)
+
+    try:
+        if pipeline is not None and hasattr(pipeline, "stop"):
+            pipeline.stop()
+    except Exception as exc:
+        logger.debug("pipeline_stop_failed", error=str(exc), exc_info=True)
+
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
+
+    logger.info("Clean shutdown complete")
+
+
+atexit.register(_cleanup_runtime_sync)
+
+
+def _handle_sigint(signum, frame):
+    _cleanup_runtime_sync()
+
+
+signal.signal(signal.SIGINT, _handle_sigint)
 
 # ─── Add Nvidia DLLs for faster-whisper CUDA support on Windows ──────────────
 def _setup_cuda_dlls():
@@ -321,6 +373,10 @@ async def main():
     logger.info("boot_title", title="DEXTER AI ASSISTANT — Booting Up")
     logger.info("boot_banner_bottom", char="=", repeat=60)
 
+    watchdog = None
+    pipeline = None
+    proactive_task = None
+
     # 1. Load Configuration & Profile (Fast)
     start_time = time.perf_counter()
     runtime_config = get_config()
@@ -340,6 +396,13 @@ async def main():
         health_monitor = HealthMonitor(service_name="Dexter")
         set_global_health_monitor(health_monitor)
         health_monitor.healthy("startup", "configuration loaded")
+
+        event_bus = EventBus()
+        watchdog = HardwareWatchdog(runtime_config.hardware.watchdog, event_bus, _WATCHDOG_STOP_EVENT)
+        watchdog.start()
+
+        global _ACTIVE_WATCHDOG
+        _ACTIVE_WATCHDOG = watchdog
 
         # 2. Kick off slow background initializations via LazyLoaders
         logger.info("initializing_stage", stage="background_loaders")
@@ -385,7 +448,7 @@ async def main():
         def _load_memory():
             from core.brain.memory import DexterMemory
 
-            return DexterMemory(disable_rag_warming=runtime_config.runtime.disable_rag_warming)
+            return DexterMemory(disable_rag_warming=runtime_config.runtime.disable_rag_warming, event_bus=event_bus)
 
         memory_loader = LazyLoader("Memory", _load_memory)
 
@@ -433,10 +496,8 @@ async def main():
 
         # Connect to LLM backends (Gemini → Groq → Ollama)
         from core.brain.llm_router import Brain
-        from core.event_bus import EventBus
         from tools import document_tools
 
-        event_bus = EventBus()
         document_tools.set_event_bus(event_bus)
         brain = Brain(event_bus=event_bus, asr_engine=asr_engine, session_context=session_context)
         health_monitor.healthy("brain", "llm router ready")
@@ -450,7 +511,6 @@ async def main():
         )
         logger.info("startup_primary_provider", provider=primary_provider)
 
-        health_monitor.attach_runtime_context(runtime_config, memory_vault, event_bus)
         health_monitor.evaluate()
         health_monitor.start_evaluation_loop(interval_seconds=300.0)
 
@@ -489,6 +549,8 @@ async def main():
             
         memory_vault = await asyncio.to_thread(memory_loader.get)
         health_monitor.healthy("memory", "long-term memory ready")
+
+        health_monitor.attach_runtime_context(runtime_config, memory_vault, event_bus)
 
         gpu_status = check_gpu_readiness(runtime_config, health_monitor)
         rag_status = check_rag_readiness(memory_vault, runtime_config, health_monitor)
@@ -541,7 +603,10 @@ async def main():
             context_store=context_store,
             session_context=session_context,
             feedback_store=feedback_store,
+            watchdog_stop_event=_WATCHDOG_STOP_EVENT,
         )
+        global _ACTIVE_PIPELINE
+        _ACTIVE_PIPELINE = pipeline
         proactive_task = None
         if proactive is not None:
             proactive_task = asyncio.create_task(proactive.run())
@@ -568,6 +633,7 @@ async def main():
         try:
             await pipeline.run()
         finally:
+            _cleanup_runtime_sync()
             mcp_task.cancel()
             try:
                 await tool_registry.shutdown_mcp()

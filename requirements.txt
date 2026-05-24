@@ -20,6 +20,8 @@ ollama
 chromadb
 sentence-transformers
 psutil
+nvidia-ml-py>=12.0
+wmi>=1.5.1
 
 # ─── Audio Pipeline ───
 sounddevice

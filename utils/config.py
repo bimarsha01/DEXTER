@@ -36,6 +36,26 @@ class HardwareConfig(BaseModel):
     whisper_compute_type: str = "auto"
     embedding_device: str = "auto"
     vram_gb: float = 0.0
+    watchdog: "HardwareWatchdogConfig" = Field(default_factory=lambda: HardwareWatchdogConfig())
+
+
+class HardwareWatchdogConfig(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    watchdog_enabled: bool = True
+    poll_interval_sec: float = 3.0
+    cpu_temp_warn_c: float = 85.0
+    cpu_temp_critical_c: float = 95.0
+    cpu_temp_critical_duration_sec: float = 30.0
+    gpu_temp_warn_c: float = 83.0
+    gpu_temp_critical_c: float = 92.0
+    gpu_temp_critical_duration_sec: float = 30.0
+    ram_warn_pct: float = 88.0
+    ram_critical_pct: float = 96.0
+    vram_warn_pct: float = 90.0
+    vram_critical_pct: float = 98.0
+    disk_free_warn_pct: float = 5.0
+    disk_free_critical_pct: float = 2.0
 
 
 class DefaultsConfig(BaseModel):
@@ -410,6 +430,7 @@ def _ensure_config_shape(config: dict) -> dict:
     config.setdefault("api_keys", {})
     config.setdefault("models", {})
     config.setdefault("hardware", {})
+    config["hardware"].setdefault("watchdog", {})
     config.setdefault("security", {})
     config.setdefault("providers", {})
     config.setdefault("audio_settings", {})

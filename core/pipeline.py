@@ -84,9 +84,10 @@ class TurnController:
         "speak": 45.0,
     }
 
-    def __init__(self, pipeline: "AsyncPipeline") -> None:
+    def __init__(self, pipeline: "AsyncPipeline", watchdog_stop_event: threading.Event | None = None) -> None:
         self.pipeline = pipeline
         self._current_turn_context: TurnContext | None = None
+        self._watchdog_stop_event = watchdog_stop_event
 
     def _effective_stage_timeout(self, stage: str) -> float:
         configured = float(getattr(self.pipeline.config.providers, "overall_turn_timeout_seconds", 0.0) or 0.0)
@@ -103,7 +104,6 @@ class TurnController:
             "ts": time.time(),
             **fields,
         }
-        self.pipeline.event_bus.emit(DexterEvents.TURN_STAGE, payload)
 
     def _record_stage_timing(self, stage: str, duration_ms: float) -> None:
         if self.pipeline.health_monitor is None:
@@ -224,6 +224,18 @@ class TurnController:
         turn_start = time.perf_counter()
         ctx = TurnContext(cid=cid, turn_start=turn_start)
 
+        def _watchdog_active() -> bool:
+            return bool(self._watchdog_stop_event is not None and self._watchdog_stop_event.is_set())
+
+        def _abort_for_watchdog() -> bool:
+            if not _watchdog_active():
+                return False
+            logger.critical("Watchdog stop active — DEXTER paused for hardware safety")
+            self.pipeline._set_state(AssistantState.IDLE)
+            ctx.stop_turn = True
+            ctx.stop_reason = "hardware_safety"
+            return True
+
         # Leak-guard: ensure previous turn context cleaned up
         try:
             if getattr(self, "_current_turn_context", None) is not None:
@@ -249,6 +261,8 @@ class TurnController:
         try:
             # mark active turn context for leak detection
             self._current_turn_context = ctx
+            if _abort_for_watchdog():
+                return
             self.pipeline._set_state(AssistantState.LISTENING)
             try:
                 logger.debug("response_interrupted_flag_at_turn_start", value=self.pipeline._response_interrupted)
@@ -257,21 +271,31 @@ class TurnController:
             ctx = await self._run_stage("transcribe", ctx, self._stage_transcribe, self._effective_stage_timeout("transcribe"))
             if ctx.stop_turn:
                 return
+            if _abort_for_watchdog():
+                return
 
             ctx = await self._run_stage("activate", ctx, self._stage_activate, self._effective_stage_timeout("activate"))
             if ctx.stop_turn:
+                return
+            if _abort_for_watchdog():
                 return
 
             ctx = await self._run_stage("retrieve_context", ctx, self._stage_retrieve_context, self._effective_stage_timeout("retrieve_context"))
             if ctx.stop_turn:
                 return
+            if _abort_for_watchdog():
+                return
 
             ctx = await self._run_stage("execute_tools", ctx, self._stage_execute_tools, self._effective_stage_timeout("execute_tools"))
             if ctx.stop_turn:
                 return
+            if _abort_for_watchdog():
+                return
 
             ctx = await self._run_stage("generate_response", ctx, self._stage_generate_response, self._effective_stage_timeout("generate_response"))
             if ctx.stop_turn:
+                return
+            if _abort_for_watchdog():
                 return
 
             ctx = await self._run_stage("speak", ctx, self._stage_speak, self._effective_stage_timeout("speak"))
@@ -824,6 +848,7 @@ class AsyncPipeline:
         context_store: ContextStore | None = None,
         session_context: SessionContext | None = None,
         feedback_store: FeedbackStore | None = None,
+        watchdog_stop_event: threading.Event | None = None,
     ) -> None:
         self.config = config
         self.transcriber = transcriber
@@ -837,6 +862,8 @@ class AsyncPipeline:
         self.context_store = context_store or ContextStore()
         self.session_context = session_context or SessionContext()
         self.feedback_store = feedback_store or FeedbackStore()
+        self._shutdown_requested = threading.Event()
+        self._watchdog_stop_event = watchdog_stop_event or threading.Event()
         self._last_transcript = ""
         self._retrieval_event_queue = self.event_bus.subscribe(maxsize=0) if hasattr(self.event_bus, "subscribe") else None
         self._latest_retrieval_event: dict | None = None
@@ -876,7 +903,7 @@ class AsyncPipeline:
         self._consecutive_activation_drops = 0
         self._always_on_until = 0.0
         self._diag_enabled = os.environ.get("DEXTER_DIAGNOSTIC", "0") == "1"
-        self.turn_controller = TurnController(self)
+        self.turn_controller = TurnController(self, watchdog_stop_event=self._watchdog_stop_event)
 
         act = config.activation
         smart_mode = (act.mode or "smart").strip().lower()
@@ -900,6 +927,9 @@ class AsyncPipeline:
                 ),
             )
         )
+
+    def stop(self) -> None:
+        self._shutdown_requested.set()
 
     def _current_user_preferences(self) -> UserPreferences:
         prefs = self.session_context.user_preferences
@@ -1910,8 +1940,17 @@ class AsyncPipeline:
             self._open_wake_window()
             logger.info("activation_window_started", seconds=60)
         watchdog = asyncio.create_task(self._watchdog())
+        watchdog_hold_logged = False
         try:
-            while True:
+            while not self._shutdown_requested.is_set():
+                if self._watchdog_stop_event.is_set():
+                    self._set_state(AssistantState.IDLE)
+                    if not watchdog_hold_logged:
+                        logger.critical("Watchdog stop active — DEXTER paused for hardware safety")
+                        watchdog_hold_logged = True
+                    await asyncio.sleep(10)
+                    continue
+                watchdog_hold_logged = False
                 try:
                     await self._handle_once()
                 except Exception as e:

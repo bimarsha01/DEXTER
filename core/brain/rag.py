@@ -376,6 +376,39 @@ _EMBEDDING_FN_CACHE: Dict[tuple[str, str], SentenceTransformerEmbeddingFunction]
 _EMBEDDING_FN_LOCK = threading.Lock()
 
 
+class HardwareEmergencyStopError(RuntimeError):
+    pass
+
+
+def _empty_cuda_cache() -> None:
+    try:
+        import torch
+
+        torch.cuda.empty_cache()
+    except Exception:
+        pass
+
+
+def _is_cuda_oom_exception(error: Exception) -> bool:
+    try:
+        import torch
+
+        if isinstance(error, torch.cuda.OutOfMemoryError):
+            return True
+    except Exception:
+        pass
+    return "out of memory" in str(error).lower()
+
+
+def _emit_hardware_emergency_stop(event_bus: Any, reason: str) -> None:
+    if event_bus is None:
+        return
+    try:
+        event_bus.emit("hardware_emergency_stop", {"reason": reason, "ts": time.time()})
+    except Exception:
+        logger.debug("hardware_emergency_stop_emit_failed", reason=reason, exc_info=True)
+
+
 def _resolve_embedding_device(device: str | None) -> str:
     requested = (device or "").strip()
     if not requested or requested.lower() in {"auto", "default"}:
@@ -386,7 +419,7 @@ def _resolve_embedding_device(device: str | None) -> str:
     return requested
 
 
-def _get_embedding_fn(model_name: str, device: str | None) -> SentenceTransformerEmbeddingFunction:
+def _get_embedding_fn(model_name: str, device: str | None, event_bus: Any = None) -> SentenceTransformerEmbeddingFunction:
     resolved_device = _resolve_embedding_device(device)
     cache_key = (model_name, resolved_device)
     with _EMBEDDING_FN_LOCK:
@@ -399,7 +432,19 @@ def _get_embedding_fn(model_name: str, device: str | None) -> SentenceTransforme
                     device=resolved_device,
                 )
             except Exception as e:
-                if resolved_device != "cpu":
+                if resolved_device != "cpu" and _is_cuda_oom_exception(e):
+                    _empty_cuda_cache()
+                    logger.error("CUDA OOM — cache cleared, retrying on CPU")
+                    try:
+                        cache_key = (model_name, "cpu")
+                        _EMBEDDING_FN_CACHE[cache_key] = SentenceTransformerEmbeddingFunction(
+                            model_name=model_name,
+                            device="cpu",
+                        )
+                    except Exception as cpu_error:
+                        _emit_hardware_emergency_stop(event_bus, f"embedding_model_init:{model_name}")
+                        raise HardwareEmergencyStopError(f"embedding model init failed for {model_name}") from cpu_error
+                elif resolved_device != "cpu":
                     logger.warning(
                         "embedding_device_fallback",
                         model=model_name,
@@ -441,6 +486,7 @@ class PersonalRAGIndex:
         batch_size: int = 256,
         max_embedding_threads: int = 4,
         health_monitor: Any = None,
+        event_bus: Any = None,
     ) -> None:
         self.user_id = (user_id or "default").lower()
         self.persist_directory = os.path.abspath(persist_directory)
@@ -456,6 +502,7 @@ class PersonalRAGIndex:
         self._batch_size = max(10, int(batch_size))
         self._max_embedding_threads = max(0, int(max_embedding_threads))
         self._health_monitor = health_monitor
+        self._event_bus = event_bus
 
         # Per-user isolated chroma path
         user_path = os.path.join(self.persist_directory, f"rag_{self.user_id}")
@@ -477,7 +524,7 @@ class PersonalRAGIndex:
         )
         # Preload embedding function (cached) for manual encoding
         if self._embedding_profile.provider != "chromadb-default":
-            self._ef = _get_embedding_fn(self._embedding_profile.model_name, self._embedding_device)
+            self._ef = _get_embedding_fn(self._embedding_profile.model_name, self._embedding_device, event_bus=self._event_bus)
         else:
             self._ef = None
 
@@ -533,6 +580,24 @@ class PersonalRAGIndex:
         self._query_cache: dict[str, tuple[list[dict], float]] = {}
         self._QUERY_CACHE_MAX_SIZE = 50
         self._QUERY_CACHE_TTL_SECONDS = 300.0
+
+    def _emit_hardware_emergency_stop(self, reason: str) -> None:
+        logger.critical("hardware_emergency_stop_request", reason=reason, user=self.user_id)
+        _emit_hardware_emergency_stop(self._event_bus, reason)
+
+    def _retry_cpu_after_cuda_oom(self, reason: str, gpu_operation, cpu_operation):
+        try:
+            return gpu_operation()
+        except Exception as error:
+            if not _is_cuda_oom_exception(error):
+                raise
+            _empty_cuda_cache()
+            logger.error("CUDA OOM — cache cleared, retrying on CPU")
+            try:
+                return cpu_operation()
+            except Exception as cpu_error:
+                self._emit_hardware_emergency_stop(reason)
+                raise HardwareEmergencyStopError(reason) from cpu_error
 
         logger.info(
             "personal_rag_initialized",
@@ -1008,12 +1073,30 @@ class PersonalRAGIndex:
                 torch.set_num_threads(max(1, self._background_embedding_threads))
             except ImportError:
                 pass
-            with self._embed_lock:
-                t0 = time.perf_counter()
-                embeddings = list(self._ef(documents))
-                t1 = time.perf_counter()
-                embed_time = int((t1 - t0) * 1000)
+
+            def _gpu_embed():
+                with self._embed_lock:
+                    t0 = time.perf_counter()
+                    result = list(self._ef(documents))
+                    t1 = time.perf_counter()
+                return result, int((t1 - t0) * 1000)
+
+            def _cpu_embed():
+                cpu_ef = _get_embedding_fn(self._embedding_profile.model_name, "cpu", event_bus=self._event_bus)
+                with self._embed_lock:
+                    t0 = time.perf_counter()
+                    result = list(cpu_ef(documents))
+                    t1 = time.perf_counter()
+                return result, int((t1 - t0) * 1000)
+
+            embeddings, embed_time = self._retry_cpu_after_cuda_oom(
+                reason=f"rag_batch_embedding:{batch_idx}",
+                gpu_operation=_gpu_embed,
+                cpu_operation=_cpu_embed,
+            )
             time.sleep(self._background_batch_sleep_seconds)
+        except HardwareEmergencyStopError:
+            raise
         except Exception as e:
             logger.warning("rag_batch_embedding_failed", batch=batch_idx, error=str(e), exc_info=True)
         return batch_idx, embeddings, embed_time
@@ -1105,7 +1188,7 @@ class PersonalRAGIndex:
             del self._query_cache[oldest]
         self._query_cache[self._cache_key(query)] = (results, time.time())
 
-    def _get_reranker(self):
+    def _get_reranker(self, device: str | None = None):
         if not self._reranker_enabled:
             return None
         if not self._reranker_ready:
@@ -1124,11 +1207,26 @@ class PersonalRAGIndex:
             try:
                 from sentence_transformers import CrossEncoder
 
-                self._reranker = CrossEncoder(self._reranker_model, max_length=512)
-                logger.info("rag_reranker_loaded", model=self._reranker_model)
+                resolved_device = (device or getattr(get_config().hardware, "device", "auto") or "auto").strip().lower()
+                if resolved_device in {"", "auto", "default"}:
+                    resolved_device = str(getattr(get_config().hardware, "device", "cpu") or "cpu").strip().lower()
+                self._reranker = CrossEncoder(self._reranker_model, max_length=512, device=resolved_device)
+                logger.info("rag_reranker_loaded", model=self._reranker_model, device=resolved_device)
             except Exception as e:
-                logger.warning("rag_reranker_load_failed", error=str(e))
-                self._reranker_enabled = False
+                if _is_cuda_oom_exception(e) and (device or "").strip().lower() != "cpu":
+                    _empty_cuda_cache()
+                    logger.error("CUDA OOM — cache cleared, retrying on CPU")
+                    try:
+                        from sentence_transformers import CrossEncoder
+
+                        self._reranker = CrossEncoder(self._reranker_model, max_length=512, device="cpu")
+                        logger.info("rag_reranker_loaded", model=self._reranker_model, device="cpu")
+                    except Exception as cpu_error:
+                        self._emit_hardware_emergency_stop(f"reranker_init:{self._reranker_model}")
+                        raise HardwareEmergencyStopError(f"reranker init failed for {self._reranker_model}") from cpu_error
+                else:
+                    logger.warning("rag_reranker_load_failed", error=str(e))
+                    self._reranker_enabled = False
         return self._reranker
 
     def _hits_from_payload(self, payload: list[dict]) -> list[RagSearchHit]:
@@ -1195,7 +1293,11 @@ class PersonalRAGIndex:
 
         try:
             pairs = [(query, h.content[:400]) for h in hits]
-            scores = reranker.predict(pairs)
+            scores = self._retry_cpu_after_cuda_oom(
+                reason=f"rag_rerank:{query[:80]}",
+                gpu_operation=lambda: reranker.predict(pairs),
+                cpu_operation=lambda: self._get_reranker("cpu").predict(pairs),
+            )
             for hit, score in zip(hits, scores):
                 hit.rerank_score = float(score)
 
@@ -1209,6 +1311,8 @@ class PersonalRAGIndex:
                 after_top3=after_top3,
             )
             return reranked[:top_n]
+        except HardwareEmergencyStopError:
+            raise
         except Exception as e:
             logger.warning("rag_rerank_failed", error=str(e))
             return hits[:top_n]
@@ -1311,16 +1415,31 @@ class PersonalRAGIndex:
             query_embeddings = None
             if self._ef is not None:
                 try:
-                    with self._embed_lock:
-                        t0 = time.perf_counter()
-                        query_embeddings = list(self._ef([query]))
-                        t1 = time.perf_counter()
-                    logger.debug(
-                        "rag_query_embedded",
-                        user=self.user_id,
-                        embed_ms=int((t1 - t0) * 1000),
-                        indexing_active=self._indexing_active,
+                    def _gpu_query_embeddings():
+                        with self._embed_lock:
+                            t0 = time.perf_counter()
+                            result = list(self._ef([query]))
+                            t1 = time.perf_counter()
+                        logger.debug(
+                            "rag_query_embedded",
+                            user=self.user_id,
+                            embed_ms=int((t1 - t0) * 1000),
+                            indexing_active=self._indexing_active,
+                        )
+                        return result
+
+                    def _cpu_query_embeddings():
+                        cpu_ef = _get_embedding_fn(self._embedding_profile.model_name, "cpu", event_bus=self._event_bus)
+                        with self._embed_lock:
+                            return list(cpu_ef([query]))
+
+                    query_embeddings = self._retry_cpu_after_cuda_oom(
+                        reason=f"rag_query_embedding:{query[:80]}",
+                        gpu_operation=_gpu_query_embeddings,
+                        cpu_operation=_cpu_query_embeddings,
                     )
+                except HardwareEmergencyStopError:
+                    raise
                 except Exception:
                     query_embeddings = None
 
