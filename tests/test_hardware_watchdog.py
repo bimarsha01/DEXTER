@@ -25,8 +25,22 @@ def make_watchdog(config=None, event_bus=None):
     return HardwareWatchdog(cfg, event_bus, stop_event), stop_event
 
 
-def test_normal_readings_no_stop(monkeypatch):
+@pytest.fixture
+def watchdog(request):
     wd, stop_event = make_watchdog()
+
+    def _cleanup() -> None:
+        try:
+            wd.stop()
+        finally:
+            wd.join(timeout=3.0)
+
+    request.addfinalizer(_cleanup)
+    return wd, stop_event
+
+
+def test_normal_readings_no_stop(monkeypatch, watchdog):
+    wd, stop_event = watchdog
     # Mock sensor readers to safe values
     wd._read_cpu_temp_c = lambda: 45.0
     wd._read_gpu_temp_c = lambda: 40.0
@@ -40,8 +54,8 @@ def test_normal_readings_no_stop(monkeypatch):
         assert not stop_event.is_set()
 
 
-def test_cpu_warn_logs_but_no_stop(caplog, monkeypatch):
-    wd, stop_event = make_watchdog()
+def test_cpu_warn_logs_but_no_stop(caplog, monkeypatch, watchdog):
+    wd, stop_event = watchdog
     wd._read_cpu_temp_c = lambda: 87.0
     wd._read_gpu_temp_c = lambda: None
     wd._read_vram_info = lambda: None
@@ -57,8 +71,8 @@ def test_cpu_warn_logs_but_no_stop(caplog, monkeypatch):
     assert any("CPU temp high" in str(args[0]) for args, _ in getattr(hwmod.logger.warning, 'call_args_list', []))
 
 
-def test_cpu_critical_sustained_triggers_stop(monkeypatch):
-    wd, stop_event = make_watchdog()
+def test_cpu_critical_sustained_triggers_stop(monkeypatch, watchdog):
+    wd, stop_event = watchdog
     # Force CPU temp to critical level
     wd._read_cpu_temp_c = lambda: 97.0
     wd._read_gpu_temp_c = lambda: None
@@ -99,8 +113,8 @@ def test_cpu_critical_sustained_triggers_stop(monkeypatch):
     assert stop_event.is_set()
 
 
-def test_gpu_critical_sustained_triggers_stop(monkeypatch):
-    wd, stop_event = make_watchdog()
+def test_gpu_critical_sustained_triggers_stop(monkeypatch, watchdog):
+    wd, stop_event = watchdog
     wd._read_cpu_temp_c = lambda: None
     wd._read_gpu_temp_c = lambda: 94.0
     wd._read_vram_info = lambda: None
@@ -121,8 +135,8 @@ def test_gpu_critical_sustained_triggers_stop(monkeypatch):
     assert stop_event.is_set()
 
 
-def test_ram_critical_immediate_sets_stop(monkeypatch):
-    wd, stop_event = make_watchdog()
+def test_ram_critical_immediate_sets_stop(monkeypatch, watchdog):
+    wd, stop_event = watchdog
     wd._read_cpu_temp_c = lambda: None
     wd._read_gpu_temp_c = lambda: None
     wd._read_vram_info = lambda: None
@@ -169,8 +183,8 @@ def test_vram_oom_recovery_cpu_retry_no_emergency(monkeypatch):
     assert not eb.emit.called
 
 
-def test_sensors_unavailable_graceful(monkeypatch):
-    wd, stop_event = make_watchdog()
+def test_sensors_unavailable_graceful(monkeypatch, watchdog):
+    wd, stop_event = watchdog
     # sensors_temperatures raises
     monkeypatch.setattr(psutil, "sensors_temperatures", lambda fahrenheit=False: (_ for _ in ()).throw(Exception("no sensor")), raising=False)
     res = wd._check_cpu_temp()
@@ -178,8 +192,8 @@ def test_sensors_unavailable_graceful(monkeypatch):
     assert not stop_event.is_set()
 
 
-def test_resume_after_stop(caplog, monkeypatch):
-    wd, stop_event = make_watchdog()
+def test_resume_after_stop(caplog, monkeypatch, watchdog):
+    wd, stop_event = watchdog
     # Trigger stop via RAM
     wd._read_cpu_temp_c = lambda: None
     wd._read_gpu_temp_c = lambda: None
@@ -207,8 +221,8 @@ def test_resume_after_stop(caplog, monkeypatch):
     assert any("resuming" in r.getMessage().lower() for r in caplog.records)
 
 
-def test_watchdog_self_stop_exits_loop_quickly(monkeypatch):
-    wd, stop_event = make_watchdog()
+def test_watchdog_self_stop_exits_loop_quickly(monkeypatch, watchdog):
+    wd, stop_event = watchdog
     # make poll interval small by patching method (avoid min clamp in implementation)
     monkeypatch.setattr(wd, "_poll_interval", lambda: 0.05)
     wd._check_all = lambda: "ok"
