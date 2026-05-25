@@ -213,12 +213,18 @@ def test_resume_after_stop(caplog, monkeypatch, watchdog):
     stop_event.set()
     # Advance time beyond 60s
     current["t"] += 61.0
-    # Patch shutdown wait to no-op to avoid delays
-    wd._shutdown_event.wait = lambda timeout=None: None
-    caplog.clear()
+    # Patch shutdown wait to advance simulated time so the loop can complete
+    def _advance_time(timeout=None):
+        current["t"] += 61.0
+        return None
+
+    wd._shutdown_event.wait = _advance_time
     wd._wait_for_safe_resume()
     assert not stop_event.is_set()
-    assert any("resuming" in r.getMessage().lower() for r in caplog.records)
+    assert any(
+        "resuming" in str(args[0]).lower()
+        for args, _ in getattr(hwmod.logger.info, "call_args_list", [])
+    )
 
 
 def test_watchdog_self_stop_exits_loop_quickly(monkeypatch, watchdog):
