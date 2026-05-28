@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import threading
 import time
-from dataclasses import asdict
+from dataclasses import asdict, is_dataclass
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, Optional
@@ -201,6 +201,25 @@ class HealthMonitor:
             except Exception:
                 pass
             return self.health_policy
+
+    def _serialize_policy(self) -> dict[str, Any]:
+        policy = self._current_policy()
+        if is_dataclass(policy):
+            return asdict(policy)
+        if hasattr(policy, "model_dump"):
+            try:
+                return policy.model_dump()
+            except Exception:
+                pass
+        if hasattr(policy, "dict"):
+            try:
+                return policy.dict()
+            except Exception:
+                pass
+        try:
+            return dict(policy)
+        except Exception:
+            return {}
 
     def _record_corrective_action(self, action: str, reason: str, **fields: Any) -> None:
         entry = {"action": action, "reason": reason, "ts": time.time(), **fields}
@@ -471,7 +490,7 @@ class HealthMonitor:
             },
             "checks": snapshot.get("checks", {}),
             "providers": enriched_providers,
-            "policy": asdict(self._current_policy()),
+            "policy": self._serialize_policy(),
             "corrective_actions": list(self._corrective_actions),
             "turn_stage_averages_ms": snapshot.get("turn_stage_averages_ms", {}),
             "updated_at": snapshot.get("updated_at", time.time()),

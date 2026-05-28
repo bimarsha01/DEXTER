@@ -86,6 +86,19 @@ class MCPClient:
 
             await asyncio.sleep(1.0)
 
+            stderr_lines: list[str] = []
+            if self._process.stderr:
+                for _ in range(5):
+                    try:
+                        line = await asyncio.wait_for(self._process.stderr.readline(), timeout=0.05)
+                    except asyncio.TimeoutError:
+                        break
+                    if not line:
+                        break
+                    stderr_lines.append(line.decode("utf-8", errors="ignore").strip())
+            if stderr_lines:
+                logger.warning("mcp_server_startup_stderr", lines=stderr_lines)
+
             if self._process.returncode is not None:
                 stderr = b""
                 if self._process.stderr:

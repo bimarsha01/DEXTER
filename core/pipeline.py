@@ -102,8 +102,25 @@ class TurnController:
     def _effective_stage_timeout(self, stage: str) -> float:
         configured = float(getattr(self.pipeline.config.providers, "overall_turn_timeout_seconds", 0.0) or 0.0)
         base = float(self.STAGE_TIMEOUTS.get(stage, 30.0))
+        if stage == "transcribe":
+            try:
+                model_name = str(
+                    getattr(self.pipeline.config.stt, "model", "")
+                    or getattr(self.pipeline.config.hardware, "whisper_model", "")
+                ).lower()
+                device = str(getattr(self.pipeline.config.hardware, "device", "") or "").lower()
+                if "large" in model_name:
+                    base = max(base, 30.0)
+                elif "medium" in model_name:
+                    base = max(base, 20.0)
+                if device == "cpu":
+                    base = max(base, 15.0)
+            except Exception:
+                pass
         if configured > 0:
-            return min(base, configured)
+            if stage in {"transcribe", "activate", "retrieve_context"}:
+                return min(base, configured)
+            return base
         return base
 
     def _emit_stage_event(self, stage: str, status: str, ctx: TurnContext, **fields) -> None:
@@ -492,15 +509,12 @@ class TurnController:
                     pipeline.event_bus.emit("transcript_partial", payload)
 
             try:
-                identified_text = await asyncio.wait_for(
-                    asyncio.to_thread(pipeline.transcriber.transcribe, audio_path, on_partial=_on_partial),
-                    timeout=self.STAGE_TIMEOUTS["transcribe"],
+                identified_text = await asyncio.to_thread(
+                    pipeline.transcriber.transcribe,
+                    audio_path,
+                    on_partial=_on_partial,
                 )
                 metrics.record_latency("stt_ms", (time.perf_counter() - stt_start) * 1000)
-            except asyncio.TimeoutError as e:
-                logger.warning("transcription_timeout", cid=ctx.cid)
-                pipeline.event_bus.emit("error_occurred", {"component": "stt", "error": "transcription_timeout"})
-                raise TurnStageError("transcribe", "transcription timed out", cause=e) from e
             except Exception as e:
                 logger.error("transcription_failed", error=str(e), exc_info=True)
                 pipeline.event_bus.emit("error_occurred", {"component": "stt", "error": str(e)})

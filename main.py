@@ -17,6 +17,7 @@ import signal
 import site
 import ctypes
 import time
+from contextlib import suppress
 from datetime import datetime
 from utils.logger import get_logger
 from utils.config import get_config, config_validation_warnings
@@ -37,11 +38,12 @@ logger = get_logger("main")
 _WATCHDOG_STOP_EVENT = threading.Event()
 _ACTIVE_WATCHDOG: HardwareWatchdog | None = None
 _ACTIVE_PIPELINE = None
+_ACTIVE_DASHBOARD = None
 _CLEANUP_DONE = False
 
 
 def _cleanup_runtime_sync() -> None:
-    global _ACTIVE_WATCHDOG, _ACTIVE_PIPELINE, _CLEANUP_DONE
+    global _ACTIVE_WATCHDOG, _ACTIVE_PIPELINE, _ACTIVE_DASHBOARD, _CLEANUP_DONE
 
     if _CLEANUP_DONE:
         return
@@ -61,6 +63,13 @@ def _cleanup_runtime_sync() -> None:
             pipeline.stop()
     except Exception as exc:
         logger.debug("pipeline_stop_failed", error=str(exc), exc_info=True)
+
+    try:
+        dashboard = _ACTIVE_DASHBOARD
+        if dashboard is not None and hasattr(dashboard, "stop"):
+            dashboard.stop()
+    except Exception as exc:
+        logger.debug("dashboard_stop_failed", error=str(exc), exc_info=True)
 
     try:
         import torch
@@ -275,9 +284,11 @@ def check_gpu_readiness(runtime_config, health_monitor: HealthMonitor | None = N
         else:
             status.status = "unavailable"
             status.details = "CUDA unavailable"
-            logger.warning("gpu_unavailable", expected_cuda=expected_cuda)
             if expected_cuda:
+                logger.warning("gpu_unavailable", expected_cuda=expected_cuda)
                 logger.error("cuda_expected_but_unavailable", expected_cuda=expected_cuda)
+            else:
+                logger.info("gpu_unavailable", expected_cuda=expected_cuda)
     except Exception as exc:
         status.status = "unavailable"
         status.details = str(exc)
@@ -377,6 +388,7 @@ async def main():
     watchdog = None
     pipeline = None
     proactive_task = None
+    dashboard_task = None
 
     # 1. Load Configuration & Profile (Fast)
     start_time = time.perf_counter()
@@ -597,6 +609,7 @@ async def main():
         )
 
         from core.pipeline import AsyncPipeline
+        from server.ws_bridge import DashboardServer
 
         pipeline = AsyncPipeline(
             config=runtime_config,
@@ -615,6 +628,21 @@ async def main():
         )
         global _ACTIVE_PIPELINE
         _ACTIVE_PIPELINE = pipeline
+
+        dashboard = DashboardServer(
+            event_bus=event_bus,
+            health_monitor=health_monitor,
+            websocket_port=int(getattr(runtime_config.server, "websocket_port", 8765)),
+            static_dir=os.path.join(os.path.dirname(__file__), getattr(runtime_config.server, "static_dir", "static/")),
+            current_project_getter=lambda: pipeline.session_context.project,
+            current_provider_getter=lambda: getattr(brain, "last_provider", None),
+            current_state_getter=lambda: pipeline.state.name,
+        )
+        global _ACTIVE_DASHBOARD
+        _ACTIVE_DASHBOARD = dashboard
+        logger.info(f"Dashboard available at {dashboard.url}")
+        dashboard_task = asyncio.create_task(dashboard.serve(), name="dexter-dashboard-server")
+
         proactive_task = None
         if proactive is not None:
             proactive_task = asyncio.create_task(proactive.run())
@@ -643,6 +671,10 @@ async def main():
         finally:
             _cleanup_runtime_sync()
             mcp_task.cancel()
+            if dashboard_task is not None:
+                dashboard_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await dashboard_task
             try:
                 await tool_registry.shutdown_mcp()
             except Exception as e:

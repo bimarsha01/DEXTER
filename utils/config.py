@@ -335,6 +335,13 @@ class VisionConfig(BaseModel):
     capture_timeout: float = 5.0
 
 
+class ServerConfig(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    websocket_port: int = Field(default=8765, ge=1, le=65535)
+    static_dir: str = "static/"
+
+
 # Automation settings for input tooling (keyboard/mouse automation)
 class AutomationConfig(BaseModel):
     model_config = ConfigDict(extra="ignore")
@@ -386,6 +393,7 @@ class DexterConfig(BaseModel):
     runtime: RuntimeConfig = Field(default_factory=RuntimeConfig)
     privacy: PrivacyConfig = Field(default_factory=PrivacyConfig)
     vision: VisionConfig = Field(default_factory=VisionConfig)
+    server: ServerConfig = Field(default_factory=ServerConfig)
     health_policy: HealthPolicy = Field(default_factory=HealthPolicy)
     automation: AutomationConfig = Field(default_factory=AutomationConfig)
     spotify: SpotifyConfig = Field(default_factory=SpotifyConfig)
@@ -444,6 +452,7 @@ def _ensure_config_shape(config: dict) -> dict:
     config.setdefault("runtime", {})
     config.setdefault("privacy", {})
     config.setdefault("vision", {})
+    config.setdefault("server", {})
     config.setdefault("health_policy", {})
     config.setdefault("automation", {})
     config.setdefault("media", {})

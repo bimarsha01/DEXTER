@@ -785,38 +785,11 @@ Never use mcp_write_file to overwrite important system files. Always confirm wit
                     except Exception:
                         pass
                     try:
-                        from core.config import runtime_config
-
-                        runtime_config.hardware.device = "cpu"
-                        runtime_config.hardware.embedding_device = "cpu"
-                    except Exception:
-                        try:
-                            cfg = get_config()
-                            cfg.hardware.device = "cpu"
-                            cfg.hardware.embedding_device = "cpu"
-                        except Exception:
-                            pass
-                    self._record_provider_failure(provider, e, False, current_status="cuda_oom")
-                    self._emit_provider_fallback(provider, "cuda_oom", fallback_to)
-                    raise QuotaExhaustedError(f"CUDA OOM — provider {provider} disabled for this session") from e
-                if _TORCH_AVAILABLE and isinstance(e, torch.cuda.OutOfMemoryError):
-                    logger.error("CUDA OOM in LLM call — clearing cache and falling back to CPU config")
-                    try:
-                        torch.cuda.empty_cache()
+                        cfg = get_config()
+                        cfg.hardware.device = "cpu"
+                        cfg.hardware.embedding_device = "cpu"
                     except Exception:
                         pass
-                    try:
-                        from core.config import runtime_config
-
-                        runtime_config.hardware.device = "cpu"
-                        runtime_config.hardware.embedding_device = "cpu"
-                    except Exception:
-                        try:
-                            cfg = get_config()
-                            cfg.hardware.device = "cpu"
-                            cfg.hardware.embedding_device = "cpu"
-                        except Exception:
-                            pass
                     self._record_provider_failure(provider, e, False, current_status="cuda_oom")
                     self._emit_provider_fallback(provider, "cuda_oom", fallback_to)
                     raise QuotaExhaustedError(f"CUDA OOM — provider {provider} disabled for this session") from e

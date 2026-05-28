@@ -17,7 +17,7 @@ groq
 ollama
 
 # ─── Memory ───
-chromadb
+chromadb>=0.4.24
 sentence-transformers
 psutil
 nvidia-ml-py>=12.0
@@ -43,6 +43,8 @@ comtypes
 
 # ─── Tool Safety ───
 jsonschema
+fastapi
+uvicorn
 
 # ─── Fuzzy Matching ───
 rapidfuzz

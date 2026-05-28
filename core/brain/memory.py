@@ -106,19 +106,32 @@ class DexterMemory:
         event_bus=None,
     ):
         logger.info("Waking up Dexter's Long-Term Memory (ChromaDB)...")
-        self._chroma_available = True
+        import os
+
+        persist_directory = os.path.abspath(os.path.expandvars(os.path.expanduser(str(persist_directory))))
+        self._chroma_available = False
+        self._chroma_persistent = False
         self.client = None
         self.collection = None
         try:
             self.client = chromadb.PersistentClient(path=persist_directory)
             self.collection = self.client.get_or_create_collection(name="dexter_memory")
+            self._chroma_available = True
+            self._chroma_persistent = True
         except Exception as e:
-            # If Chroma cannot start (permissions/corrupt DB), the assistant must still boot.
-            if hasattr(logger, "critical"):
-                logger.critical("chroma_startup_failed", error=str(e), exc_info=True)
-            else:
-                logger.error("chroma_startup_failed", error=str(e), exc_info=True)
-            self._chroma_available = False
+            # If Chroma cannot start (permissions/corrupt DB), fall back to ephemeral client.
+            try:
+                self.client = chromadb.Client()
+                self.collection = self.client.get_or_create_collection(name="dexter_memory")
+                self._chroma_available = True
+                self._chroma_persistent = False
+                logger.warning("chroma_fallback_ephemeral", error=str(e))
+            except Exception as fallback_error:
+                if hasattr(logger, "critical"):
+                    logger.critical("chroma_startup_failed", error=str(fallback_error), exc_info=True)
+                else:
+                    logger.error("chroma_startup_failed", error=str(fallback_error), exc_info=True)
+                self._chroma_available = False
 
         self._max_items = max_items
         self._max_age_seconds = max_age_days * 86400 if max_age_days else None
@@ -128,8 +141,8 @@ class DexterMemory:
         cfg = get_config()
         health_monitor = get_global_health_monitor()
         # Multi-user RAG manager — passes all config fields including BGE model.
-        if not self._chroma_available or disable_rag_warming:
-            if disable_rag_warming and self._chroma_available:
+        if not self._chroma_persistent or disable_rag_warming:
+            if disable_rag_warming and self._chroma_persistent:
                 logger.info("rag_warming_disabled", reason="low_power_mode")
             self.personal_rag = None
         else:

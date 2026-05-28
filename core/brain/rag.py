@@ -1940,6 +1940,7 @@ class MultiUserRAGManager:
         default_roots: Optional[list[str]] = None,
         cfg: Optional[dict] = None,
         health_monitor: Any = None,
+        event_bus: Any = None,
     ) -> None:
         self.persist_directory = os.path.abspath(persist_directory)
         os.makedirs(self.persist_directory, exist_ok=True)
@@ -1947,6 +1948,7 @@ class MultiUserRAGManager:
         self._default_roots = default_roots or []
         self._cfg = cfg or {}
         self._health_monitor = health_monitor
+        self._event_bus = event_bus
 
     def get_index_for_user(self, user_id: Optional[str] = None) -> PersonalRAGIndex:
         uid = (user_id or getpass.getuser() or "default").lower()
@@ -1967,6 +1969,7 @@ class MultiUserRAGManager:
             batch_size=int(self._cfg.get("batch_size", 256)),
             max_embedding_threads=int(self._cfg.get("max_embedding_threads", 4)),
             health_monitor=self._health_monitor,
+            event_bus=self._event_bus,
         )
         idx.start_polling()
         self._indexes[uid] = idx

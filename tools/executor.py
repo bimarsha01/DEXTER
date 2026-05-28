@@ -16,7 +16,12 @@ from utils.config import DexterConfig, get_workspace_root, get_config
 from utils.metrics import metrics
 from tools.schema_registry import get_tool_schema
 
-UNSAFE_PATTERN = re.compile(r"(;|\||\|\||&&|`|\$\(|\n)")
+UNSAFE_PATTERN = re.compile(r"(;|\||\|\||&&|`|\$\()")
+NEWLINE_PATTERN = re.compile(r"\n")
+MULTILINE_ALLOWED: dict[str, set[str]] = {
+    "create_note": {"content"},
+    "type_text": {"text"},
+}
 PATH_ARG_NAMES = {"path", "file_path", "filepath", "root", "directory", "folder", "output_path"}
 RELATIVE_PATH_NAMES = {"relative_path"}
 
@@ -116,8 +121,12 @@ class ToolExecutor:
                 continue
             if isinstance(value, str) and tool_name in search_tools and key in search_keys:
                 value = _clean_search_text(value)
-            if isinstance(value, str) and UNSAFE_PATTERN.search(value):
-                raise ValueError(f"Unsafe characters detected in argument '{key}'.")
+            if isinstance(value, str):
+                allow_multiline = key in MULTILINE_ALLOWED.get(tool_name, set())
+                if not allow_multiline and NEWLINE_PATTERN.search(value):
+                    raise ValueError(f"Unsafe characters detected in argument '{key}'.")
+                if UNSAFE_PATTERN.search(value):
+                    raise ValueError(f"Unsafe characters detected in argument '{key}'.")
             clean[key] = value
         return clean
 

@@ -238,17 +238,24 @@ class DexterTranscriber:
             "min_silence_duration_ms": 900,
             "speech_pad_ms": 400,
         }
-        segments, info = model.transcribe(
-            normalized_path,
-            beam_size=self.beam_size,
-            best_of=5,
-            temperature=self.temperature,
-            batch_size=whisper_batch_size,
-            condition_on_previous_text=False,
-            initial_prompt=self._initial_prompt,
-            vad_filter=True,
-            vad_parameters=vad_params,
-        )
+        transcribe_kwargs = {
+            "beam_size": self.beam_size,
+            "best_of": 5,
+            "temperature": self.temperature,
+            "batch_size": whisper_batch_size,
+            "condition_on_previous_text": False,
+            "initial_prompt": self._initial_prompt,
+            "vad_filter": True,
+            "vad_parameters": vad_params,
+        }
+        try:
+            segments, info = model.transcribe(normalized_path, **transcribe_kwargs)
+        except TypeError as exc:
+            if "batch_size" not in str(exc):
+                raise
+            logger.warning("transcribe_batch_size_unsupported", error=str(exc))
+            transcribe_kwargs.pop("batch_size", None)
+            segments, info = model.transcribe(normalized_path, **transcribe_kwargs)
 
         # Join all spoken segments
         collected = []

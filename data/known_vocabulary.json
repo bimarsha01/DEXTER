@@ -112,6 +112,7 @@
     "kit",
     "launcher",
     "layout",
+    "learn_redis",
     "lenovo",
     "lenovo vantage service",
     "lfs",
@@ -246,5 +247,5 @@
     "x86",
     "xampp"
   ],
-  "count": 245
+  "count": 246
 }

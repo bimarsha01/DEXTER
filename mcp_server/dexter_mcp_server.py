@@ -16,7 +16,6 @@ from pathlib import Path
 from typing import Any, Callable
 
 from fastmcp import FastMCP
-from fastapi.responses import JSONResponse
 
 from core.event_bus import EventBus
 from core.health import HealthMonitor, get_global_health_monitor, set_global_health_monitor
@@ -1001,16 +1000,7 @@ class _MCPStatusHandler(BaseHTTPRequestHandler):
             monitor = get_global_health_monitor() or _LOCAL_HEALTH_MONITOR
             raw_summary = monitor.get_health_summary()
             safe_summary = _sanitize_health_for_external(raw_summary)
-            response = JSONResponse(safe_summary)
-            body = response.body
-            self.send_response(response.status_code)
-            for header_name, header_value in response.headers.items():
-                if header_name.lower() == "content-length":
-                    continue
-                self.send_header(header_name, header_value)
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
+            self._write_json(200, safe_summary)
             return
         if self.path == "/tools":
             self._write_json(200, {"tools": load_tool_schemas()})

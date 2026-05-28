@@ -80,12 +80,19 @@ class VocabularyBuilder:
             persist_dir = getattr(self._config.rag, "persist_directory", None)
             if not persist_dir:
                 return names
+            persist_dir = os.path.abspath(os.path.expandvars(os.path.expanduser(str(persist_dir))))
+            if not os.path.exists(persist_dir):
+                return names
             import chromadb
 
             client = chromadb.PersistentClient(path=persist_dir)
             collections = client.list_collections()
             for col in collections:
                 try:
+                    if isinstance(col, str):
+                        col = client.get_collection(col)
+                    elif not hasattr(col, "get") and hasattr(col, "name"):
+                        col = client.get_collection(col.name)
                     results = col.get(include=["metadatas"], limit=5000)
                     for meta in results.get("metadatas", []):
                         if meta and "path" in meta:
