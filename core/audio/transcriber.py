@@ -1,5 +1,7 @@
+import inspect
 import os
 import threading
+import time
 import numpy as np
 import soundfile as sf
 from faster_whisper import WhisperModel
@@ -76,6 +78,7 @@ class DexterTranscriber:
         self.model_size = (model_size or cfg.hardware.whisper_model or "tiny").strip()
         self._model: WhisperModel | None = None
         self._model_lock = threading.Lock()
+        self._batch_size_supported: bool | None = None
         logger.info(
             "transcriber_loading",
             model_size=model_size,
@@ -95,6 +98,7 @@ class DexterTranscriber:
             logger.warning("transcriber_warmup_failed", error=str(e))
 
     def _ensure_model(self) -> WhisperModel:
+        """Load Whisper model with GPU/CPU fallback while keeping compute types stable."""
         if self._model is not None:
             return self._model
 
@@ -139,6 +143,17 @@ class DexterTranscriber:
                 logger.info(f"Whisper loaded: {self.model_size} on {fallback_device} ({fallback_compute_type})")
 
         return self._model
+
+    def _supports_batch_size(self, model: WhisperModel) -> bool:
+        """Return True when the Whisper backend supports the batch_size argument."""
+        if self._batch_size_supported is not None:
+            return self._batch_size_supported
+        try:
+            params = inspect.signature(model.transcribe).parameters
+            self._batch_size_supported = "batch_size" in params
+        except Exception:
+            self._batch_size_supported = False
+        return self._batch_size_supported
 
     def _build_initial_prompt(self, config) -> str:
         from pathlib import Path
@@ -212,15 +227,30 @@ class DexterTranscriber:
 
     def transcribe(self, audio_file: str, on_partial=None) -> str:
         """
-        Takes an audio filepath and returns the transcribed text.
-        Uses the configured beam_size for speed/accuracy tradeoff.
+        Transcribe an audio file with Whisper and return the final text.
+
+        Logs audio duration, transcription duration, and transcript stats to
+        make long-utterance failures easier to diagnose.
         """
         if not os.path.exists(audio_file):
             logger.error("transcriber_audio_missing", path=audio_file)
             return ""
 
         normalized_path = self._normalize_audio(audio_file)
-        logger.debug("transcriber_run_started", path=audio_file, beam_size=self.beam_size)
+        audio_duration_ms = None
+        try:
+            info = sf.info(normalized_path)
+            if info.frames and info.samplerate:
+                audio_duration_ms = (info.frames / info.samplerate) * 1000.0
+        except Exception as exc:
+            logger.debug("transcribe_audio_info_failed", error=str(exc))
+
+        logger.info(
+            "transcribe_started",
+            path=audio_file,
+            beam_size=self.beam_size,
+            audio_duration_ms=round(audio_duration_ms, 2) if audio_duration_ms is not None else None,
+        )
         model = self._ensure_model()
         prompt = DEFAULT_WAKE_PROMPT
         extra_prompt = (self.initial_prompt or "").strip()
@@ -240,22 +270,34 @@ class DexterTranscriber:
         }
         transcribe_kwargs = {
             "beam_size": self.beam_size,
-            "best_of": 5,
+            "best_of": self.best_of,
             "temperature": self.temperature,
-            "batch_size": whisper_batch_size,
-            "condition_on_previous_text": False,
+            "condition_on_previous_text": self.condition_on_previous_text,
             "initial_prompt": self._initial_prompt,
             "vad_filter": True,
             "vad_parameters": vad_params,
         }
+
+        if whisper_batch_size > 0 and self._supports_batch_size(model):
+            transcribe_kwargs["batch_size"] = whisper_batch_size
+
+        transcribe_start = time.perf_counter()
         try:
             segments, info = model.transcribe(normalized_path, **transcribe_kwargs)
         except TypeError as exc:
             if "batch_size" not in str(exc):
                 raise
+            self._batch_size_supported = False
             logger.warning("transcribe_batch_size_unsupported", error=str(exc))
             transcribe_kwargs.pop("batch_size", None)
             segments, info = model.transcribe(normalized_path, **transcribe_kwargs)
+        except Exception as exc:
+            logger.error(
+                "transcribe_failed",
+                error=str(exc),
+                audio_duration_ms=round(audio_duration_ms, 2) if audio_duration_ms is not None else None,
+            )
+            raise
 
         # Join all spoken segments
         collected = []
@@ -270,5 +312,18 @@ class DexterTranscriber:
                         error=str(e),
                         exc_info=True,
                     )
-        text = " ".join(collected)
-        return text.strip()
+        text = " ".join(collected).strip()
+        duration_ms = (time.perf_counter() - transcribe_start) * 1000.0
+        transcript_length = len(text)
+
+        privacy_cfg = getattr(get_config(), "privacy", None)
+        include_transcript = bool(getattr(privacy_cfg, "debug_log_transcripts", False))
+        logger.info(
+            "transcribe_completed",
+            transcribe_duration_ms=round(duration_ms, 2),
+            audio_duration_ms=round(audio_duration_ms, 2) if audio_duration_ms is not None else None,
+            transcript_length=transcript_length,
+            transcript=text if include_transcript else None,
+            transcript_preview=text[:200] if text and not include_transcript else None,
+        )
+        return text

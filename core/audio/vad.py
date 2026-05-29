@@ -20,6 +20,7 @@ class VADListener:
         vad_threshold: float | None = None,
         min_speech_duration_ms: int | None = None,
         min_silence_duration_ms: int | None = None,
+        min_utterance_duration_ms: int | None = None,
         speech_pad_ms: int | None = None,
         max_speech_duration_s: int | None = None,
     ):
@@ -42,7 +43,10 @@ class VADListener:
             min_speech_duration_ms if min_speech_duration_ms is not None else getattr(audio_cfg, "min_speech_duration_ms", 100)
         )
         self.min_silence_duration_ms = int(
-            min_silence_duration_ms if min_silence_duration_ms is not None else getattr(audio_cfg, "min_silence_duration_ms", 800)
+            min_silence_duration_ms if min_silence_duration_ms is not None else getattr(audio_cfg, "min_silence_duration_ms", 1100)
+        )
+        self.min_utterance_duration_ms = int(
+            min_utterance_duration_ms if min_utterance_duration_ms is not None else getattr(audio_cfg, "min_utterance_duration_ms", 350)
         )
         self.speech_pad_ms = int(
             speech_pad_ms if speech_pad_ms is not None else getattr(audio_cfg, "speech_pad_ms", 400)
@@ -97,6 +101,7 @@ class VADListener:
         
         When interrupted (on_speech_start called while TTS is playing):
         - Uses shorter silence_threshold (0.8s) to respond quickly
+        - Drops very short utterances to avoid accidental triggers
         """
         recording = []
         is_speaking = False
@@ -211,6 +216,15 @@ class VADListener:
 
         # If we captured audio, save it to a file
         if recording:
+            if speech_start_time is not None:
+                utterance_duration_ms = (time.time() - speech_start_time) * 1000.0
+                if utterance_duration_ms < float(self.min_utterance_duration_ms):
+                    logger.info(
+                        "vad_utterance_too_short",
+                        duration_ms=round(utterance_duration_ms, 2),
+                        min_duration_ms=self.min_utterance_duration_ms,
+                    )
+                    return None
             audio_data = np.concatenate(recording, axis=0)
             sf.write(output_file, audio_data, self.sample_rate)
             return output_file

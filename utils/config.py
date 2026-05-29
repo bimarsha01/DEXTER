@@ -246,9 +246,18 @@ class AudioSettingsConfig(BaseModel):
     device_index: int | None = None
     vad_threshold: float = 0.25
     min_speech_duration_ms: int = 100
-    min_silence_duration_ms: int = 900
+    min_silence_duration_ms: int = 1100
+    min_utterance_duration_ms: int = 350
     speech_pad_ms: int = 400
     max_speech_duration_s: int = 30
+
+
+class TranscriptionConfig(BaseModel):
+    """Transcription time budget and reliability tuning."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    timeout_seconds: float = Field(default=40.0, ge=5.0, le=90.0)
 
 
 class SpeedConfig(BaseModel):
@@ -386,6 +395,7 @@ class DexterConfig(BaseModel):
     providers: ProvidersConfig = Field(default_factory=ProvidersConfig)
     rag: RagConfig = Field(default_factory=RagConfig)
     audio_settings: AudioSettingsConfig = Field(default_factory=AudioSettingsConfig)
+    transcription: TranscriptionConfig = Field(default_factory=TranscriptionConfig)
     stt: SttConfig = Field(default_factory=SttConfig)
     history: HistoryConfig = Field(default_factory=HistoryConfig)
     mcp: McpConfig = Field(default_factory=McpConfig)
@@ -443,6 +453,7 @@ def _ensure_config_shape(config: dict) -> dict:
     config.setdefault("security", {})
     config.setdefault("providers", {})
     config.setdefault("audio_settings", {})
+    config.setdefault("transcription", {})
     config.setdefault("speed", {})
     config.setdefault("stt", {})
     config.setdefault("activation", {})

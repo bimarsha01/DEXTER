@@ -118,9 +118,13 @@ audio_settings:
   chunk_size: 512
   vad_threshold: 0.25
   min_speech_duration_ms: 100
-  min_silence_duration_ms: 900
+  min_silence_duration_ms: 1100
+  min_utterance_duration_ms: 350
   speech_pad_ms: 400
   max_speech_duration_s: 30
+
+transcription:
+  timeout_seconds: 40
 
 stt:
   model: "medium.en"

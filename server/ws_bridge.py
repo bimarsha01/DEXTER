@@ -109,7 +109,10 @@ class DashboardServer:
         async with self._clients_lock:
             self._clients[client_key] = websocket
         try:
-            await websocket.send_json(self.health_monitor.get_health_summary())
+            await websocket.send_json({
+                "type": "health_summary",
+                "payload": self.health_monitor.get_health_summary(),
+            })
             await websocket.send_json(self._build_dashboard_snapshot())
             while True:
                 await websocket.receive_text()

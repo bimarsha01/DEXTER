@@ -388,7 +388,6 @@ async def main():
     watchdog = None
     pipeline = None
     proactive_task = None
-    dashboard_task = None
 
     # 1. Load Configuration & Profile (Fast)
     start_time = time.perf_counter()
@@ -640,8 +639,13 @@ async def main():
         )
         global _ACTIVE_DASHBOARD
         _ACTIVE_DASHBOARD = dashboard
-        logger.info(f"Dashboard available at {dashboard.url}")
-        dashboard_task = asyncio.create_task(dashboard.serve(), name="dexter-dashboard-server")
+        logger.info(f"Dashboard: {dashboard.url}")
+
+        async def _run_pipeline_with_dashboard() -> None:
+            try:
+                await pipeline.run()
+            finally:
+                dashboard.stop()
 
         proactive_task = None
         if proactive is not None:
@@ -667,14 +671,14 @@ async def main():
         )
 
         try:
-            await pipeline.run()
+            await asyncio.gather(
+                dashboard.serve(),
+                _run_pipeline_with_dashboard(),
+            )
         finally:
             _cleanup_runtime_sync()
+            dashboard.stop()
             mcp_task.cancel()
-            if dashboard_task is not None:
-                dashboard_task.cancel()
-                with suppress(asyncio.CancelledError):
-                    await dashboard_task
             try:
                 await tool_registry.shutdown_mcp()
             except Exception as e:

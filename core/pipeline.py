@@ -3,6 +3,7 @@ import os
 import re
 import time
 import threading
+import soundfile as sf
 from dataclasses import dataclass, field
 from functools import partial
 from pathlib import Path
@@ -33,6 +34,8 @@ class TurnContext:
     cid: str
     turn_start: float
     audio_path: str | None = None
+    audio_duration_ms: float = 0.0
+    transcribe_duration_ms: float = 0.0
     identified_text: str = ""
     preprocessed_text: str = ""
     effective_mode: str = ""
@@ -86,7 +89,7 @@ class WatchdogStopError(RuntimeError):
 
 class TurnController:
     STAGE_TIMEOUTS = {
-        "transcribe": 10.0,
+        "transcribe": 40.0,
         "activate": 5.0,
         "retrieve_context": 5.0,
         "execute_tools": 30.0,
@@ -100,25 +103,19 @@ class TurnController:
         self._watchdog_stop_event = watchdog_stop_event
 
     def _effective_stage_timeout(self, stage: str) -> float:
+        """Return the stage timeout, applying transcription-specific safeguards."""
         configured = float(getattr(self.pipeline.config.providers, "overall_turn_timeout_seconds", 0.0) or 0.0)
         base = float(self.STAGE_TIMEOUTS.get(stage, 30.0))
         if stage == "transcribe":
             try:
-                model_name = str(
-                    getattr(self.pipeline.config.stt, "model", "")
-                    or getattr(self.pipeline.config.hardware, "whisper_model", "")
-                ).lower()
-                device = str(getattr(self.pipeline.config.hardware, "device", "") or "").lower()
-                if "large" in model_name:
-                    base = max(base, 30.0)
-                elif "medium" in model_name:
-                    base = max(base, 20.0)
-                if device == "cpu":
-                    base = max(base, 15.0)
+                transcription_cfg = getattr(self.pipeline.config, "transcription", None)
+                configured_transcribe = float(getattr(transcription_cfg, "timeout_seconds", 40.0) or 40.0)
             except Exception:
-                pass
+                configured_transcribe = 40.0
+            base = min(max(configured_transcribe, 5.0), 90.0)
+            return base
         if configured > 0:
-            if stage in {"transcribe", "activate", "retrieve_context"}:
+            if stage in {"activate", "retrieve_context"}:
                 return min(base, configured)
             return base
         return base
@@ -165,32 +162,66 @@ class TurnController:
         self._emit_stage_event(stage, "done", ctx, duration_ms=round(duration_ms, 2))
 
     async def _run_stage(self, stage: str, ctx: TurnContext, handler, timeout: float) -> TurnContext:
+        """Run a pipeline stage with timing, telemetry, and a transcribe timeout retry."""
         self._stage_entry(stage, ctx)
         stage_start = time.perf_counter()
+        retry_timeout = None
+        if stage == "transcribe":
+            retry_timeout = min(timeout + 10.0, 90.0)
+
+        attempt = 0
         try:
-            result = await asyncio.wait_for(handler(ctx), timeout=timeout)
-        except asyncio.TimeoutError as e:
-            duration_ms = (time.perf_counter() - stage_start) * 1000
-            self._record_stage_timing(stage, duration_ms)
-            logger.warning(
-                "turn_stage_time_budget_exceeded",
-                stage=stage,
-                turn_id=ctx.cid,
-                duration_ms=round(duration_ms, 2),
-                budget_ms=round(timeout * 1000, 2),
-            )
-            self._emit_stage_event(
-                stage,
-                "error",
-                ctx,
-                error=f"{stage} stage timed out after {timeout:.1f}s",
-                duration_ms=round(duration_ms, 2),
-            )
-            try:
-                self.pipeline.event_bus.emit("turn_stage_error", {"stage": stage, "error": f"{stage} stage timed out after {timeout:.1f}s", "turn_id": ctx.cid, "duration_ms": round(duration_ms, 2)})
-            except Exception:
-                pass
-            raise TurnStageError(stage, f"{stage} stage timed out after {timeout:.1f}s", cause=e) from e
+            while True:
+                attempt_start = time.perf_counter()
+                try:
+                    result = await asyncio.wait_for(handler(ctx), timeout=timeout)
+                    break
+                except asyncio.TimeoutError as e:
+                    attempt_duration_ms = (time.perf_counter() - attempt_start) * 1000
+                    if stage == "transcribe" and attempt == 0 and retry_timeout and retry_timeout > timeout:
+                        logger.warning(
+                            "transcribe_timeout_retry",
+                            stage=stage,
+                            turn_id=ctx.cid,
+                            attempt=attempt + 1,
+                            attempt_duration_ms=round(attempt_duration_ms, 2),
+                            timeout_seconds=round(timeout, 2),
+                            retry_timeout_seconds=round(retry_timeout, 2),
+                            audio_duration_ms=round(ctx.audio_duration_ms, 2) if ctx.audio_duration_ms else None,
+                        )
+                        attempt += 1
+                        timeout = retry_timeout
+                        continue
+
+                    duration_ms = (time.perf_counter() - stage_start) * 1000
+                    self._record_stage_timing(stage, duration_ms)
+                    logger.warning(
+                        "turn_stage_time_budget_exceeded",
+                        stage=stage,
+                        turn_id=ctx.cid,
+                        duration_ms=round(duration_ms, 2),
+                        budget_ms=round(timeout * 1000, 2),
+                    )
+                    if stage == "transcribe":
+                        logger.warning(
+                            "transcribe_timeout",
+                            turn_id=ctx.cid,
+                            audio_duration_ms=round(ctx.audio_duration_ms, 2) if ctx.audio_duration_ms else None,
+                            transcribe_duration_ms=round(duration_ms, 2),
+                            timeout_seconds=round(timeout, 2),
+                        )
+                    self._emit_stage_event(
+                        stage,
+                        "error",
+                        ctx,
+                        error=f"{stage} stage timed out after {timeout:.1f}s",
+                        duration_ms=round(duration_ms, 2),
+                    )
+                    try:
+                        self.pipeline.event_bus.emit("turn_stage_error", {"stage": stage, "error": f"{stage} stage timed out after {timeout:.1f}s", "turn_id": ctx.cid, "duration_ms": round(duration_ms, 2)})
+                    except Exception:
+                        pass
+                    raise TurnStageError(stage, f"{stage} stage timed out after {timeout:.1f}s", cause=e) from e
         except TurnStageError as e:
             duration_ms = (time.perf_counter() - stage_start) * 1000
             self._record_stage_timing(stage, duration_ms)
@@ -407,7 +438,12 @@ class TurnController:
                 {"component": e.stage, "error": str(e)},
             )
             # Speak a short error for non-response stage failures so the turn does not end silently.
-            if e.stage == "generate_response":
+            if e.stage == "transcribe" and "timed out" in str(e):
+                try:
+                    await self.pipeline.tts.speak("I heard part of that but it got cut off. Could you repeat the last part?")
+                except Exception:
+                    pass
+            elif e.stage == "generate_response":
                 try:
                     await self.pipeline.tts.speak("I didn't get a response in time. Please try again.")
                 except Exception:
@@ -464,6 +500,7 @@ class TurnController:
                 pass
 
     async def _stage_transcribe(self, ctx: TurnContext) -> TurnContext:
+        """Capture audio with VAD, transcribe with Whisper, and log detailed timing."""
         pipeline = self.pipeline
         vad_start = time.perf_counter()
 
@@ -499,6 +536,20 @@ class TurnController:
             pipeline._set_state(AssistantState.TRANSCRIBING)
             stt_start = time.perf_counter()
 
+            try:
+                info = sf.info(audio_path)
+                if info.frames and info.samplerate:
+                    ctx.audio_duration_ms = (info.frames / info.samplerate) * 1000.0
+            except Exception as exc:
+                logger.debug("transcribe_audio_duration_failed", error=str(exc))
+
+            logger.info(
+                "transcribe_audio_captured",
+                turn_id=ctx.cid,
+                audio_duration_ms=round(ctx.audio_duration_ms, 2) if ctx.audio_duration_ms else None,
+                path=audio_path,
+            )
+
             def _on_partial(text: str) -> None:
                 if not text:
                     return
@@ -508,20 +559,33 @@ class TurnController:
                 else:
                     pipeline.event_bus.emit("transcript_partial", payload)
 
-            try:
-                identified_text = await asyncio.to_thread(
-                    pipeline.transcriber.transcribe,
-                    audio_path,
-                    on_partial=_on_partial,
-                )
-                metrics.record_latency("stt_ms", (time.perf_counter() - stt_start) * 1000)
-            except Exception as e:
-                logger.error("transcription_failed", error=str(e), exc_info=True)
-                pipeline.event_bus.emit("error_occurred", {"component": "stt", "error": str(e)})
-                raise TurnStageError("transcribe", "transcription failed", cause=e) from e
+            identified_text = ""
+            for attempt in range(2):
+                try:
+                    identified_text = await asyncio.to_thread(
+                        pipeline.transcriber.transcribe,
+                        audio_path,
+                        on_partial=_on_partial,
+                    )
+                    break
+                except Exception as e:
+                    if attempt == 0:
+                        logger.warning(
+                            "transcribe_retrying",
+                            turn_id=ctx.cid,
+                            attempt=attempt + 1,
+                            error=str(e),
+                        )
+                        continue
+                    logger.error("transcription_failed", error=str(e), exc_info=True)
+                    pipeline.event_bus.emit("error_occurred", {"component": "stt", "error": str(e)})
+                    raise TurnStageError("transcribe", "transcription failed", cause=e) from e
+
+            ctx.transcribe_duration_ms = (time.perf_counter() - stt_start) * 1000.0
+            metrics.record_latency("stt_ms", ctx.transcribe_duration_ms)
 
             if not identified_text:
-                logger.debug("transcription_empty", cid=ctx.cid)
+                logger.debug("transcription_empty", cid=ctx.cid, audio_duration_ms=round(ctx.audio_duration_ms, 2) if ctx.audio_duration_ms else None)
                 pipeline._set_state(AssistantState.IDLE)
                 ctx.stop_turn = True
                 ctx.stop_reason = "empty_transcript"
@@ -529,9 +593,21 @@ class TurnController:
 
             privacy_cfg = getattr(pipeline.config, "privacy", None)
             if privacy_cfg is not None and bool(getattr(privacy_cfg, "debug_log_transcripts", False)):
-                logger.info("utterance_started", cid=ctx.cid, transcript=identified_text)
+                logger.info(
+                    "utterance_started",
+                    cid=ctx.cid,
+                    transcript=identified_text,
+                    audio_duration_ms=round(ctx.audio_duration_ms, 2) if ctx.audio_duration_ms else None,
+                    transcribe_duration_ms=round(ctx.transcribe_duration_ms, 2) if ctx.transcribe_duration_ms else None,
+                )
             else:
-                logger.debug("utterance_started", cid=ctx.cid, transcript_length=len(identified_text))
+                logger.debug(
+                    "utterance_started",
+                    cid=ctx.cid,
+                    transcript_length=len(identified_text),
+                    audio_duration_ms=round(ctx.audio_duration_ms, 2) if ctx.audio_duration_ms else None,
+                    transcribe_duration_ms=round(ctx.transcribe_duration_ms, 2) if ctx.transcribe_duration_ms else None,
+                )
             pipeline.event_bus.emit("transcript_received", {"text": identified_text, "correlation_id": ctx.cid})
             logger.debug("transcript_final", text=identified_text)
 

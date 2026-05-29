@@ -65,6 +65,16 @@ class CaptureResult:
 
 
 @dataclass
+class ScreenCaptureResult:
+    image_bytes: bytes
+    foreground_window: str
+    capture_mode: str
+    image: Image.Image | None = None
+    capture_ts: float | None = None
+    was_verified: bool = False
+
+
+@dataclass
 class WindowSnapshot:
     hwnd: int
     title: str
@@ -173,7 +183,7 @@ def _get_local_vision_captioner():
         return None
 
 
-def _caption_screen_locally(capture: CaptureResult | None) -> str:
+def _caption_screen_locally(capture: ScreenCaptureResult | None) -> str:
     captioner = _get_local_vision_captioner()
     if captioner is None:
         return ""
@@ -627,7 +637,7 @@ def _resize_image(image: Image.Image, max_dimension: int) -> Image.Image:
     return image.resize(new_size, Image.LANCZOS)
 
 
-def capture_screen_for_vision(max_dimension: int = 1280) -> Optional[CaptureResult]:
+def capture_screen_for_vision(max_dimension: int = 1280) -> Optional[ScreenCaptureResult]:
     """Capture the user's actual viewport atomically.
 
     Returns a CaptureResult on success or None on any failure. Never raises for expected capture failures.
@@ -664,7 +674,11 @@ def capture_screen_for_vision(max_dimension: int = 1280) -> Optional[CaptureResu
                 capture_timeout_seconds=timeout_seconds,
             )
 
-            result = CaptureResult(
+            buffer = io.BytesIO()
+            resized.save(buffer, format="PNG")
+
+            result = ScreenCaptureResult(
+                image_bytes=buffer.getvalue(),
                 image=resized,
                 foreground_window=title or "",
                 capture_mode=capture_mode,
@@ -686,7 +700,6 @@ def capture_screen_for_vision(max_dimension: int = 1280) -> Optional[CaptureResu
     if capture_context is not None and capture_context.restore_failed:
         status = "restore_failed"
         _emit_vision_capture_event(status, capture_context.elapsed_ms())
-        return None
 
     _emit_vision_capture_event(status, capture_context.elapsed_ms() if capture_context is not None else 0.0)
     return result
