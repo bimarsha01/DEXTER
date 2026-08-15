@@ -257,7 +257,7 @@ class TranscriptionConfig(BaseModel):
 
     model_config = ConfigDict(extra="ignore")
 
-    timeout_seconds: float = Field(default=40.0, ge=5.0, le=90.0)
+    timeout_seconds: float = Field(default=40.0, ge=5.0, le=120.0)
 
 
 class SpeedConfig(BaseModel):

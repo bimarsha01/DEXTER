@@ -124,10 +124,10 @@ audio_settings:
   max_speech_duration_s: 30
 
 transcription:
-  timeout_seconds: 40
+  timeout_seconds: 75
 
 stt:
-  model: "medium.en"
+  model: "auto"
   beam_size: 5
   best_of: 5
   temperature: [0.0, 0.2, 0.4]

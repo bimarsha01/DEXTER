@@ -5,8 +5,6 @@ import time
 import threading
 from dataclasses import dataclass
 
-import chromadb
-
 from core.brain.rag import MultiUserRAGManager
 from core.health import get_global_health_monitor
 from utils.config import get_config
@@ -108,20 +106,22 @@ class DexterMemory:
         logger.info("Waking up Dexter's Long-Term Memory (ChromaDB)...")
         import os
 
+        from utils.chroma_client import get_ephemeral_client, get_persistent_client
+
         persist_directory = os.path.abspath(os.path.expandvars(os.path.expanduser(str(persist_directory))))
         self._chroma_available = False
         self._chroma_persistent = False
         self.client = None
         self.collection = None
         try:
-            self.client = chromadb.PersistentClient(path=persist_directory)
+            self.client = get_persistent_client(persist_directory)
             self.collection = self.client.get_or_create_collection(name="dexter_memory")
             self._chroma_available = True
             self._chroma_persistent = True
         except Exception as e:
             # If Chroma cannot start (permissions/corrupt DB), fall back to ephemeral client.
             try:
-                self.client = chromadb.Client()
+                self.client = get_ephemeral_client()
                 self.collection = self.client.get_or_create_collection(name="dexter_memory")
                 self._chroma_available = True
                 self._chroma_persistent = False

@@ -249,6 +249,12 @@ async def test_stt_stage_times_out_raises_turn_stage_error_and_stops_after_error
         transcriber=SlowTranscriber(),
     )
     monkeypatch.setitem(pipeline.turn_controller.STAGE_TIMEOUTS, "transcribe", 0.01)
+    monkeypatch.setattr(pipeline.turn_controller, "_transcription_timeout_seconds", lambda: 0.01)
+    monkeypatch.setattr(
+        pipeline.turn_controller,
+        "_effective_stage_timeout",
+        lambda stage: 0.01 if stage == "transcribe" else pipeline.turn_controller.STAGE_TIMEOUTS.get(stage, 30.0),
+    )
     ctx = TurnContext(cid="turn-stt", turn_start=time.perf_counter())
 
     with pytest.raises(TurnStageError) as excinfo:
@@ -256,7 +262,7 @@ async def test_stt_stage_times_out_raises_turn_stage_error_and_stops_after_error
             "transcribe",
             ctx,
             pipeline.turn_controller._stage_transcribe,
-            pipeline.turn_controller._effective_stage_timeout("transcribe"),
+            0.01,
         )
 
     assert excinfo.value.stage == "transcribe"

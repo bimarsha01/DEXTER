@@ -236,6 +236,10 @@ def apply_low_power_overrides(config_dict: dict) -> dict:
         config_dict["models"] = {}
     
     config_dict["models"]["whisper_model"] = settings["whisper_model"]
+    # Keep STT model in sync — transcriber reads stt.model first.
+    if "stt" not in config_dict:
+        config_dict["stt"] = {}
+    config_dict["stt"]["model"] = settings["whisper_model"]
     if "audio_settings" not in config_dict:
         config_dict["audio_settings"] = {}
     config_dict["audio_settings"]["whisper_batch_size"] = settings["whisper_batch_size"]

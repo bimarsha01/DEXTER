@@ -83,9 +83,9 @@ class VocabularyBuilder:
             persist_dir = os.path.abspath(os.path.expandvars(os.path.expanduser(str(persist_dir))))
             if not os.path.exists(persist_dir):
                 return names
-            import chromadb
+            from utils.chroma_client import get_persistent_client
 
-            client = chromadb.PersistentClient(path=persist_dir)
+            client = get_persistent_client(persist_dir)
             collections = client.list_collections()
             for col in collections:
                 try:

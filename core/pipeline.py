@@ -89,7 +89,7 @@ class WatchdogStopError(RuntimeError):
 
 class TurnController:
     STAGE_TIMEOUTS = {
-        "transcribe": 40.0,
+        "transcribe": 120.0,
         "activate": 5.0,
         "retrieve_context": 5.0,
         "execute_tools": 30.0,
@@ -102,18 +102,29 @@ class TurnController:
         self._current_turn_context: TurnContext | None = None
         self._watchdog_stop_event = watchdog_stop_event
 
+    def _transcription_timeout_seconds(self) -> float:
+        """Timeout for the Whisper call only (excludes VAD listen time)."""
+        try:
+            transcription_cfg = getattr(self.pipeline.config, "transcription", None)
+            configured = float(getattr(transcription_cfg, "timeout_seconds", 40.0) or 40.0)
+        except Exception:
+            configured = 40.0
+        return min(max(configured, 15.0), 120.0)
+
     def _effective_stage_timeout(self, stage: str) -> float:
         """Return the stage timeout, applying transcription-specific safeguards."""
         configured = float(getattr(self.pipeline.config.providers, "overall_turn_timeout_seconds", 0.0) or 0.0)
         base = float(self.STAGE_TIMEOUTS.get(stage, 30.0))
         if stage == "transcribe":
+            # Outer budget must cover VAD capture + STT. Whisper timeout is applied
+            # separately inside _stage_transcribe so listen time does not steal STT budget.
             try:
-                transcription_cfg = getattr(self.pipeline.config, "transcription", None)
-                configured_transcribe = float(getattr(transcription_cfg, "timeout_seconds", 40.0) or 40.0)
+                audio_cfg = getattr(self.pipeline.config, "audio_settings", None)
+                max_speech = float(getattr(audio_cfg, "max_speech_duration_s", 30.0) or 30.0)
             except Exception:
-                configured_transcribe = 40.0
-            base = min(max(configured_transcribe, 5.0), 90.0)
-            return base
+                max_speech = 30.0
+            stt_budget = self._transcription_timeout_seconds()
+            return min(max(max_speech + stt_budget + 15.0, 60.0), 180.0)
         if configured > 0:
             if stage in {"activate", "retrieve_context"}:
                 return min(base, configured)
@@ -167,7 +178,9 @@ class TurnController:
         stage_start = time.perf_counter()
         retry_timeout = None
         if stage == "transcribe":
-            retry_timeout = min(timeout + 10.0, 90.0)
+            # Only retry when the configured budget is realistic; tiny test
+            # timeouts should fail immediately instead of being extended by +10s.
+            retry_timeout = min(timeout + 10.0, 90.0) if timeout >= 5.0 else None
 
         attempt = 0
         try:
@@ -210,17 +223,7 @@ class TurnController:
                             transcribe_duration_ms=round(duration_ms, 2),
                             timeout_seconds=round(timeout, 2),
                         )
-                    self._emit_stage_event(
-                        stage,
-                        "error",
-                        ctx,
-                        error=f"{stage} stage timed out after {timeout:.1f}s",
-                        duration_ms=round(duration_ms, 2),
-                    )
-                    try:
-                        self.pipeline.event_bus.emit("turn_stage_error", {"stage": stage, "error": f"{stage} stage timed out after {timeout:.1f}s", "turn_id": ctx.cid, "duration_ms": round(duration_ms, 2)})
-                    except Exception:
-                        pass
+                    # Raise once; the outer TurnStageError handler emits telemetry.
                     raise TurnStageError(stage, f"{stage} stage timed out after {timeout:.1f}s", cause=e) from e
         except TurnStageError as e:
             duration_ms = (time.perf_counter() - stage_start) * 1000
@@ -560,14 +563,31 @@ class TurnController:
                     pipeline.event_bus.emit("transcript_partial", payload)
 
             identified_text = ""
+            stt_timeout = self._transcription_timeout_seconds()
             for attempt in range(2):
                 try:
-                    identified_text = await asyncio.to_thread(
-                        pipeline.transcriber.transcribe,
-                        audio_path,
-                        on_partial=_on_partial,
+                    identified_text = await asyncio.wait_for(
+                        asyncio.to_thread(
+                            pipeline.transcriber.transcribe,
+                            audio_path,
+                            on_partial=_on_partial,
+                        ),
+                        timeout=stt_timeout,
                     )
                     break
+                except asyncio.TimeoutError as e:
+                    logger.error(
+                        "transcription_timed_out",
+                        turn_id=ctx.cid,
+                        attempt=attempt + 1,
+                        timeout_seconds=round(stt_timeout, 2),
+                        audio_duration_ms=round(ctx.audio_duration_ms, 2) if ctx.audio_duration_ms else None,
+                    )
+                    raise TurnStageError(
+                        "transcribe",
+                        f"transcription timed out after {stt_timeout:.1f}s",
+                        cause=e,
+                    ) from e
                 except Exception as e:
                     if attempt == 0:
                         logger.warning(

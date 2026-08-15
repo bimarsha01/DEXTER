@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useRef, useState } from "https://esm.sh/react@18";
+﻿import React, { useEffect, useMemo, useRef, useState } from "https://esm.sh/react@18";
 import { createRoot } from "https://esm.sh/react-dom@18/client";
 import htm from "https://esm.sh/htm@3";
 
@@ -480,6 +480,7 @@ function useDexterData() {
             responseText,
             durationMs: payload.duration_ms,
             project: projectRef.current?.name || "dexter",
+            sources: payload.sources || payload.rag_sources || payload.citations || [],
           },
           ...prev,
         ];
@@ -654,37 +655,46 @@ function CameraIcon() { return html`<svg class="lucide" viewBox="0 0 24 24"><pat
 function GlobeIcon() { return html`<svg class="lucide" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/><path d="M2 12h20"/></svg>`; }
 function CloudIcon() { return html`<svg class="lucide" viewBox="0 0 24 24"><path d="M17.5 19H9a7 7 0 1 1 6.71-9h1.79a4.5 4.5 0 1 1 0 9Z"/></svg>`; }
 
-// --- Top Bar ---
-function TopBar({ assistantState, project, hardwareBars, providerName }) {
-  const isListening = assistantState === "listening";
-  const isThinking = assistantState === "thinking";
-  const isSpeaking = assistantState === "speaking";
-  const isError = assistantState === "error";
-  
-  let dotClass = "";
-  if (isListening) dotClass = "listening";
-  if (isThinking) dotClass = "thinking";
-  if (isSpeaking) dotClass = "speaking";
-  if (isError) dotClass = "error";
-  
+function statusLabel(state) {
+  switch (state) {
+    case "listening": return "Online â€¢ Listening";
+    case "thinking": return "Online â€¢ Thinking";
+    case "speaking": return "Online â€¢ Speaking";
+    case "error": return "Degraded â€¢ Error";
+    default: return "Online â€¢ Idle";
+  }
+}
+
+function modeCopy(state) {
+  switch (state) {
+    case "listening": return { title: "Listening", sub: "Capturing your voice and preparing transcription." };
+    case "thinking": return { title: "Processing", sub: "Retrieving context and generating a response." };
+    case "speaking": return { title: "Speaking", sub: "Delivering the response through voice." };
+    case "error": return { title: "Attention Needed", sub: "Something went wrong on the last turn." };
+    default: return { title: "Idle", sub: "Ready for the next command." };
+  }
+}
+
+function TopBar({ assistantState, project, hardwareBars, providerName, onOpenProjects }) {
+  const dotClass = assistantState === "idle" ? "online" : assistantState;
   return html`
     <header class="top-bar">
       <div class="tb-left">
         <div class="brand">Dexter</div>
         <div class="status-indicator">
           <div class=${`status-dot ${dotClass}`}></div>
-          <span>${assistantState}</span>
+          <span>${statusLabel(assistantState)}</span>
         </div>
       </div>
-      
       <div class="tb-center">
-        <div class="active-project mono">${project?.name || "No Project Active"}</div>
+        <button class="active-project mono" onClick=${onOpenProjects}>
+          ${project?.name || "No Project Active"}
+        </button>
       </div>
-      
       <div class="tb-right">
         <div class="hw-mini-bars">
-          ${hardwareBars.map(bar => html`
-            <div class="hw-mini">
+          ${hardwareBars.map((bar) => html`
+            <div class="hw-mini" key=${bar.key}>
               <span>${bar.key.toUpperCase()}</span>
               <div class="hw-mini-track">
                 <div class="hw-mini-fill" style=${{ width: `${bar.percent}%`, background: bar.color }}></div>
@@ -699,106 +709,128 @@ function TopBar({ assistantState, project, hardwareBars, providerName }) {
   `;
 }
 
-// --- Left Panel ---
 function Orb({ state }) {
+  const hint = {
+    idle: "Standing by",
+    listening: "Hearing youâ€¦",
+    thinking: "DEXTER is thinkingâ€¦",
+    speaking: "Respondingâ€¦",
+    error: "Needs attention",
+  }[state] || "Standing by";
+
   return html`
     <div class="orb-container">
       <div class="orb" data-state=${state}>
-        <div class="orb-core"></div>
+        <div class="orb-ring-2"></div>
         <div class="orb-ring"></div>
+        <div class="orb-core"></div>
+        <div class="orb-wave">
+          <span></span><span></span><span></span><span></span><span></span>
+        </div>
       </div>
       <div class=${`orb-label mono ${state}`}>${state}</div>
+      <div class="orb-hint">${hint}</div>
     </div>
   `;
 }
 
-function LeftPanel({ assistantState }) {
+function LeftPanel({ assistantState, turns, onOpenHistory }) {
+  const recent = turns.slice(0, 6);
   return html`
     <aside class="panel panel-left">
       <${Orb} state=${assistantState} />
       <div class="quick-actions">
-        <button class="btn-ptt">
-          <${MicIcon} /> Push to Talk
+        <button class="btn-ptt" type="button" title="Voice is always captured when Dexter is listening">
+          <${MicIcon} /> Voice Active
         </button>
         <div class="action-grid">
-          <button class="btn-action"><${HistoryIcon} /> History</button>
-          <button class="btn-action"><${SettingsIcon} /> Settings</button>
+          <button class="btn-action" type="button" onClick=${onOpenHistory}><${HistoryIcon} /> History</button>
+          <button class="btn-action" type="button" onClick=${onOpenHistory}><${SettingsIcon} /> Activity</button>
+        </div>
+      </div>
+      <div>
+        <div class="section-title">Recent Commands</div>
+        <div class="recent-list">
+          ${recent.length === 0
+            ? html`<div class="subtle mono" style=${{ fontSize: "0.75rem" }}>No turns yet</div>`
+            : recent.map((turn) => html`
+              <div class="recent-item" key=${turn.id}>
+                <div class="recent-text">${turn.userText}</div>
+                <div class="recent-meta mono">
+                  <span>${turn.when}</span>
+                  <span>${turn.provider || "â€”"}</span>
+                </div>
+              </div>
+            `)}
         </div>
       </div>
     </aside>
   `;
 }
 
-// --- Center Column ---
-function PipelineBanner({ pipeline }) {
-  return html`
-    <div class="feed-header">
-      <div class="pipeline-banner">
-        ${STAGE_ORDER.map((stage) => {
-          const status = pipeline[stage] || "idle";
-          return html`
-            <div class=${`pipe-step ${status}`}>
-              <div class="pipe-dot"></div>
-              <span>${STAGE_LABELS[stage]}</span>
-            </div>
-          `;
-        })}
-      </div>
-    </div>
-  `;
-}
-
-function ChatFeed({ turns }) {
+function CenterColumn({ pipeline, turns, assistantState }) {
+  const mode = modeCopy(assistantState);
   const feedRef = useRef(null);
-  
-  // Auto-scroll to bottom
+
   useEffect(() => {
-    if (feedRef.current) {
-      feedRef.current.scrollTop = feedRef.current.scrollHeight;
-    }
-  }, [turns]);
+    if (feedRef.current) feedRef.current.scrollTop = feedRef.current.scrollHeight;
+  }, [turns, assistantState]);
 
-  return html`
-    <div class="chat-feed" ref=${feedRef}>
-      ${turns.slice().reverse().map(turn => html`
-        <div class="msg-wrapper user">
-          <div class="msg-bubble">${turn.userText}</div>
-          <div class="msg-meta mono">
-            <span>${turn.when}</span>
-          </div>
-        </div>
-        <div class="msg-wrapper dexter">
-          <div class="msg-bubble">${turn.responseText}</div>
-          <div class="msg-meta mono">
-            <span>${formatDurationMs(turn.durationMs)}</span>
-            <span>${turn.provider}</span>
-            <span>[${turn.project}]</span>
-          </div>
-        </div>
-      `)}
-      ${turns.length === 0 ? html`
-        <div style=${{ textAlign: 'center', color: 'var(--tx-sub)', marginTop: '40px' }}>
-          <div class="serif" style=${{ fontSize: '1.5rem', marginBottom: '8px' }}>Awaiting Command</div>
-          <div class="mono subtle">Ready to process voice or text input.</div>
-        </div>
-      ` : null}
-    </div>
-  `;
-}
-
-function CenterColumn({ pipeline, turns }) {
   return html`
     <main class="panel panel-center">
-      <${PipelineBanner} pipeline=${pipeline} />
-      <${ChatFeed} turns=${turns} />
+      <div class="mode-banner">
+        <div class="mode-title">${mode.title}</div>
+        <div class="mode-sub">${mode.sub}</div>
+        <div class="pipeline-banner">
+          ${STAGE_ORDER.map((stage) => {
+            const status = pipeline[stage] || "idle";
+            return html`
+              <div class=${`pipe-step ${status}`} key=${stage}>
+                <div class="pipe-dot"></div>
+                <span>${STAGE_LABELS[stage]}</span>
+              </div>
+            `;
+          })}
+        </div>
+      </div>
+      <div class="chat-feed" ref=${feedRef}>
+        ${turns.length === 0
+          ? html`
+              <div class="empty-feed">
+                <div class="serif">Awaiting Command</div>
+                <div class="mono subtle">Speak naturally â€” Dexter is standing by.</div>
+              </div>
+            `
+          : turns.slice().reverse().map((turn) => html`
+              <div key=${`${turn.id}-u`}>
+                <div class="msg-wrapper user">
+                  <div class="msg-bubble">${turn.userText}</div>
+                  <div class="msg-meta mono"><span>${turn.when}</span></div>
+                </div>
+                <div class="msg-wrapper dexter">
+                  <div class="msg-bubble">
+                    ${turn.responseText}
+                    ${Array.isArray(turn.sources) && turn.sources.length
+                      ? html`<div class="rag-pills">
+                          ${turn.sources.map((src, i) => html`<span class="rag-pill mono" key=${i}>[${i + 1}] ${src}</span>`)}
+                        </div>`
+                      : null}
+                  </div>
+                  <div class="msg-meta mono">
+                    <span>${formatDurationMs(turn.durationMs)}</span>
+                    <span>${turn.provider}</span>
+                    <span>[${turn.project}]</span>
+                  </div>
+                </div>
+              </div>
+            `)}
+      </div>
     </main>
   `;
 }
 
-// --- Right Panel ---
-function HealthCard({ label, value, percent, color }) {
-  const sparklines = Array.from({ length: 15 }).map(() => Math.random() * 80 + 20); // Dummy sparkline data
-  
+function HealthCard({ label, value, percent, color, history }) {
+  const bars = (history && history.length ? history : Array.from({ length: 12 }, () => percent || 20)).slice(-12);
   return html`
     <div class="health-card">
       <div class="hc-info">
@@ -806,70 +838,165 @@ function HealthCard({ label, value, percent, color }) {
         <span class="hc-val mono">${value}</span>
       </div>
       <div class="hc-sparkline">
-        ${sparklines.map((h, i) => {
-          const isLast = i === sparklines.length - 1;
-          const bg = isLast ? color : 'var(--tx-muted)';
-          const hVal = isLast ? percent : h;
-          return html`<div class="hc-bar" style=${{ height: `${hVal}%`, background: bg }}></div>`;
-        })}
+        ${bars.map((h, i) => html`
+          <div
+            class="hc-bar"
+            key=${i}
+            style=${{
+              height: `${clamp(Number(h) || 8, 8, 100)}%`,
+              background: i === bars.length - 1 ? color : "var(--tx-muted)",
+            }}
+          ></div>
+        `)}
       </div>
     </div>
   `;
 }
 
-function RightPanel({ health, docCount, project, hardwareBars }) {
+function chipClass(status) {
+  const text = String(status || "").toLowerCase();
+  if (["healthy", "ready", "active", "ok", "online"].some((s) => text.includes(s))) return "good";
+  if (["degraded", "warn", "quota"].some((s) => text.includes(s))) return "warn";
+  if (["error", "offline", "failed", "down"].some((s) => text.includes(s))) return "bad";
+  return "idle";
+}
+
+function RightPanel({ health, docCount, project, hardwareBars, sparkHistory }) {
   const lastIndexedParts = formatAgoParts(health?.rag?.last_updated_ts);
-  
+  const automation = health?.automation?.status || "unknown";
+  const providers = health?.providers || {};
+  const providerEntries = Object.entries(providers).slice(0, 4);
+
   return html`
     <aside class="panel panel-right">
       <div>
         <div class="section-title">System Health</div>
         <div class="health-grid">
-          ${hardwareBars.map(bar => html`
-            <${HealthCard} label=${bar.label} value=${bar.display} percent=${bar.percent} color=${bar.color} />
+          ${hardwareBars.map((bar) => html`
+            <${HealthCard}
+              key=${bar.key}
+              label=${bar.label}
+              value=${bar.display}
+              percent=${bar.percent}
+              color=${bar.color}
+              history=${sparkHistory?.[bar.key]}
+            />
           `)}
         </div>
       </div>
-      
+
       <div>
-        <div class="section-title">Current Context</div>
+        <div class="section-title">Knowledge</div>
         <div class="info-card">
-          <div class="ic-row mono subtle">Project</div>
-          <div class="ic-row ic-val">${project?.name || 'dexter-v2'}</div>
-          <div class="ic-row mono subtle" style=${{ marginTop: '12px' }}>Knowledge Base</div>
           <div class="ic-row">
-            <span class="subtle">Indexed Files:</span>
-            <span class="mono">${formatNumber(docCount)}</span>
+            <span class="subtle">RAG status</span>
+            <span class=${`status-chip ${chipClass(health?.rag?.status)}`}>${health?.rag?.status || "idle"}</span>
           </div>
           <div class="ic-row">
-            <span class="subtle">Updated:</span>
-            <span class="mono">${lastIndexedParts ? `${lastIndexedParts.value} ${lastIndexedParts.unit}` : 'unknown'}</span>
+            <span class="subtle">Indexed</span>
+            <span class="mono ic-val">${formatNumber(docCount)} docs</span>
+          </div>
+          <div class="ic-row">
+            <span class="subtle">Updated</span>
+            <span class="mono">${lastIndexedParts ? (lastIndexedParts.text || `${lastIndexedParts.value} ${lastIndexedParts.unit}`) : "unknown"}</span>
           </div>
         </div>
       </div>
-      
+
+      <div>
+        <div class="section-title">Current Project</div>
+        <div class="info-card">
+          <div class="ic-row mono subtle">Active context</div>
+          <div class="ic-row ic-val">${project?.name || "None detected"}</div>
+          <div class="ic-row mono subtle" style=${{ marginTop: "8px", fontSize: "0.72rem", wordBreak: "break-all" }}>
+            ${project?.source_path || "Waiting for project signal"}
+          </div>
+        </div>
+      </div>
+
+      <div>
+        <div class="section-title">Connections</div>
+        <div class="mcp-list">
+          <div class="mcp-row">
+            <span>Automation</span>
+            <span class=${`status-chip ${chipClass(automation)}`}>${automation}</span>
+          </div>
+          ${providerEntries.map(([name, info]) => html`
+            <div class="mcp-row" key=${name}>
+              <span>${name}</span>
+              <span class=${`status-chip ${chipClass(info?.current_status || info?.status)}`}>
+                ${info?.current_status || info?.status || "unknown"}
+              </span>
+            </div>
+          `)}
+        </div>
+      </div>
+
       <div>
         <div class="section-title">Quick Tools</div>
         <div class="tools-grid">
-          <div class="tool-btn">
-            <${CameraIcon} />
-            <span class="mono" style=${{ fontSize: '0.65rem' }}>Screen</span>
-          </div>
-          <div class="tool-btn">
-            <${GlobeIcon} />
-            <span class="mono" style=${{ fontSize: '0.65rem' }}>Browser</span>
-          </div>
-          <div class="tool-btn">
-            <${CloudIcon} />
-            <span class="mono" style=${{ fontSize: '0.65rem' }}>Weather</span>
-          </div>
+          <div class="tool-btn"><${CameraIcon} /><span class="mono" style=${{ fontSize: "0.65rem" }}>Screen</span></div>
+          <div class="tool-btn"><${GlobeIcon} /><span class="mono" style=${{ fontSize: "0.65rem" }}>Browser</span></div>
+          <div class="tool-btn"><${CloudIcon} /><span class="mono" style=${{ fontSize: "0.65rem" }}>Weather</span></div>
         </div>
       </div>
     </aside>
   `;
 }
 
-// --- Main App ---
+function HistoryView({ turns, onClose }) {
+  return html`
+    <div class="view-overlay">
+      <div class="view-header">
+        <div class="view-title">History</div>
+        <button class="view-close" type="button" onClick=${onClose}>Close</button>
+      </div>
+      <div class="history-list">
+        ${turns.length === 0
+          ? html`<div class="subtle">No conversation history yet.</div>`
+          : turns.map((turn) => html`
+            <div class="history-card" key=${turn.id}>
+              <div class="user">${turn.userText}</div>
+              <div class="response">${turn.responseText}</div>
+              <div class="meta mono">
+                <span>${turn.when}</span>
+                <span>${turn.provider}</span>
+                <span>${formatDurationMs(turn.durationMs)}</span>
+                <span>${turn.project}</span>
+              </div>
+            </div>
+          `)}
+      </div>
+    </div>
+  `;
+}
+
+function ProjectsView({ projects, activeName, onClose, onSelect }) {
+  return html`
+    <div class="view-overlay">
+      <div class="view-header">
+        <div class="view-title">Projects</div>
+        <button class="view-close" type="button" onClick=${onClose}>Close</button>
+      </div>
+      <div class="projects-grid">
+        ${projects.length === 0
+          ? html`<div class="subtle">No indexed projects yet.</div>`
+          : projects.map((item) => html`
+            <div
+              class=${`project-card ${item.name === activeName ? "active" : ""}`}
+              key=${item.id || item.name}
+              onClick=${() => onSelect?.(item)}
+            >
+              <h3>${item.name}</h3>
+              <p class="mono">${item.path || "Local index"}</p>
+              <p style=${{ marginTop: "10px" }} class="mono subtle">${formatNumber(item.count || 0)} docs</p>
+            </div>
+          `)}
+      </div>
+    </div>
+  `;
+}
+
 function App() {
   const {
     connection,
@@ -880,9 +1007,13 @@ function App() {
     turns,
     pipeline,
     hardwareBars,
+    projects,
     emergencyStop,
     clearEmergencyStop,
   } = useDexterData();
+
+  const [view, setView] = useState("main");
+  const [sparkHistory, setSparkHistory] = useState({ cpu: [], gpu: [], ram: [] });
 
   const orbState = useMemo(() => {
     const normalized = normalizeState(assistantState);
@@ -894,35 +1025,69 @@ function App() {
     return "idle";
   }, [assistantState, pipeline]);
 
+  useEffect(() => {
+    setSparkHistory((prev) => {
+      const next = { ...prev };
+      for (const bar of hardwareBars) {
+        const series = [...(prev[bar.key] || []), bar.percent || 0].slice(-12);
+        next[bar.key] = series;
+      }
+      return next;
+    });
+  }, [hardwareBars]);
+
   const docCount = health?.rag?.doc_count ?? 0;
   const providerName = activeProvider || "unknown";
 
   return html`
-    <div style=${{ display: "flex", flexDirection: "column", height: "100%", width: "100%" }}>
+    <div style=${{ display: "flex", flexDirection: "column", height: "100%", width: "100%", position: "relative" }}>
       ${connection !== "connected" && connection !== "mock"
-        ? html`<div style=${{ position: 'absolute', top: 0, left: 0, width: '100%', padding: '4px', textAlign: 'center', background: 'var(--accent-red)', color: 'white', zIndex: 100 }} class="mono">Reconnecting...</div>`
+        ? html`<div class="reconnect-banner mono">Reconnecting to Dexterâ€¦</div>`
         : null}
-        
-      <${TopBar} 
-        assistantState=${orbState} 
-        project=${project} 
-        hardwareBars=${hardwareBars} 
-        providerName=${providerName} 
+
+      <${TopBar}
+        assistantState=${orbState}
+        project=${project}
+        hardwareBars=${hardwareBars}
+        providerName=${providerName}
+        onOpenProjects=${() => setView("projects")}
       />
-      
+
       <div class="dashboard-core">
-        <${LeftPanel} assistantState=${orbState} />
-        <${CenterColumn} pipeline=${pipeline} turns=${turns} />
-        <${RightPanel} health=${health} docCount=${docCount} project=${project} hardwareBars=${hardwareBars} />
+        <${LeftPanel}
+          assistantState=${orbState}
+          turns=${turns}
+          onOpenHistory=${() => setView("history")}
+        />
+        <${CenterColumn} pipeline=${pipeline} turns=${turns} assistantState=${orbState} />
+        <${RightPanel}
+          health=${health}
+          docCount=${docCount}
+          project=${project}
+          hardwareBars=${hardwareBars}
+          sparkHistory=${sparkHistory}
+        />
       </div>
 
-      ${emergencyStop ? html`
-        <div style=${{ position: 'fixed', bottom: '20px', left: '50%', transform: 'translateX(-50%)', background: 'var(--accent-red)', color: 'white', padding: '16px 24px', borderRadius: '8px', zIndex: 100, cursor: 'pointer' }} onClick=${clearEmergencyStop}>
-          <div class="mono" style=${{ fontWeight: 'bold' }}>HARDWARE EMERGENCY STOP</div>
-          <div>${emergencyStop.reason}</div>
-          <div class="mono" style=${{ fontSize: '0.8rem', marginTop: '8px', opacity: 0.8 }}>Tap to dismiss</div>
-        </div>
-      ` : null}
+      ${view === "history" ? html`<${HistoryView} turns=${turns} onClose=${() => setView("main")} />` : null}
+      ${view === "projects"
+        ? html`<${ProjectsView}
+            projects=${projects}
+            activeName=${project?.name}
+            onClose=${() => setView("main")}
+            onSelect=${() => setView("main")}
+          />`
+        : null}
+
+      ${emergencyStop
+        ? html`
+            <div class="emergency-toast" onClick=${clearEmergencyStop}>
+              <div class="mono" style=${{ fontWeight: "600" }}>HARDWARE EMERGENCY STOP</div>
+              <div>${emergencyStop.reason}</div>
+              <div class="mono" style=${{ fontSize: "0.75rem", marginTop: "8px", opacity: 0.85 }}>Tap to dismiss</div>
+            </div>
+          `
+        : null}
     </div>
   `;
 }

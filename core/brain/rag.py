@@ -512,11 +512,13 @@ class PersonalRAGIndex:
         self._health_monitor = health_monitor
         self._event_bus = event_bus
 
-        # Per-user isolated chroma path
+        # Per-user isolated chroma path (thread-safe client factory)
+        from utils.chroma_client import get_persistent_client
+
         user_path = os.path.join(self.persist_directory, f"rag_{self.user_id}")
         os.makedirs(user_path, exist_ok=True)
 
-        self._client = chromadb.PersistentClient(path=user_path)
+        self._client = get_persistent_client(user_path)
         collection_metadata = {
             "index_schema_version": self._index_schema_version,
             "embedding_model": self._embedding_profile.model_name,

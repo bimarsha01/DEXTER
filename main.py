@@ -235,8 +235,31 @@ def resolve_hardware_config(runtime_config) -> None:
     if hasattr(runtime_config, "rag"):
         runtime_config.rag.embedding_device = resolved_embedding_device
 
+    # Prefer the hardware-resolved Whisper size. Config often pins medium.en which
+    # times out on CPU; keep .en suffix when present for English-only accuracy.
+    if hasattr(runtime_config, "stt") and resolved_whisper_model:
+        configured_stt = str(getattr(runtime_config.stt, "model", "") or "").strip().lower()
+        size_rank = {"tiny": 0, "base": 1, "small": 2, "medium": 3, "large": 4, "large-v2": 4, "large-v3": 4}
+
+        def _rank(name: str) -> int:
+            base = name.replace(".en", "").strip().lower()
+            return size_rank.get(base, 2)
+
+        wants_english = (not configured_stt or configured_stt == "auto" or configured_stt.endswith(".en")
+                         or resolved_whisper_model.endswith(".en"))
+        pick = resolved_whisper_model.replace(".en", "")
+        if not configured_stt or configured_stt == "auto" or (
+            resolved_device == "cpu" and _rank(configured_stt) > _rank(resolved_whisper_model)
+        ):
+            runtime_config.stt.model = f"{pick}.en" if wants_english else pick
+
+    if resolved_device == "cpu" and hasattr(runtime_config, "transcription"):
+        # First cold-start STT on CPU regularly exceeds 40s for larger models.
+        current_timeout = float(getattr(runtime_config.transcription, "timeout_seconds", 40.0) or 40.0)
+        runtime_config.transcription.timeout_seconds = max(current_timeout, 75.0)
+
     logger.info(
-        f"Hardware: {resolved_device}, Whisper: {resolved_whisper_model} ({resolved_compute_type}), Embeddings: {resolved_embedding_device}"
+        f"Hardware: {resolved_device}, Whisper: {getattr(getattr(runtime_config, 'stt', None), 'model', resolved_whisper_model)} ({resolved_compute_type}), Embeddings: {resolved_embedding_device}"
     )
 
 
@@ -429,7 +452,11 @@ async def main():
         def _load_transcriber():
             from core.audio.transcriber import DexterTranscriber
 
-            stt_model = runtime_config.stt.model or runtime_config.hardware.whisper_model
+            stt_model = (
+                runtime_config.stt.model
+                or runtime_config.hardware.whisper_model
+                or "base.en"
+            )
             t = DexterTranscriber(
                 model_size=stt_model,
                 beam_size=runtime_config.stt.beam_size,
